@@ -224,6 +224,16 @@ def reader_allowed(envelope: Envelope, request: Request) -> bool:
     return False
 
 
+@app.get("/health/headers")
+def health_headers(request: Request) -> dict[str, Any]:
+    """Diagnostic: names of request headers that reached the app.
+
+    Values are never echoed — this exists to detect reverse proxies that strip
+    custom headers (which would silently break header-based authentication).
+    """
+    return {"received_header_names": sorted(request.headers.keys())}
+
+
 def _not_found(artifact_id: str) -> JSONResponse:
     """Identical answer whether the artifact never existed or was deleted."""
     return JSONResponse(
