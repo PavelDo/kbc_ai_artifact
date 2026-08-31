@@ -208,6 +208,8 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("GET", "/health"),
         ("GET", "/context"),
         ("GET", "/skill"),
+        ("GET", "/agent"),
+        ("GET", "/admin"),
         ("GET", "/docs"),
         ("GET", "/openapi.json"),
         ("GET", "/a/{id}"),
@@ -236,6 +238,36 @@ def test_skill_returns_markdown(api: Api) -> None:
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/markdown")
     assert resp.text.strip() != ""
+
+
+def test_agent_serves_the_agent_definition_file(api: Api) -> None:
+    """/agent must serve skills/artifact-hub-agent/AGENT.md verbatim.
+
+    The expectation is read from disk rather than hard-coded so the test keeps
+    passing while the definition itself is rewritten.
+    """
+    expected = main.AGENT_PATH.read_text(encoding="utf-8")
+    resp = api.client.get("/agent")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/markdown")
+    assert resp.text == expected
+    # Echoing the first line proves it is *that* file, not some other markdown.
+    assert resp.text.splitlines()[0] == expected.splitlines()[0]
+
+
+def test_context_documents_the_agent_and_admin_endpoints(api: Api) -> None:
+    body = api.client.get("/context").json()
+    by_path = {e["path"]: e for e in body["endpoints"]}
+
+    agent = by_path["/agent"]
+    assert agent["method"] == "GET"
+    assert agent["auth"] == "none"
+    assert "subagent" in agent["purpose"].lower()
+    assert "~/.claude/agents" in agent["purpose"]
+
+    admin = by_path["/admin"]
+    assert admin["method"] == "GET"
+    assert "sessionStorage" in admin["purpose"]
 
 
 # --------------------------------------------------------------------------
@@ -270,6 +302,179 @@ def test_openapi_json_never_leaks_the_hub_storage_token(api: Api) -> None:
     resp = api.client.get("/openapi.json")
     assert resp.status_code == 200
     assert api.settings.hub_storage_token not in resp.text
+
+
+# --------------------------------------------------------------------------
+# OpenAPI documentation audit
+#
+# These tests are the standing guarantee that /docs stays usable: every
+# operation explains itself, and every parameter a caller can send is
+# described in the schema. They are mechanical on purpose — a new route or a
+# new parameter that skips its documentation fails the suite.
+# --------------------------------------------------------------------------
+
+#: The three tags declared on the app; every operation must carry exactly one.
+_TAGS = {"public", "artifacts", "versions", "service"}
+
+
+def _operations(schema: dict) -> list[tuple[str, str, dict]]:
+    """Every (method, path, operation) in the generated document."""
+    out: list[tuple[str, str, dict]] = []
+    for path, methods in schema["paths"].items():
+        for method, operation in methods.items():
+            if isinstance(operation, dict):
+                out.append((method.upper(), path, operation))
+    return out
+
+
+def test_openapi_every_operation_has_summary_description_and_one_tag(
+    api: Api,
+) -> None:
+    schema = api.client.get("/openapi.json").json()
+    operations = _operations(schema)
+    assert operations, "no operations in the OpenAPI document"
+    for method, path, operation in operations:
+        where = f"{method} {path}"
+        assert operation.get("summary", "").strip(), f"{where}: empty summary"
+        assert (
+            operation.get("description", "").strip()
+        ), f"{where}: empty description"
+        tags = operation.get("tags") or []
+        assert len(tags) == 1, f"{where}: expected exactly one tag, got {tags}"
+        assert tags[0] in _TAGS, f"{where}: unknown tag {tags[0]!r}"
+
+
+def test_openapi_every_parameter_is_described(api: Api) -> None:
+    schema = api.client.get("/openapi.json").json()
+    seen = 0
+    for method, path, operation in _operations(schema):
+        for parameter in operation.get("parameters", []):
+            seen += 1
+            where = f"{method} {path} [{parameter.get('in')} {parameter.get('name')}]"
+            description = parameter.get("description") or parameter.get(
+                "schema", {}
+            ).get("description")
+            assert description and description.strip(), f"{where}: no description"
+    assert seen, "no parameters found; the audit would be vacuous"
+
+
+def test_openapi_every_operation_documents_its_responses(api: Api) -> None:
+    schema = api.client.get("/openapi.json").json()
+    for method, path, operation in _operations(schema):
+        responses = operation.get("responses") or {}
+        assert responses, f"{method} {path}: no responses documented"
+        for code, response in responses.items():
+            where = f"{method} {path} -> {code}"
+            assert (
+                response.get("description", "").strip()
+            ), f"{where}: response without a description"
+
+
+def test_openapi_api_operations_carry_the_security_schemes(api: Api) -> None:
+    """/api/* is header-authenticated; the public read path must not claim to be."""
+    schema = api.client.get("/openapi.json").json()
+    for method, path, operation in _operations(schema):
+        if path.startswith("/api/"):
+            security = operation.get("security")
+            assert security, f"{method} {path}: missing security requirement"
+            names = set(security[0])
+            assert names == {"StorageApiToken", "StorageStack"}, (
+                f"{method} {path}: unexpected security {names}"
+            )
+        else:
+            assert (
+                "security" not in operation
+            ), f"{method} {path}: public route must not require credentials"
+
+
+def _parameter(schema: dict, path: str, method: str, name: str) -> dict:
+    for parameter in schema["paths"][path][method].get("parameters", []):
+        if parameter["name"] == name:
+            return parameter
+    raise AssertionError(f"{method.upper()} {path} does not document {name!r}")
+
+
+def test_openapi_documents_the_versions_format_query_parameter(api: Api) -> None:
+    schema = api.client.get("/openapi.json").json()
+    parameter = _parameter(schema, "/a/{artifact_id}/versions", "get", "format")
+    assert parameter["in"] == "query"
+    assert parameter["required"] is False
+    assert parameter["schema"]["default"] == "json"
+    assert parameter["schema"]["enum"] == ["json", "html"]
+    assert "html" in parameter["description"]
+
+
+def test_openapi_documents_the_diff_format_query_parameter(api: Api) -> None:
+    schema = api.client.get("/openapi.json").json()
+    parameter = _parameter(schema, "/a/{artifact_id}/diff/{spec}", "get", "format")
+    assert parameter["in"] == "query"
+    assert parameter["schema"]["default"] == "html"
+    assert parameter["schema"]["enum"] == ["html", "unified", "json"]
+    assert "unified" in parameter["description"]
+
+
+def test_openapi_documents_the_path_parameters(api: Api) -> None:
+    schema = api.client.get("/openapi.json").json()
+
+    spec = _parameter(schema, "/a/{artifact_id}/diff/{spec}", "get", "spec")
+    assert spec["in"] == "path"
+    assert "OLD..NEW" in spec["description"]
+
+    artifact_id = _parameter(schema, "/a/{artifact_id}", "get", "artifact_id")
+    assert "capability" in artifact_id["description"]
+
+    version = _parameter(
+        schema, "/a/{artifact_id}/v/{version}", "get", "version"
+    )
+    assert "version" in version["description"].lower()
+
+
+def test_openapi_declares_non_json_response_content_types(api: Api) -> None:
+    """HTML pages, markdown and the unified diff must not look like JSON."""
+    schema = api.client.get("/openapi.json").json()
+
+    def content(path: str, method: str, code: str) -> set[str]:
+        return set(
+            schema["paths"][path][method]["responses"][code].get("content", {})
+        )
+
+    assert "text/html" in content("/", "get", "200")
+    assert "text/html" in content("/admin", "get", "200")
+    assert "text/plain" in content("/", "post", "200")
+    assert any(
+        media.startswith("text/markdown") for media in content("/skill", "get", "200")
+    )
+    assert any(
+        media.startswith("text/markdown") for media in content("/agent", "get", "200")
+    )
+    assert "text/html" in content("/a/{artifact_id}", "get", "200")
+    diff_content = content("/a/{artifact_id}/diff/{spec}", "get", "200")
+    assert {"text/html", "text/plain", "application/json"} <= diff_content
+
+
+def test_openapi_request_bodies_carry_examples_and_field_descriptions(
+    api: Api,
+) -> None:
+    schema = api.client.get("/openapi.json").json()
+    schemas = schema["components"]["schemas"]
+    for name in ("PublishBody", "UpdateBody", "VersionBody", "HeadBody"):
+        model = schemas[name]
+        assert model.get("examples"), f"{name}: no request-body example"
+        for field, definition in model["properties"].items():
+            assert definition.get(
+                "description", ""
+            ).strip(), f"{name}.{field}: no description"
+
+
+def test_openapi_unlock_form_field_is_documented(api: Api) -> None:
+    schema = api.client.get("/openapi.json").json()
+    body = schema["paths"]["/a/{artifact_id}/unlock"]["post"]["requestBody"]
+    assert "application/x-www-form-urlencoded" in body["content"]
+    form_schema_ref = body["content"]["application/x-www-form-urlencoded"][
+        "schema"
+    ]["$ref"].rsplit("/", 1)[-1]
+    form_schema = schema["components"]["schemas"][form_schema_ref]
+    assert form_schema["properties"]["password"]["description"].strip()
 
 
 # --------------------------------------------------------------------------
@@ -847,6 +1052,49 @@ def test_landing_page_advertises_repo_and_version(api: Api) -> None:
     assert main.GITHUB_REPO_URL in resp.text
     assert main.SERVICE_VERSION in resp.text
     assert "kbc-artifact-hub" in resp.text
+
+
+def test_landing_page_links_the_admin_studio_and_the_agent_definition(
+    api: Api,
+) -> None:
+    text = api.client.get("/").text
+    assert "/admin" in text
+    assert "/agent" in text
+    assert "Admin studio" in text
+    # The install one-liner from the "for agents" section.
+    assert "~/.claude/agents/artifact-hub.md" in text
+
+
+def test_admin_page_is_html_and_self_describing(api: Api) -> None:
+    resp = api.client.get("/admin")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "Admin studio" in resp.text
+
+
+def test_admin_page_keeps_credentials_in_the_tab_only(api: Api) -> None:
+    """The studio must never ship a token, and must never reach for localStorage.
+
+    The page is public, so a leaked hub token would be catastrophic; and the
+    whole security story rests on the visitor's own token living in
+    sessionStorage (per-tab, cleared on close) rather than anywhere durable.
+    Both are asserted mechanically so a later edit cannot quietly regress them.
+    """
+    text = api.client.get("/admin").text
+    assert api.settings.hub_storage_token not in text
+    assert "good-token" not in text
+    assert "localStorage" not in text
+    assert "sessionStorage" in text
+    assert "hub_admin_auth" in text
+    # The promise made to the visitor on the sign-in card.
+    assert "Your token stays in this browser tab" in text
+
+
+def test_admin_page_offers_every_stack_alias_and_a_custom_url(api: Api) -> None:
+    text = api.client.get("/admin").text
+    for alias in ("us", "gcp-us", "eu", "azure-eu", "gcp-eu"):
+        assert f'<option value="{alias}">' in text
+    assert '<option value="__custom__">' in text
 
 
 # --------------------------------------------------------------------------

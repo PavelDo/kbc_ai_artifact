@@ -11,6 +11,12 @@ Owners add live versions; other projects may submit **proposals** when the owner
 opted in with ``accept_versions`` — a proposal is readable only by the owner or
 its author until the owner promotes it.
 
+Two documents and one page are served straight from the repository: ``/skill``
+and ``/agent`` hand an agent its instructions, and ``/admin`` is a completely
+client-side moderation studio — a static HTML page whose JavaScript drives this
+same API with a token the visitor pastes into their own browser, so the server
+never sees a studio session.
+
 Startup is deliberately tolerant: if Storage is unreachable while hydrating the
 index, the process still boots and retries hydration on the next request, so a
 transient Storage outage cannot put the app into a crash loop.
@@ -32,7 +38,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
+from fastapi import Path as PathParam
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import (
     HTMLResponse,
@@ -57,7 +64,7 @@ from src.builder import BuildError, BuiltArtifact
 from src.config import Settings, load_settings
 from src.diff import DiffError, compute_diff
 from src.kbc import BackendError, KbcFilesBackend
-from src.pages import landing_page, unlock_page, versions_page
+from src.pages import admin_page, landing_page, unlock_page, versions_page
 from src.security import (
     CookieSigner,
     check_password,
@@ -88,11 +95,82 @@ SKILL_PATH = (
     Path(__file__).resolve().parent.parent / "skills/artifact-publisher/SKILL.md"
 )
 
+#: Path of the ready-to-install Claude Code subagent definition, served at
+#: ``/agent``. Resolved exactly like :data:`SKILL_PATH`.
+AGENT_PATH = (
+    Path(__file__).resolve().parent.parent / "skills/artifact-hub-agent/AGENT.md"
+)
+
 #: ``/a/{id}/diff/{spec}`` accepts exactly ``<older>..<newer>``.
 _DIFF_SPEC = re.compile(r"^(\d+)\.\.(\d+)$")
 
 #: Longest contributor note accepted on a submitted version.
 MAX_NOTE_CHARS = 500
+
+# --------------------------------------------------------------------------
+# OpenAPI documentation constants
+#
+# Every route documents its parameters through these, so one wording change
+# stays one edit and no operation can quietly ship an undescribed parameter.
+# --------------------------------------------------------------------------
+
+#: Description attached to every ``artifact_id`` path parameter.
+ARTIFACT_ID_DESC = (
+    "Artifact identifier from the publish response — the capability part of "
+    "the URL. Unguessable by design; there is no public listing."
+)
+
+#: Description attached to every ``version`` path parameter.
+VERSION_DESC = (
+    "Version number as listed by GET /a/{id}/versions (1 for the first "
+    "published version, counting up; numbers are never reused)."
+)
+
+#: Description of the ``spec`` path parameter of the diff endpoint.
+SPEC_DESC = (
+    "Two version numbers in the form OLD..NEW, for example 1..2. Anything "
+    "else is a 400."
+)
+
+#: Sentence appended to the description of reads that honour the password gate.
+PASSWORD_GATE_NOTE = (
+    "When the artifact is password-protected, machine clients send the "
+    "password in the X-Artifact-Password header (Swagger UI cannot send it "
+    "from this page); browsers use the unlock form at POST /a/{id}/unlock, "
+    "which sets a signed cookie scoped to the artifact path."
+)
+
+#: Reused ``responses`` entries, so the same failure never gets two wordings.
+RESP_STACK_400 = {"description": "Unknown or disallowed X-Storage-Stack value."}
+RESP_TOKEN_401 = {"description": "Storage token missing or rejected by the stack."}
+RESP_STACK_502 = {
+    "description": (
+        "The caller's Keboola stack could not be reached to verify the token."
+    )
+}
+RESP_HUB_502 = {
+    "description": (
+        "The hub's own Keboola Storage backend is unavailable; the artifact "
+        "could not be read or written."
+    )
+}
+RESP_NOT_FOUND = {"description": "No artifact exists with this id."}
+
+#: ``content`` blocks for the non-JSON responses, so /docs stops implying JSON.
+CONTENT_HTML = {"text/html": {"schema": {"type": "string"}}}
+CONTENT_MARKDOWN = {"text/markdown": {"schema": {"type": "string"}}}
+CONTENT_TEXT = {"text/plain": {"schema": {"type": "string"}}}
+
+
+class MarkdownResponse(Response):
+    """A ``text/markdown`` response.
+
+    Used only as a route's ``response_class`` so the generated OpenAPI document
+    advertises the real content type of ``/skill`` and ``/agent``. The handlers
+    still build their own :class:`Response`, so runtime behavior is unchanged.
+    """
+
+    media_type = "text/markdown; charset=utf-8"
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -219,6 +297,11 @@ made from this page.
 
 ## Learn more
 
+- [`/admin`](/admin) — browser studio for artifact owners: review, diff,
+  promote, reject, pin and delete versions. Your token stays in the tab.
+- [`/agent`](/agent) — a ready-to-install Claude Code subagent definition
+  (`install -d ~/.claude/agents && curl -fsSL {base}/agent -o
+  ~/.claude/agents/artifact-hub.md`).
 - [`/skill`](/skill) — SKILL.md teaching an AI agent how to publish
   artifacts, unassisted.
 - [`/context`](/context) — machine-readable manifest of endpoints, auth
@@ -576,6 +659,14 @@ def may_see(meta: ArtifactMeta, envelope: Envelope, caller: Owner | None) -> boo
         "would otherwise break header-based authentication in a way that is "
         "hard to diagnose from the outside."
     ),
+    responses={
+        200: {
+            "description": (
+                "JSON object with 'received_header_names': the sorted header "
+                "names of this request, values omitted."
+            )
+        }
+    },
 )
 def health_headers(request: Request) -> dict[str, Any]:
     """Diagnostic: names of request headers that reached the app.
@@ -659,6 +750,23 @@ class PublishBody(BaseModel):
     request and never stored, logged or echoed back.
     """
 
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "markdown": (
+                        "# Q3 review\n\n"
+                        "Shipped the new ingest path.\n\n"
+                        "| metric | Q2 | Q3 |\n|---|---|---|\n"
+                        "| runs | 120 | 184 |\n"
+                    ),
+                    "title": "Q3 review",
+                    "accept_versions": True,
+                }
+            ]
+        }
+    }
+
     html: str | None = Field(
         None,
         description=(
@@ -740,6 +848,18 @@ class UpdateBody(BaseModel):
     adds a new live version — nothing is ever overwritten.
     """
 
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "markdown": "# Q3 review\n\nCorrected the Q3 run count.\n",
+                    "title": "Q3 review (corrected)",
+                    "accept_versions": True,
+                }
+            ]
+        }
+    }
+
     html: str | None = Field(
         None,
         description=(
@@ -816,6 +936,17 @@ class VersionBody(BaseModel):
     ``git_url``, plus an optional note describing what changed.
     """
 
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "markdown": "# Q3 review\n\nFixed the Q3 totals.\n",
+                    "note": "fix Q3 totals",
+                }
+            ]
+        }
+    }
+
     html: str | None = Field(None, description="Complete HTML document, served as-is.")
     markdown: str | None = Field(
         None, description="Markdown source, rendered by the built-in template."
@@ -849,6 +980,10 @@ class VersionBody(BaseModel):
 
 class HeadBody(BaseModel):
     """Body of ``PUT /api/artifacts/{id}/head``."""
+
+    model_config = {
+        "json_schema_extra": {"examples": [{"mode": "pinned", "version": 2}]}
+    }
 
     mode: str = Field(
         ...,
@@ -1033,7 +1168,15 @@ def _artifact_response(
     response_class=HTMLResponse,
     tags=["public"],
     summary="Landing page",
-    description="Human-facing HTML documentation of the hub: what it does, how to authenticate, and copy-pasteable curl examples.",
+    description=(
+        "Human-facing HTML documentation of the hub: what it does, how to "
+        "authenticate, copy-pasteable curl examples, and links to the admin "
+        "studio (/admin), the agent definition (/agent) and the skill "
+        "(/skill). Needs no credentials and returns a complete HTML document."
+    ),
+    responses={
+        200: {"description": "The landing page.", "content": CONTENT_HTML}
+    },
 )
 def landing(request: Request) -> HTMLResponse:
     """Human-facing documentation page."""
@@ -1047,7 +1190,15 @@ def landing(request: Request) -> HTMLResponse:
     response_class=PlainTextResponse,
     tags=["service"],
     summary="Platform startup probe",
-    description="Always returns 200 'OK'. Used by the Keboola Data App platform to check the process is up; not meant to be called by clients.",
+    description=(
+        "Always returns 200 with the plain-text body 'OK'. Used by the Keboola "
+        "Data App platform proxy to check that the process is up; it takes no "
+        "body, no parameters and no credentials, and is not meant to be called "
+        "by clients."
+    ),
+    responses={
+        200: {"description": "Always; body is 'OK'.", "content": CONTENT_TEXT}
+    },
 )
 def landing_probe() -> PlainTextResponse:
     """Platform startup check — the proxy POSTs to ``/`` to see if we are up."""
@@ -1058,7 +1209,21 @@ def landing_probe() -> PlainTextResponse:
     "/health",
     tags=["service"],
     summary="Liveness and index statistics",
-    description="Reports process liveness, the running service version, and whether the in-memory artifact index has finished hydrating from Storage.",
+    description=(
+        "Reports process liveness, the running service version, and whether "
+        "the in-memory artifact index has finished hydrating from Storage. "
+        "'hydrated': false means Storage was unreachable at startup and the "
+        "hub is serving in degraded mode (individual artifacts still resolve, "
+        "one Storage lookup at a time). Unauthenticated."
+    ),
+    responses={
+        200: {
+            "description": (
+                "JSON with 'status', 'version', 'artifacts' (indexed count) "
+                "and 'hydrated'."
+            )
+        }
+    },
 )
 def health(request: Request) -> dict:
     """Liveness plus index statistics."""
@@ -1074,7 +1239,22 @@ def health(request: Request) -> dict:
     "/context",
     tags=["service"],
     summary="Machine-readable service manifest",
-    description="Full manifest for agents: endpoints, auth model, stack aliases, publish body schema, the versioning model, and configured limits. Intended to be fetched once before scripting against the API.",
+    description=(
+        "Full manifest for agents: endpoint catalog, auth model, stack "
+        "aliases, publish body schema, the versioning model, and the limits "
+        "this deployment is actually configured with. Intended to be fetched "
+        "once before scripting against the API — it is the authoritative "
+        "source when this document and the running service disagree. "
+        "Unauthenticated; contains no owner or token details."
+    ),
+    responses={
+        200: {
+            "description": (
+                "The manifest: 'service', 'version', 'base_url', 'auth', "
+                "'endpoints', 'publish_body', 'versioning', 'limits', 'notes'."
+            )
+        }
+    },
 )
 def context(request: Request) -> dict:
     """Machine-readable manifest of the service, for agents."""
@@ -1147,6 +1327,32 @@ def context(request: Request) -> dict:
                 "path": "/skill",
                 "auth": "none",
                 "purpose": "SKILL.md for agents (text/markdown)",
+            },
+            {
+                "method": "GET",
+                "path": "/agent",
+                "auth": "none",
+                "purpose": (
+                    "a ready-to-install Claude Code subagent definition "
+                    "(text/markdown); install with 'install -d "
+                    "~/.claude/agents && curl -fsSL {base}/agent -o "
+                    "~/.claude/agents/artifact-hub.md'"
+                ),
+            },
+            {
+                "method": "GET",
+                "path": "/admin",
+                "auth": (
+                    "none to load the page; the visitor's own storage token, "
+                    "entered in the browser, for every call it makes"
+                ),
+                "purpose": (
+                    "owner/moderation studio (HTML): list your artifacts, "
+                    "review and diff proposals, promote, reject, pin or "
+                    "delete versions. The token stays in the browser tab "
+                    "(sessionStorage) and is only sent as the usual "
+                    "management headers."
+                ),
             },
             {
                 "method": "GET",
@@ -1373,9 +1579,22 @@ def context(request: Request) -> dict:
 @app.get(
     "/skill",
     tags=["service"],
+    response_class=MarkdownResponse,
     summary="Agent-facing SKILL.md",
-    description="Serves skills/artifact-publisher/SKILL.md verbatim, teaching an AI agent how to authenticate, publish artifacts and contribute versions unassisted.",
-    responses={404: {"description": "SKILL.md is not readable on this deployment."}},
+    description=(
+        "Serves skills/artifact-publisher/SKILL.md verbatim as text/markdown, "
+        "teaching an AI agent how to authenticate, publish artifacts and "
+        "contribute versions unassisted. Unauthenticated, and identical for "
+        "every caller. Use /agent instead for a ready-to-install Claude Code "
+        "subagent definition."
+    ),
+    responses={
+        200: {
+            "description": "The SKILL.md document.",
+            "content": CONTENT_MARKDOWN,
+        },
+        404: {"description": "SKILL.md is not readable on this deployment."},
+    },
 )
 def skill() -> Response:
     """Serve the agent-facing SKILL.md."""
@@ -1390,16 +1609,109 @@ def skill() -> Response:
 
 
 @app.get(
-    "/a/{artifact_id}",
-    tags=["public"],
-    summary="Rendered artifact page (head version)",
-    description="Serves the head version's built HTML as-is — the newest live version, or the one the owner pinned. When the artifact is password-protected and the caller has not unlocked it, returns the HTML unlock form instead.",
+    "/agent",
+    tags=["service"],
+    response_class=MarkdownResponse,
+    summary="Ready-to-install Claude Code subagent definition",
+    description=(
+        "Serves skills/artifact-hub-agent/AGENT.md verbatim as text/markdown: "
+        "a self-contained Claude Code subagent definition (YAML front matter "
+        "plus instructions) that knows how to publish, update and moderate "
+        "artifacts on this hub. Install it with:\n\n"
+        "`install -d ~/.claude/agents && curl -fsSL {base}/agent -o "
+        "~/.claude/agents/artifact-hub.md`\n\n"
+        "Unauthenticated, and identical for every caller."
+    ),
     responses={
-        401: {"description": "Password-protected artifact; the unlock form is returned."},
-        404: {"description": "No artifact exists with this id, or it has no live version."},
+        200: {
+            "description": "The AGENT.md subagent definition.",
+            "content": CONTENT_MARKDOWN,
+        },
+        404: {"description": "AGENT.md is not readable on this deployment."},
     },
 )
-def read_artifact(artifact_id: str, request: Request) -> Response:
+def agent() -> Response:
+    """Serve the ready-to-install Claude Code subagent definition."""
+    try:
+        text = AGENT_PATH.read_text(encoding="utf-8")
+    except OSError:
+        logger.error("AGENT.md not readable at %s", AGENT_PATH)
+        return JSONResponse(
+            status_code=404, content={"error": "agent definition not available"}
+        )
+    return Response(content=text, media_type="text/markdown; charset=utf-8")
+
+
+@app.get(
+    "/admin",
+    tags=["service"],
+    response_class=HTMLResponse,
+    summary="Owner and moderation studio (browser UI)",
+    description=(
+        "A single self-contained HTML page for artifact owners: list the "
+        "artifacts your project owns, open a version history, read a pending "
+        "proposal, diff it against the head, then promote, reject, pin or "
+        "delete it, and toggle accept_versions.\n\n"
+        "The page itself is public and needs no credentials — authentication "
+        "happens entirely in the browser. The visitor pastes their Storage "
+        "token and picks a stack; the page keeps them in a JavaScript variable "
+        "and in sessionStorage (per-tab, cleared when the tab closes) and "
+        "sends them as the usual X-StorageApi-Token / X-Storage-Stack headers "
+        "on the very same API calls curl would make. The server never sees or "
+        "stores the token beyond serving those ordinary API requests."
+    ),
+    responses={
+        200: {"description": "The admin studio page.", "content": CONTENT_HTML}
+    },
+)
+def admin(request: Request) -> HTMLResponse:
+    """Serve the client-side moderation studio.
+
+    Deliberately a static document: no server-side session, no token handling,
+    nothing to log. Everything it does, it does from the visitor's browser
+    against the public API.
+    """
+    return HTMLResponse(
+        admin_page(base_url(request), SERVICE_VERSION, GITHUB_REPO_URL)
+    )
+
+
+@app.get(
+    "/a/{artifact_id}",
+    tags=["public"],
+    response_class=HTMLResponse,
+    summary="Rendered artifact page (head version)",
+    description=(
+        "Serves the head version's built HTML as-is — the newest live "
+        "version, or the one the owner pinned. No token is needed: the "
+        "unguessable id in the URL is the access control.\n\n"
+        + PASSWORD_GATE_NOTE
+        + "\n\nUntil the caller is unlocked, this returns 401 with the unlock "
+        "form as HTML rather than the artifact."
+    ),
+    responses={
+        200: {
+            "description": "The head version's HTML document.",
+            "content": CONTENT_HTML,
+        },
+        401: {
+            "description": (
+                "Password-protected artifact; the HTML unlock form is returned."
+            ),
+            "content": CONTENT_HTML,
+        },
+        404: {
+            "description": (
+                "No artifact exists with this id, or it has no live version."
+            )
+        },
+        502: RESP_HUB_502,
+    },
+)
+def read_artifact(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+) -> Response:
     """Serve the head version, or the unlock form when protected."""
     meta = _meta_of(request, artifact_id)
     if meta is None:
@@ -1415,16 +1727,40 @@ def read_artifact(artifact_id: str, request: Request) -> Response:
 @app.post(
     "/a/{artifact_id}/unlock",
     tags=["public"],
+    status_code=303,
     summary="Unlock a password-protected artifact",
-    description="Target of the HTML unlock form. On a correct password, redirects to the artifact page and sets a signed, path-scoped cookie so future browser visits do not need the password again.",
+    description=(
+        "Target of the HTML unlock form; the password is sent as an "
+        "application/x-www-form-urlencoded 'password' field. On a correct "
+        "password this responds 303 to the artifact page and sets a signed, "
+        "HttpOnly cookie scoped to /a/{id}, so later visits from that browser "
+        "skip the form until the cookie expires. Machine clients do not need "
+        "this endpoint at all — they send X-Artifact-Password on each read."
+    ),
     responses={
-        303: {"description": "Correct password; redirects to the artifact page with an unlock cookie set."},
-        401: {"description": "Wrong password; the unlock form is returned with an error message."},
-        404: {"description": "No artifact exists with this id."},
+        303: {
+            "description": (
+                "Correct password; redirects to the artifact page with an "
+                "unlock cookie set."
+            )
+        },
+        401: {
+            "description": (
+                "Wrong password; the unlock form is returned with an error "
+                "message."
+            ),
+            "content": CONTENT_HTML,
+        },
+        404: RESP_NOT_FOUND,
+        502: RESP_HUB_502,
     },
 )
 def unlock_artifact(
-    artifact_id: str, request: Request, password: str = Form("")
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    password: str = Form(
+        "", description="The artifact's reader password, from the unlock form."
+    ),
 ) -> Response:
     """Password form target: on success set a signed, path-scoped cookie."""
     meta = _meta_of(request, artifact_id)
@@ -1450,14 +1786,38 @@ def unlock_artifact(
 @app.get(
     "/a/{artifact_id}/raw",
     tags=["public"],
+    response_class=HTMLResponse,
     summary="Raw artifact HTML (head version)",
-    description="The exact built HTML of the head version, with no unlock-form fallback — meant for machine consumption. When protected, send the password via the X-Artifact-Password header.",
+    description=(
+        "The exact built HTML of the head version, with no unlock-form "
+        "fallback — meant for machine consumption. Identical bytes to what "
+        "GET /a/{id} serves.\n\n" + PASSWORD_GATE_NOTE + "\n\nA protected "
+        "artifact without a valid password answers 401 as JSON, never as a "
+        "form."
+    ),
     responses={
-        401: {"description": "Password required or wrong (see X-Artifact-Password header)."},
-        404: {"description": "No artifact exists with this id, or it has no live version."},
+        200: {
+            "description": "The head version's HTML document.",
+            "content": CONTENT_HTML,
+        },
+        401: {
+            "description": (
+                "Password required or wrong; JSON hint pointing at the "
+                "X-Artifact-Password header."
+            )
+        },
+        404: {
+            "description": (
+                "No artifact exists with this id, or it has no live version."
+            )
+        },
+        502: RESP_HUB_502,
     },
 )
-def read_raw(artifact_id: str, request: Request) -> Response:
+def read_raw(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+) -> Response:
     """The head version's HTML itself, for machines."""
     meta = _meta_of(request, artifact_id)
     if meta is None:
@@ -1474,13 +1834,40 @@ def read_raw(artifact_id: str, request: Request) -> Response:
     "/a/{artifact_id}/source",
     tags=["public"],
     summary="Original submitted source",
-    description="Returns the original Markdown for markdown-sourced artifacts, or the original HTML for html/git-html artifacts. Markdown rendered from a git repository has no retained source and returns 404 with a pointer back to the repository.",
+    description=(
+        "Returns the head version's original Markdown (as text/markdown) for "
+        "markdown-sourced artifacts, or the original HTML (as text/html) for "
+        "html and git-html artifacts. Markdown rendered from a git repository "
+        "has no retained source: that answers 404 with a JSON pointer back to "
+        "the repository, ref and commit.\n\n" + PASSWORD_GATE_NOTE
+    ),
     responses={
-        401: {"description": "Password required or wrong (see X-Artifact-Password header)."},
-        404: {"description": "No artifact with this id, or its source was not retained (git-sourced Markdown)."},
+        200: {
+            "description": (
+                "The retained source: Markdown for markdown artifacts, HTML "
+                "otherwise."
+            ),
+            "content": {**CONTENT_MARKDOWN, **CONTENT_HTML},
+        },
+        401: {
+            "description": (
+                "Password required or wrong (see the X-Artifact-Password "
+                "header)."
+            )
+        },
+        404: {
+            "description": (
+                "No artifact with this id, it has no live version, or its "
+                "source was not retained (git-sourced Markdown)."
+            )
+        },
+        502: RESP_HUB_502,
     },
 )
-def read_source(artifact_id: str, request: Request) -> Response:
+def read_source(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+) -> Response:
     """The original source: markdown for markdown artifacts, HTML otherwise."""
     meta = _meta_of(request, artifact_id)
     if meta is None:
@@ -1516,10 +1903,28 @@ def read_source(artifact_id: str, request: Request) -> Response:
     "/a/{artifact_id}/meta",
     tags=["public"],
     summary="Public artifact metadata",
-    description="JSON metadata of the artifact and its head version (title, timestamps, version counts, protection and contribution flags, size) with no owner details. Available even when the artifact is password-protected.",
-    responses={404: {"description": "No artifact exists with this id, or it has no live version."}},
+    description=(
+        "JSON metadata of the artifact and its head version: title, source "
+        "type, timestamps, size, head version, total and proposed version "
+        "counts, the 'protected' and 'accept_versions' flags, and every "
+        "public URL. Deliberately carries no owner identity and no password "
+        "record. Unlike the content endpoints this is readable even when the "
+        "artifact is password-protected — it is metadata only."
+    ),
+    responses={
+        200: {"description": "The artifact's public metadata."},
+        404: {
+            "description": (
+                "No artifact exists with this id, or it has no live version."
+            )
+        },
+        502: RESP_HUB_502,
+    },
 )
-def read_meta(artifact_id: str, request: Request) -> Response:
+def read_meta(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+) -> Response:
     """Public metadata; available even when the artifact is password-protected."""
     meta = _meta_of(request, artifact_id)
     if meta is None:
@@ -1550,15 +1955,43 @@ def read_meta(artifact_id: str, request: Request) -> Response:
 @app.get(
     "/a/{artifact_id}/v/{version}",
     tags=["public"],
+    response_class=HTMLResponse,
     summary="One specific version",
-    description="Serves the built HTML of a single version. A proposed version is private: only the artifact owner and the version's author can read it, by sending X-StorageApi-Token and X-Storage-Stack.",
+    description=(
+        "Serves the built HTML of a single version, live or proposed. A "
+        "*proposed* version is private: only the artifact owner and the "
+        "version's own author may read it, and they identify themselves by "
+        "sending the two management headers (X-StorageApi-Token and "
+        "X-Storage-Stack) on this otherwise unauthenticated read. Anyone else "
+        "gets 403.\n\n" + PASSWORD_GATE_NOTE
+    ),
     responses={
-        401: {"description": "Password-protected artifact; the unlock form is returned."},
-        403: {"description": "This version is a proposal and the caller is neither the owner nor its author."},
-        404: {"description": "No artifact or no such version."},
+        200: {
+            "description": "That version's HTML document.",
+            "content": CONTENT_HTML,
+        },
+        401: {
+            "description": (
+                "Password-protected artifact; the HTML unlock form is returned."
+            ),
+            "content": CONTENT_HTML,
+        },
+        403: {
+            "description": (
+                "This version is a proposal and the caller is neither the "
+                "owner nor its author."
+            )
+        },
+        404: {"description": "No artifact, or no such version."},
+        422: {"description": "'version' is not an integer."},
+        502: RESP_HUB_502,
     },
 )
-def read_version(artifact_id: str, version: int, request: Request) -> Response:
+def read_version(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    version: int = PathParam(..., description=VERSION_DESC),
+) -> Response:
     """Serve one version, honoring both the password gate and proposal privacy."""
     meta = _meta_of(request, artifact_id)
     if meta is None:
@@ -1577,14 +2010,53 @@ def read_version(artifact_id: str, version: int, request: Request) -> Response:
     "/a/{artifact_id}/versions",
     tags=["public"],
     summary="Version history",
-    description="Lists every version (live and proposed) newest first, with its author, status, note and size. Add ?format=html for a human-readable picker page with links to each version and to the diff of every adjacent pair. Proposal *metadata* is public to capability-URL holders; proposal *content* is not.",
+    description=(
+        "Lists every version (live and proposed) newest first, with its "
+        "number, title, status, author project, note, size, source type and "
+        "creation time, plus the current head version and the artifact's "
+        "'protected' and 'accept_versions' flags.\n\n"
+        "Proposal *metadata* is public to capability-URL holders; proposal "
+        "*content* is not — fetching it still requires being the owner or the "
+        "author (see GET /a/{id}/v/{n}).\n\n"
+        "The 'format' query parameter selects the rendering: 'json' (the "
+        "default) returns the machine-readable history; 'html' returns a "
+        "styled picker page with links to each version and to the diff of "
+        "every adjacent pair. Any other value is treated as 'json'.\n\n"
+        + PASSWORD_GATE_NOTE
+    ),
     responses={
-        401: {"description": "Password required or wrong (see X-Artifact-Password header)."},
-        404: {"description": "No artifact exists with this id."},
+        200: {
+            "description": (
+                "The version history as JSON, or the picker page when "
+                "format=html."
+            ),
+            "content": {"application/json": {}, **CONTENT_HTML},
+        },
+        401: {
+            "description": (
+                "Password required or wrong: JSON for format=json, the HTML "
+                "unlock form for format=html."
+            )
+        },
+        404: RESP_NOT_FOUND,
+        502: RESP_HUB_502,
     },
 )
 def read_versions(
-    artifact_id: str, request: Request, format: str = "json"
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    format: str = Query(
+        "json",
+        description=(
+            "Rendering of the history: 'json' (default, machine-readable) or "
+            "'html' (a human-readable picker page). Any other value falls "
+            "back to 'json'."
+        ),
+        # Documentation only: the runtime deliberately accepts anything and
+        # falls back to JSON, so declaring a Literal here would turn today's
+        # silent fallback into a 422.
+        json_schema_extra={"enum": ["json", "html"]},
+    ),
 ) -> Response:
     """Version history as JSON, or a styled picker page with ?format=html."""
     meta = _meta_of(request, artifact_id)
@@ -1631,17 +2103,68 @@ def read_versions(
     "/a/{artifact_id}/diff/{spec}",
     tags=["public"],
     summary="Diff two versions",
-    description="Compares two versions given as '{older}..{newer}' (for example 3..5). Renders a side-by-side HTML page by default; ?format=unified returns text/plain and ?format=json returns the unified diff plus added/removed counts. Markdown is compared when both versions carry it, otherwise the built HTML.",
+    description=(
+        "Compares two versions of one artifact, given in the path as "
+        "'{older}..{newer}' (for example 3..5). Markdown is compared when "
+        "both versions carry Markdown source, otherwise the built HTML is.\n\n"
+        "The 'format' query parameter selects the rendering: 'html' (the "
+        "default) is a side-by-side page for humans, 'unified' is a "
+        "text/plain unified diff, and 'json' returns the unified diff plus "
+        "added/removed line counts. An unknown value is a 400.\n\n"
+        "Either side may be a proposal, in which case the same rule as GET "
+        "/a/{id}/v/{n} applies: send the two management headers to read it as "
+        "the owner or the author, otherwise 403.\n\n" + PASSWORD_GATE_NOTE
+    ),
     responses={
-        400: {"description": "Malformed diff spec or unknown format."},
-        401: {"description": "Password required or wrong (see X-Artifact-Password header)."},
+        200: {
+            "description": (
+                "The diff in the requested rendering: HTML page, plain-text "
+                "unified diff, or JSON."
+            ),
+            "content": {
+                **CONTENT_HTML,
+                **CONTENT_TEXT,
+                "application/json": {},
+            },
+        },
+        400: {
+            "description": (
+                "Malformed diff spec (not OLD..NEW) or an unknown 'format'."
+            )
+        },
+        401: {
+            "description": (
+                "Password required or wrong (see the X-Artifact-Password "
+                "header)."
+            )
+        },
         403: {"description": "One side is a proposal the caller may not read."},
-        404: {"description": "No artifact, or one of the versions does not exist."},
-        413: {"description": "One side exceeds HUB_DIFF_MAX_BYTES."},
+        404: {
+            "description": "No artifact, or one of the versions does not exist."
+        },
+        413: {
+            "description": (
+                "One side is larger than the configured HUB_DIFF_MAX_BYTES."
+            )
+        },
+        502: RESP_HUB_502,
     },
 )
 def read_diff(
-    artifact_id: str, spec: str, request: Request, format: str = "html"
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    spec: str = PathParam(..., description=SPEC_DESC),
+    format: str = Query(
+        "html",
+        description=(
+            "Rendering of the diff: 'html' (default, side-by-side page), "
+            "'unified' (text/plain unified diff) or 'json' (unified diff plus "
+            "added/removed counts). Anything else is a 400."
+        ),
+        # Documentation only — validation stays in compute_diff so an unknown
+        # format keeps answering 400 rather than FastAPI's 422.
+        json_schema_extra={"enum": ["html", "unified", "json"]},
+    ),
 ) -> Response:
     """Diff two versions of one artifact in the requested rendering."""
     match = _DIFF_SPEC.match(spec)
@@ -1698,12 +2221,29 @@ def read_diff(
     summary="Publish a new artifact",
     description="Publish HTML, Markdown, or a git repository as a new artifact. Exactly one of 'html', 'markdown', 'git_url' must be provided. Requires a Storage token (X-StorageApi-Token) and stack (X-Storage-Stack); the token establishes the owning project and is used once to store a canonical copy there. Set 'accept_versions' to let other projects submit moderated version proposals.",
     responses={
-        201: {"description": "Artifact published as version 1; returns its id and URLs."},
-        400: {"description": "Unknown or disallowed X-Storage-Stack value."},
-        401: {"description": "Storage token missing or rejected by the stack."},
+        201: {
+            "description": (
+                "Artifact published as version 1; returns its id, title, "
+                "flags, head version and every public URL."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
         413: {"description": "Built HTML exceeds the configured size limit."},
-        422: {"description": "Invalid body: not exactly one content field, git credentials without git_url, or a build failure (bad repo, no entry file, markdown render error)."},
-        502: {"description": "The caller's Keboola stack could not be reached to verify the token, or the canonical upload failed."},
+        422: {
+            "description": (
+                "Invalid body: not exactly one content field, git credentials "
+                "without git_url, or a build failure (bad repo, no entry "
+                "file, markdown render error)."
+            )
+        },
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, the canonical upload into the caller's project "
+                "failed, or the hub's own Storage is unavailable."
+            )
+        },
     },
 )
 def publish_artifact(
@@ -1767,20 +2307,41 @@ def publish_artifact(
     summary="Update an artifact",
     description="Owner-only. A content field ('html', 'markdown', 'git_url') adds a new live version; 'password', 'clear_password' and 'accept_versions' change artifact-level settings. A title is only valid together with new content, because a title lives on a version.",
     responses={
-        200: {"description": "Artifact updated; returns its current state."},
-        400: {"description": "Unknown or disallowed X-Storage-Stack value."},
-        401: {"description": "Storage token missing or rejected by the stack."},
-        403: {"description": "Token is valid but not from the project that owns this artifact."},
-        404: {"description": "No artifact exists with this id."},
+        200: {
+            "description": (
+                "Artifact updated; returns its current state, including the "
+                "version this call produced and the version now served."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: {
+            "description": (
+                "Token is valid but not from the project that owns this "
+                "artifact."
+            )
+        },
+        404: RESP_NOT_FOUND,
         413: {"description": "Built HTML exceeds the configured size limit."},
-        422: {"description": "Invalid body: more than one content field, git credentials without git_url, a title without content, or a build failure."},
-        502: {"description": "The caller's Keboola stack could not be reached to verify the token, or the canonical upload failed."},
+        422: {
+            "description": (
+                "Invalid body: more than one content field, git credentials "
+                "without git_url, a title without content, or a build failure."
+            )
+        },
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, the canonical upload failed, or the hub's own "
+                "Storage is unavailable."
+            )
+        },
     },
 )
 def update_artifact(
-    artifact_id: str,
     body: UpdateBody,
     request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
     auth: tuple[Owner, str] = Depends(require_owner),
 ) -> Response:
     """Add a live version and/or change the artifact-level settings."""
@@ -1861,11 +2422,30 @@ def update_artifact(
     "/api/artifacts",
     tags=["artifacts"],
     summary="List the caller's artifacts",
-    description="Lists artifacts owned by the caller's own project (identified by the Storage token's owning project), with version counts and URLs merged in.",
+    description=(
+        "Lists the artifacts owned by the caller's own project — ownership is "
+        "the pair (stack, project id) derived from the Storage token, so the "
+        "listing depends only on the credentials, never on a query. Each row "
+        "carries the title, timestamps, 'protected' and 'accept_versions' "
+        "flags, head version, total version count, pending 'proposed_count', "
+        "and every public URL. Newest 'updated_at' first. This is the "
+        "endpoint the /admin studio calls to sign a visitor in."
+    ),
     responses={
-        400: {"description": "Unknown or disallowed X-Storage-Stack value."},
-        401: {"description": "Storage token missing or rejected by the stack."},
-        502: {"description": "The caller's Keboola stack could not be reached to verify the token."},
+        200: {
+            "description": (
+                "JSON with 'project_id' and the 'artifacts' array (possibly "
+                "empty)."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable."
+            )
+        },
     },
 )
 def list_artifacts(
@@ -1886,18 +2466,39 @@ def list_artifacts(
     "/api/artifacts/{artifact_id}",
     tags=["artifacts"],
     summary="Delete an artifact",
-    description="Deletes every version and the meta record from the hub's project. The canonical copies in the authors' own projects are left untouched. Requires a Storage token from the owning project.",
+    description=(
+        "Deletes every version and the meta record from the hub's project, so "
+        "the artifact and all its URLs stop resolving. Irreversible. The "
+        "canonical copies in the authors' own Keboola projects are left "
+        "untouched. Requires a Storage token from the owning project; another "
+        "project's valid token is a 403."
+    ),
     responses={
-        400: {"description": "Unknown or disallowed X-Storage-Stack value."},
-        401: {"description": "Storage token missing or rejected by the stack."},
-        403: {"description": "Token is valid but not from the project that owns this artifact."},
-        404: {"description": "No artifact exists with this id."},
-        502: {"description": "The caller's Keboola stack could not be reached to verify the token."},
+        200: {
+            "description": (
+                "Deleted; JSON confirming the canonical copies were kept."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: {
+            "description": (
+                "Token is valid but not from the project that owns this "
+                "artifact."
+            )
+        },
+        404: RESP_NOT_FOUND,
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable."
+            )
+        },
     },
 )
 def delete_artifact(
-    artifact_id: str,
     request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
     auth: tuple[Owner, str] = Depends(require_owner),
 ) -> Response:
     """Delete every version; the authors' canonical copies are left untouched."""
@@ -1932,21 +2533,47 @@ def delete_artifact(
     summary="Submit a new version",
     description="Adds a version to an existing artifact. The owning project's submissions go live immediately; another project may submit only when the owner set 'accept_versions', and its submission lands as a moderated proposal that stays private until the owner promotes it. The canonical copy is stored in the *caller's* own project with the caller's token.",
     responses={
-        201: {"description": "Version stored; returns its number, status and URL."},
-        400: {"description": "Unknown or disallowed X-Storage-Stack value."},
-        401: {"description": "Storage token missing or rejected by the stack."},
-        403: {"description": "This artifact does not accept versions from other projects."},
-        404: {"description": "No artifact exists with this id."},
+        201: {
+            "description": (
+                "Version stored; returns its number, its status ('live' for "
+                "the owner, 'proposed' otherwise), the note and its URL."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: {
+            "description": (
+                "This artifact does not accept versions from other projects "
+                "(its owner has not set accept_versions)."
+            )
+        },
+        404: RESP_NOT_FOUND,
         413: {"description": "Built HTML exceeds the configured size limit."},
-        422: {"description": "Invalid body: not exactly one content field, git credentials without git_url, an over-long note, or a build failure."},
-        429: {"description": "This project reached HUB_MAX_VERSIONS_PER_DAY submissions for this artifact today."},
-        502: {"description": "The caller's Keboola stack could not be reached, or the canonical upload failed."},
+        422: {
+            "description": (
+                "Invalid body: not exactly one content field, git credentials "
+                "without git_url, an over-long note, or a build failure."
+            )
+        },
+        429: {
+            "description": (
+                "This project reached HUB_MAX_VERSIONS_PER_DAY submissions "
+                "for this artifact today."
+            )
+        },
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached, the "
+                "canonical upload failed, or the hub's own Storage is "
+                "unavailable."
+            )
+        },
     },
 )
 def submit_version(
-    artifact_id: str,
     body: VersionBody,
     request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
     auth: tuple[Owner, str] = Depends(require_owner),
 ) -> Response:
     """Submit one version: live for the owner, a moderated proposal otherwise."""
@@ -2029,19 +2656,30 @@ def submit_version(
     summary="Promote a proposal to live",
     description="Owner-only. Marks a proposed version live so it can be served. With the default head mode ('latest') the promoted version immediately becomes what /a/{id} serves.",
     responses={
-        200: {"description": "Version promoted; reports the version now served as head."},
-        400: {"description": "Unknown or disallowed X-Storage-Stack value."},
-        401: {"description": "Storage token missing or rejected by the stack."},
+        200: {
+            "description": (
+                "Version promoted; reports its new status, the head mode and "
+                "the version now served as head."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
         403: {"description": "Only the owning project may promote a version."},
-        404: {"description": "No artifact or no such version."},
+        404: {"description": "No artifact, or no such version."},
         409: {"description": "That version is already live."},
-        502: {"description": "The caller's Keboola stack could not be reached to verify the token."},
+        422: {"description": "'version' is not an integer."},
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable."
+            )
+        },
     },
 )
 def promote_version(
-    artifact_id: str,
-    version: int,
     request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    version: int = PathParam(..., description=VERSION_DESC),
     auth: tuple[Owner, str] = Depends(require_owner),
 ) -> Response:
     """Owner approves a proposal: its status becomes live."""
@@ -2095,19 +2733,35 @@ def promote_version(
     summary="Delete a version or withdraw a proposal",
     description="The owning project may delete any version except the last live one. A contributor may delete only their own proposal — withdrawing a submission they no longer stand behind.",
     responses={
-        200: {"description": "Version deleted."},
-        400: {"description": "Unknown or disallowed X-Storage-Stack value."},
-        401: {"description": "Storage token missing or rejected by the stack."},
-        403: {"description": "Not the owner, and not the author of this proposal."},
-        404: {"description": "No artifact or no such version."},
-        409: {"description": "This is the only live version; an artifact must keep one."},
-        502: {"description": "The caller's Keboola stack could not be reached to verify the token."},
+        200: {
+            "description": (
+                "Version deleted; reports the version now served as head."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: {
+            "description": "Not the owner, and not the author of this proposal."
+        },
+        404: {"description": "No artifact, or no such version."},
+        409: {
+            "description": (
+                "This is the only live version; an artifact must keep one."
+            )
+        },
+        422: {"description": "'version' is not an integer."},
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable."
+            )
+        },
     },
 )
 def delete_version(
-    artifact_id: str,
-    version: int,
     request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    version: int = PathParam(..., description=VERSION_DESC),
     auth: tuple[Owner, str] = Depends(require_owner),
 ) -> Response:
     """Owner deletes any version; a contributor withdraws their own proposal."""
@@ -2169,19 +2823,36 @@ def delete_version(
     summary="Choose what /a/{id} serves",
     description="Owner-only. {'mode': 'latest'} always serves the newest live version; {'mode': 'pinned', 'version': n} freezes the artifact on one live version, which is also protected from retention pruning.",
     responses={
-        200: {"description": "Head pointer updated; reports the version now served."},
-        400: {"description": "Unknown or disallowed X-Storage-Stack value."},
-        401: {"description": "Storage token missing or rejected by the stack."},
-        403: {"description": "Only the owning project may move the head pointer."},
-        404: {"description": "No artifact exists with this id."},
-        422: {"description": "Unknown mode, missing version for 'pinned', or a version that does not exist or is not live."},
-        502: {"description": "The caller's Keboola stack could not be reached to verify the token."},
+        200: {
+            "description": (
+                "Head pointer updated; reports the new head mode and the "
+                "version now served."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: {
+            "description": "Only the owning project may move the head pointer."
+        },
+        404: RESP_NOT_FOUND,
+        422: {
+            "description": (
+                "Unknown mode, missing 'version' for 'pinned', or a version "
+                "that does not exist or is not live."
+            )
+        },
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable."
+            )
+        },
     },
 )
 def set_head(
-    artifact_id: str,
     body: HeadBody,
     request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
     auth: tuple[Owner, str] = Depends(require_owner),
 ) -> Response:
     """Point the head at the newest live version, or pin it to one version."""

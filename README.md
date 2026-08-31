@@ -33,6 +33,14 @@ content, source, or metadata over a small JSON API.
 - **Head pointer**: `/a/{id}` serves the newest live version, or one you pin
 - Machine-readable API: `/context` manifest and a `/skill` SKILL.md an AI
   agent can read to learn how to publish and contribute, unassisted
+- **Admin studio** (`/admin`): a browser moderation UI where an artifact's
+  owner pastes their Storage token client-side (kept in `sessionStorage`,
+  never sent to or stored by the server) to review proposal diffs, promote or
+  reject them, pin the head version, and toggle `accept_versions` — all by
+  clicking
+- **Installable agent** (`/agent`): serves a ready-to-use Claude Code subagent
+  definition, distilled from `/skill`, that a user can drop straight into
+  `~/.claude/agents/`
 - Markdown rendering with GFM tables, task lists, mermaid diagrams, and
   syntax-highlighted code
 - Survives restarts: the only durable state is Keboola Storage Files; local
@@ -90,6 +98,8 @@ Public (no auth):
 | POST | `/` | Returns 200 (platform health check) |
 | GET | `/context` | Machine-readable manifest |
 | GET | `/skill` | SKILL.md (`text/markdown`) teaching agents how to publish |
+| GET | `/agent` | Ready-to-install Claude Code subagent definition (`text/markdown`) |
+| GET | `/admin` | Browser moderation studio (owner pastes their Storage token client-side; never stored server-side) |
 | GET | `/docs` | Interactive Swagger UI for this API |
 | GET | `/openapi.json` | Machine-readable OpenAPI schema for this API |
 | GET | `/a/{id}` | Head version rendered, or the password unlock form |
@@ -225,6 +235,18 @@ repository has to send it again. Use the narrowest scope possible and revoke
 the token when it is no longer needed. Note that the published artifact is
 still served from a public URL: the token protects the clone, not the result.
 
+## Install the agent / skill
+
+Two ways to teach an AI agent this API, both served directly by the hub:
+
+```bash
+# Claude Code subagent — fully self-contained, no other skill needs to load
+install -d ~/.claude/agents && curl -fsSL "$HUB/agent" -o ~/.claude/agents/artifact-hub.md
+
+# SKILL.md — for a skills-based setup (e.g. skills/artifact-publisher/)
+install -d ~/.claude/skills/artifact-publisher && curl -fsSL "$HUB/skill" -o ~/.claude/skills/artifact-publisher/SKILL.md
+```
+
 ## Local development
 
 ```bash
@@ -321,3 +343,14 @@ As a v1 caveat, all artifacts
 are served from the same application origin, which makes the path-scoped
 cookie a soft boundary rather than a hard one; this is an accepted risk for
 v1 and may be revisited (e.g. per-artifact subdomains) later.
+
+## Contributing
+
+See `CLAUDE.md` at the repo root for project-specific rules before changing
+code: the 3.11 f-string-backslash gotcha, why absolute URLs must go through
+`base_url()`/the `public_origin` middleware instead of the raw `Host` header,
+the Storage-tag-driven index rebuild, and the secrets-scrubbing discipline
+around client and git tokens. In short — `uv run pytest tests/ -q` and
+`python3.11 -m py_compile src/*.py` must both be clean before any commit, and
+tests must use `InMemoryFilesBackend` with `verify_token` patched, never a
+live Keboola call.

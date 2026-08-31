@@ -26,6 +26,16 @@ Call `GET /context` on that same host for a machine-readable manifest
 (supported inputs, current limits, endpoint list) if you need to confirm
 capabilities before publishing. For interactive exploration, `GET /docs`
 serves a Swagger UI and `GET /openapi.json` the underlying OpenAPI schema.
+If anything below ever looks stale, `/skill` and `/context` are always the
+current truth — re-fetch them rather than trusting a cached copy of this file.
+
+`GET /agent` serves a ready-to-install Claude Code subagent that knows this
+entire API (auth, publishing, versioning, moderation) without needing this
+skill loaded at all. Install it with:
+
+```bash
+install -d ~/.claude/agents && curl -fsSL "$HUB/agent" -o ~/.claude/agents/artifact-hub.md
+```
 
 ## Authentication
 
@@ -345,6 +355,17 @@ is protected from retention pruning. The response reports
 - **Rate limit** — `HUB_MAX_VERSIONS_PER_DAY` (default 20) submitted versions
   per contributing project, per artifact, per UTC day. Past that, 429.
 
+### Admin studio
+
+`GET /admin` is a browser-based moderation studio for an artifact's owner:
+review proposal diffs, promote or reject them, pin the head version, and
+toggle `accept_versions` — all by clicking, no curl required. The author signs
+in by pasting their own Storage token directly into the page; that token stays
+in the browser's `sessionStorage` and is **never** sent to or stored by the
+hub's server outside the individual API calls it makes on the author's behalf.
+Point a human at this page instead of asking them to run the promote/reject
+curl commands above by hand.
+
 ## Reading (public, no token required)
 
 | Endpoint | Returns |
@@ -356,6 +377,8 @@ is protected from retention pruning. The response reports
 | `GET /a/{id}/raw` | Exact HTML that will be rendered — no chrome around it |
 | `GET /a/{id}/source` | Original source you submitted (markdown or html) |
 | `GET /a/{id}/meta` | JSON metadata (title, timestamps, head version, version counts, content type — no owner details) |
+| `GET /admin` | Browser moderation studio for the artifact owner (token pasted client-side, never stored server-side) |
+| `GET /agent` | This hub's SKILL.md distilled into a ready-to-install Claude Code subagent |
 
 If the artifact is password-protected, machine clients pass
 `X-Artifact-Password: <password>` on these requests; browsers get an HTML
