@@ -25,10 +25,12 @@ import threading
 import tomllib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import lru_cache
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.openapi.utils import get_openapi
@@ -345,6 +347,101 @@ def ensure_hydrated(app_obj: FastAPI) -> None:
 # --------------------------------------------------------------------------
 # Middleware and error handling
 # --------------------------------------------------------------------------
+
+
+#: Forwarded schemes we are willing to trust; anything else is ignored.
+_PUBLIC_SCHEMES = frozenset({"http", "https"})
+
+#: A ``host[:port]`` we are willing to write into the request scope: a
+#: registered name or IPv4 literal, or a bracketed IPv6 literal, each with an
+#: optional port. Deliberately strict — a malformed forwarded value must be
+#: dropped rather than turned into a broken absolute URL.
+_PUBLIC_HOST = re.compile(r"^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::[0-9]{1,5})?$")
+
+
+def _first_forwarded(raw: str | None) -> str:
+    """First entry of a comma-separated ``X-Forwarded-*`` value, stripped."""
+    if not raw:
+        return ""
+    return raw.split(",", 1)[0].strip()
+
+
+@lru_cache(maxsize=8)
+def _public_origin(public_base_url: str | None) -> tuple[str, str] | None:
+    """``(scheme, netloc)`` of ``HUB_PUBLIC_BASE_URL``, or None when unusable.
+
+    Memoized, so the configured value is parsed once instead of on every
+    request. Keying the cache on the value rather than parsing at import time
+    keeps the helper honest when the module-level settings object is swapped
+    (as the test suite does).
+    """
+    if not public_base_url:
+        return None
+    parsed = urlsplit(public_base_url)
+    scheme = parsed.scheme.lower()
+    if scheme not in _PUBLIC_SCHEMES or not _PUBLIC_HOST.match(parsed.netloc):
+        return None
+    return scheme, parsed.netloc
+
+
+def _set_host_header(scope: dict[str, Any], host: str) -> None:
+    """Replace (or insert) the ``host`` entry of an ASGI scope's header list.
+
+    Every other header is carried over untouched and in order; duplicate
+    ``Host`` headers collapse into the single normalized one.
+    """
+    encoded = host.encode("latin-1")
+    headers: list[tuple[bytes, bytes]] = []
+    replaced = False
+    for name, value in scope["headers"]:
+        if name == b"host":
+            if replaced:
+                continue
+            headers.append((name, encoded))
+            replaced = True
+        else:
+            headers.append((name, value))
+    if not replaced:
+        headers.append((b"host", encoded))
+    scope["headers"] = headers
+
+
+@app.middleware("http")
+async def public_origin(request: Request, call_next):
+    """Normalize the request scope to the origin the client actually used.
+
+    The Keboola data-app platform proxy terminates TLS and rewrites ``Host`` to
+    the internal cluster service name (``app-*.sandbox.svc.cluster.local``),
+    forwarding the real values in ``X-Forwarded-Proto`` / ``X-Forwarded-Host``.
+    Starlette builds *absolute* URLs straight from the ASGI scope, so without
+    this normalization a request for ``/a/{id}/`` gets a 307 whose ``Location``
+    names the internal hostname — both a leak and unreachable for the client.
+
+    Rewriting the scheme and the ``Host`` header here, before routing, fixes
+    every absolute URL Starlette generates (trailing-slash redirects today,
+    ``url_for`` tomorrow). :func:`base_url` never had this bug because it reads
+    the forwarded headers itself, which is why JSON payload URLs were correct
+    while redirects were not.
+
+    Precedence: an explicitly configured ``HUB_PUBLIC_BASE_URL`` wins, then the
+    forwarded headers; when neither yields a usable value the scope is left
+    exactly as it arrived.
+    """
+    origin = _public_origin(settings.public_base_url)
+    if origin is not None:
+        scheme, host = origin
+    else:
+        scheme = _first_forwarded(request.headers.get("x-forwarded-proto")).lower()
+        host = _first_forwarded(request.headers.get("x-forwarded-host"))
+        if scheme not in _PUBLIC_SCHEMES:
+            scheme = ""
+        if not _PUBLIC_HOST.match(host):
+            host = ""
+    if scheme:
+        request.scope["scheme"] = scheme
+    if host:
+        _set_host_header(request.scope, host)
+    return await call_next(request)
 
 
 @app.middleware("http")

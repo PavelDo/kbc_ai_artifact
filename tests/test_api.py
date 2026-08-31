@@ -273,6 +273,93 @@ def test_openapi_json_never_leaks_the_hub_storage_token(api: Api) -> None:
 
 
 # --------------------------------------------------------------------------
+# Public origin behind the platform proxy
+# --------------------------------------------------------------------------
+
+PROXY_HEADERS = {
+    "X-Forwarded-Host": "artifact-hub.example.com",
+    "X-Forwarded-Proto": "https",
+}
+
+
+def test_trailing_slash_redirect_uses_the_forwarded_origin(api: Api) -> None:
+    """The 307 must not leak the internal cluster hostname (see issue)."""
+    artifact_id = _publish_markdown(api, "# Hello")
+    resp = api.client.get(
+        f"/a/{artifact_id}/", headers=PROXY_HEADERS, follow_redirects=False
+    )
+    assert resp.status_code == 307
+    location = resp.headers["location"]
+    assert location.startswith(f"https://artifact-hub.example.com/a/{artifact_id}")
+    assert "cluster.local" not in location
+    assert "testserver" not in location
+
+
+def test_api_trailing_slash_redirect_uses_the_forwarded_origin(api: Api) -> None:
+    resp = api.client.get(
+        "/api/artifacts/",
+        headers={**AUTH_HEADERS, **PROXY_HEADERS},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 307
+    location = resp.headers["location"]
+    assert location.startswith("https://artifact-hub.example.com/api/artifacts")
+    assert "cluster.local" not in location
+    assert "testserver" not in location
+
+
+def test_public_base_url_wins_over_forwarded_headers_in_redirects(
+    api: Api, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        main,
+        "settings",
+        dataclasses.replace(api.settings, public_base_url="https://hub.example.org"),
+    )
+    artifact_id = _publish_markdown(api, "# Hello")
+    resp = api.client.get(
+        f"/a/{artifact_id}/", headers=PROXY_HEADERS, follow_redirects=False
+    )
+    assert resp.status_code == 307
+    assert resp.headers["location"].startswith(
+        f"https://hub.example.org/a/{artifact_id}"
+    )
+
+
+def test_redirect_without_forwarded_headers_is_unchanged(api: Api) -> None:
+    """Regression: no proxy headers, no public base URL — behavior as before."""
+    artifact_id = _publish_markdown(api, "# Hello")
+    resp = api.client.get(f"/a/{artifact_id}/", follow_redirects=False)
+    assert resp.status_code == 307
+    assert resp.headers["location"] == f"https://testserver/a/{artifact_id}"
+
+
+def test_malformed_forwarded_host_is_ignored(api: Api) -> None:
+    """A broken forwarded value must never become the redirect target."""
+    artifact_id = _publish_markdown(api, "# Hello")
+    resp = api.client.get(
+        f"/a/{artifact_id}/",
+        headers={"X-Forwarded-Host": "  ", "X-Forwarded-Proto": "  "},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 307
+    assert resp.headers["location"] == f"https://testserver/a/{artifact_id}"
+
+
+def test_payload_urls_still_use_the_forwarded_host(api: Api) -> None:
+    """Regression: the JSON URLs that were already correct stay correct."""
+    resp = api.client.post(
+        "/api/artifacts",
+        json={"markdown": "# Hello"},
+        headers={**AUTH_HEADERS, **PROXY_HEADERS},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["url"] == f"https://artifact-hub.example.com/a/{body['id']}"
+    assert body["versions_url"] == f"{body['url']}/versions"
+
+
+# --------------------------------------------------------------------------
 # Publish
 # --------------------------------------------------------------------------
 
