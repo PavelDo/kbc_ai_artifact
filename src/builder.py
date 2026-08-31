@@ -512,12 +512,16 @@ def _validate_git_url(git_url: str) -> str:
 def _run_git(args: list[str], timeout_s: int) -> subprocess.CompletedProcess[str]:
     """Run a git command, capturing output; never raises on non-zero exit."""
     try:
+        # GIT_TERMINAL_PROMPT=0 makes git fail immediately on private or
+        # missing repositories instead of waiting for interactive credentials.
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
         return subprocess.run(  # noqa: S603 - fixed argv, no shell
             args,
             capture_output=True,
             text=True,
             timeout=timeout_s,
             check=False,
+            env=env,
         )
     except FileNotFoundError as exc:
         raise BuildError("git is not available on this server.") from exc
@@ -538,6 +542,12 @@ def _clone(git_url: str, ref: str | None, dest: Path, timeout_s: int) -> None:
     if result.returncode == 0:
         return
     reason = _last_line(result.stderr) or _last_line(result.stdout)
+    lowered = (result.stderr or "").lower()
+    if "could not read username" in lowered or "authentication failed" in lowered:
+        raise BuildError(
+            "Could not clone the repository: it is private or does not exist. "
+            "Only public https repositories are supported."
+        )
     detail = f" git said: {reason}" if reason else ""
     if ref:
         raise BuildError(
