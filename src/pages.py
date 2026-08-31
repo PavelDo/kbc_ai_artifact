@@ -176,8 +176,8 @@ capabilities, and an optional password adds a second layer on top.</p>
 headers. The hub verifies the token against your stack's own
 <code>/v2/storage/tokens/verify</code> endpoint and never stores it.</p>
 <pre><code>X-StorageApi-Token: &lt;your Keboola Storage API token&gt;
-X-Kbc-Stack: &lt;alias or https URL&gt;</code></pre>
-<p><code>X-Kbc-Stack</code> accepts an alias (<code>us</code>,
+X-Storage-Stack: &lt;alias or https URL&gt;</code></pre>
+<p><code>X-Storage-Stack</code> accepts an alias (<code>us</code>,
 <code>gcp-us</code>, <code>eu</code>, <code>azure-eu</code>,
 <code>gcp-eu</code>) or any full <code>https://*.keboola.com</code> URL.
 Ownership is the pair (stack, project id); updating or deleting an artifact
@@ -186,7 +186,7 @@ requires a token from the project that published it.</p>
 <h2>Publish HTML</h2>
 <pre><code>curl -s -X POST "{base}/api/artifacts" \\
   -H "X-StorageApi-Token: $KBC_TOKEN" \\
-  -H "X-Kbc-Stack: eu" \\
+  -H "X-Storage-Stack: eu" \\
   -H "Content-Type: application/json" \\
   -d '{{"html": "&lt;h1&gt;Hello&lt;/h1&gt;", "title": "My report"}}'</code></pre>
 
@@ -195,7 +195,7 @@ requires a token from the project that published it.</p>
 mermaid fences and syntax highlighting.</p>
 <pre><code>curl -s -X POST "{base}/api/artifacts" \\
   -H "X-StorageApi-Token: $KBC_TOKEN" \\
-  -H "X-Kbc-Stack: eu" \\
+  -H "X-Storage-Stack: eu" \\
   -H "Content-Type: application/json" \\
   -d '{{"markdown": "# Q3 review\\n\\n- shipped\\n- measured\\n",
        "title": "Q3 review", "password": "optional"}}'</code></pre>
@@ -207,7 +207,7 @@ mermaid fences and syntax highlighting.</p>
 images are inlined as data URIs so the result is self-contained.</p>
 <pre><code>curl -s -X POST "{base}/api/artifacts" \\
   -H "X-StorageApi-Token: $KBC_TOKEN" \\
-  -H "X-Kbc-Stack: eu" \\
+  -H "X-Storage-Stack: eu" \\
   -H "Content-Type: application/json" \\
   -d '{{"git_url": "https://github.com/owner/repo",
        "git_ref": "main", "git_path": "docs/report.md"}}'</code></pre>

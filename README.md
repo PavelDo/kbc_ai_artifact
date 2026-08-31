@@ -62,7 +62,7 @@ Public (no auth):
 | GET | `/a/{id}/meta` | Public metadata JSON (no owner details) |
 | GET | `/health` | Liveness check + index stats |
 
-Authenticated (`X-StorageApi-Token` + `X-Kbc-Stack` headers):
+Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 
 | Method | Path | Description |
 |---|---|---|
@@ -74,28 +74,28 @@ Authenticated (`X-StorageApi-Token` + `X-Kbc-Stack` headers):
 ## Quick start (curl)
 
 Set `$HUB` to the deployed base URL, `your-token` to a real Keboola Storage
-API token, and pick the `X-Kbc-Stack` alias for your stack (`us`, `gcp-us`,
+API token, and pick the `X-Storage-Stack` alias for your stack (`us`, `gcp-us`,
 `eu`, `azure-eu`, `gcp-eu`, or any full `https://*.keboola.com` URL).
 
 ```bash
 # Publish HTML
 curl -s -X POST "$HUB/api/artifacts" \
   -H "X-StorageApi-Token: your-token" \
-  -H "X-Kbc-Stack: eu" \
+  -H "X-Storage-Stack: eu" \
   -H "Content-Type: application/json" \
   -d '{"html": "<!doctype html><html><body><h1>Hello</h1></body></html>", "title": "My report"}'
 
 # Publish Markdown
 curl -s -X POST "$HUB/api/artifacts" \
   -H "X-StorageApi-Token: your-token" \
-  -H "X-Kbc-Stack: eu" \
+  -H "X-Storage-Stack: eu" \
   -H "Content-Type: application/json" \
   -d '{"markdown": "# Title\n\nSome content."}'
 
 # Publish from a public git repo
 curl -s -X POST "$HUB/api/artifacts" \
   -H "X-StorageApi-Token: your-token" \
-  -H "X-Kbc-Stack: eu" \
+  -H "X-Storage-Stack: eu" \
   -H "Content-Type: application/json" \
   -d '{"git_url": "https://github.com/org/repo", "git_ref": "main", "git_path": "docs/report.md"}'
 
@@ -105,14 +105,14 @@ curl -s "$HUB/a/<id>/raw"
 # Update (owner project only)
 curl -s -X PUT "$HUB/api/artifacts/<id>" \
   -H "X-StorageApi-Token: your-token" \
-  -H "X-Kbc-Stack: eu" \
+  -H "X-Storage-Stack: eu" \
   -H "Content-Type: application/json" \
   -d '{"markdown": "# Updated"}'
 
 # Delete (owner project only)
 curl -s -X DELETE "$HUB/api/artifacts/<id>" \
   -H "X-StorageApi-Token: your-token" \
-  -H "X-Kbc-Stack: eu"
+  -H "X-Storage-Stack: eu"
 ```
 
 Add `"password": "secret"` to any publish/update body to protect the

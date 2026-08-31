@@ -33,10 +33,10 @@ two headers on every request:
 
 ```
 X-StorageApi-Token: <your Keboola Storage API token>
-X-Kbc-Stack: <alias-or-url>
+X-Storage-Stack: <alias-or-url>
 ```
 
-`X-Kbc-Stack` accepts either a short alias or a full `https://` URL of your
+`X-Storage-Stack` accepts either a short alias or a full `https://` URL of your
 Keboola stack:
 
 | Alias | Resolves to |
@@ -67,7 +67,7 @@ examples below.
 ```bash
 curl -s -X POST "$HUB/api/artifacts" \
   -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Kbc-Stack: eu" \
+  -H "X-Storage-Stack: eu" \
   -H "Content-Type: application/json" \
   -d '{
     "html": "<!doctype html><html><body><h1>Hello</h1></body></html>",
@@ -91,7 +91,7 @@ Response:
 ```bash
 curl -s -X POST "$HUB/api/artifacts" \
   -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Kbc-Stack: eu" \
+  -H "X-Storage-Stack: eu" \
   -H "Content-Type: application/json" \
   -d '{
     "markdown": "# Title\n\nSome **content** with a table:\n\n| a | b |\n|---|---|\n| 1 | 2 |\n"
@@ -108,7 +108,7 @@ writing any CSS.
 ```bash
 curl -s -X POST "$HUB/api/artifacts" \
   -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Kbc-Stack: eu" \
+  -H "X-Storage-Stack: eu" \
   -H "Content-Type: application/json" \
   -d '{
     "git_url": "https://github.com/org/repo",
@@ -136,19 +136,19 @@ authenticate by sending the header `X-Artifact-Password: secret` on reads.
 # Update (must use a token from the owning project)
 curl -s -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx" \
   -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Kbc-Stack: eu" \
+  -H "X-Storage-Stack: eu" \
   -H "Content-Type: application/json" \
   -d '{"markdown": "# Updated title\n\nNew content."}'
 
 # Delete
 curl -s -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx" \
   -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Kbc-Stack: eu"
+  -H "X-Storage-Stack: eu"
 
 # List your own project's artifacts
 curl -s "$HUB/api/artifacts" \
   -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Kbc-Stack: eu"
+  -H "X-Storage-Stack: eu"
 ```
 
 `PUT` and `DELETE` both require a token from the project that originally
@@ -196,7 +196,7 @@ mind:
 
 | Status | Meaning |
 |---|---|
-| 400 | Unknown or disallowed `X-Kbc-Stack` value |
+| 400 | Unknown or disallowed `X-Storage-Stack` value |
 | 401 | Storage token rejected by the stack, or wrong artifact password |
 | 403 | Token is valid but not from the owning project (update/delete) |
 | 404 | Unknown artifact id (identical response whether it never existed or was deleted) |

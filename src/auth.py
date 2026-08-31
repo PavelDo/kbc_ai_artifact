@@ -2,7 +2,7 @@
 
 The management API authenticates with two headers:
   X-StorageApi-Token: any Keboola Storage API token
-  X-Kbc-Stack:        stack alias or full https URL
+  X-Storage-Stack:    stack alias or full https URL
 
 A stack URL is accepted when it is https and its hostname ends with
 ``.keboola.com``, or when it is explicitly listed in HUB_EXTRA_STACKS.
@@ -59,7 +59,7 @@ def resolve_stack(raw: str, extra_stacks: tuple[str, ...] = ()) -> str:
     """Turn an alias or URL into a normalized allowed stack URL."""
     value = (raw or "").strip().rstrip("/")
     if not value:
-        raise StackError("Missing X-Kbc-Stack header (alias or https URL)")
+        raise StackError("Missing X-Storage-Stack header (alias or https URL)")
     lowered = value.lower()
     if lowered in STACK_ALIASES:
         return STACK_ALIASES[lowered]

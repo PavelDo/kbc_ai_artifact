@@ -174,7 +174,8 @@ def base_url(request: Request) -> str:
     if settings.public_base_url:
         return settings.public_base_url
     scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
-    return f"{scheme.split(',')[0].strip()}://{request.url.netloc}"
+    host = request.headers.get("x-forwarded-host") or request.url.netloc
+    return f"{scheme.split(',')[0].strip()}://{host.split(',')[0].strip()}"
 
 
 def artifact_urls(base: str, artifact_id: str) -> dict[str, str]:
@@ -195,7 +196,12 @@ def require_owner(request: Request) -> tuple[Owner, str]:
     uploaded to the caller's own project with it. It is never stored or logged.
     """
     token = request.headers.get("x-storageapi-token", "")
-    raw_stack = request.headers.get("x-kbc-stack", "")
+    # Primary header is X-Storage-Stack: the platform proxy in front of
+    # deployed data apps strips X-Kbc-* headers, so that name never arrives.
+    # X-Kbc-Stack is kept as an alias for direct/local access.
+    raw_stack = request.headers.get("x-storage-stack", "") or request.headers.get(
+        "x-kbc-stack", ""
+    )
     try:
         stack_url = resolve_stack(raw_stack, settings.extra_stacks)
     except StackError as exc:
@@ -427,7 +433,7 @@ def context(request: Request) -> dict:
             "applies_to": "/api/*",
             "headers": {
                 "X-StorageApi-Token": "any Keboola Storage API token",
-                "X-Kbc-Stack": "stack alias or full https URL",
+                "X-Storage-Stack": "stack alias or full https URL (X-Kbc-Stack accepted as alias for direct access)",
             },
             "stack_aliases": dict(STACK_ALIASES),
             "stack_rule": (
