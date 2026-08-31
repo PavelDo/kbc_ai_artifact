@@ -1,0 +1,9 @@
+.kbagent/
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+logs/
+.pytest_cache/
+uv.lock
