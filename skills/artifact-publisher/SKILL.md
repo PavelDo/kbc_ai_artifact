@@ -81,9 +81,14 @@ Response:
 ```json
 {
   "id": "aBcD3fGhIjKlMnOpQrStUvWx",
+  "version": 1,
+  "status": "live",
+  "head_version": 1,
+  "accept_versions": false,
   "url": "https://<hub-host>/a/aBcD3fGhIjKlMnOpQrStUvWx",
   "raw_url": "https://<hub-host>/a/aBcD3fGhIjKlMnOpQrStUvWx/raw",
-  "meta_url": "https://<hub-host>/a/aBcD3fGhIjKlMnOpQrStUvWx/meta"
+  "meta_url": "https://<hub-host>/a/aBcD3fGhIjKlMnOpQrStUvWx/meta",
+  "versions_url": "https://<hub-host>/a/aBcD3fGhIjKlMnOpQrStUvWx/versions"
 }
 ```
 
@@ -163,6 +168,13 @@ Add `"password": "secret"` to any of the publish bodies above (create or
 update). Human visitors get an unlock form in the browser; machine clients
 authenticate by sending the header `X-Artifact-Password: secret` on reads.
 
+### Open the artifact to contributions
+
+Add `"accept_versions": true` to a publish or update body to let **other**
+Keboola projects submit versions of your artifact. Their submissions always
+land as moderated proposals that only you can promote — see *Versioning*
+below. The default is `false`: only the owning project may add versions.
+
 ### Update and delete
 
 ```bash
@@ -185,16 +197,165 @@ curl -s "$HUB/api/artifacts" \
 ```
 
 `PUT` and `DELETE` both require a token from the project that originally
-published the artifact.
+published the artifact. A `PUT` that carries content adds a **new version**;
+nothing is ever overwritten. A `title` lives on a version, so it can only be
+changed together with new content (422 otherwise).
+
+## Versioning
+
+Every submission becomes its own version with a verified author. `GET /a/{id}`
+serves the **head** — the newest live version, or one the owner pinned.
+
+Versions have one of two statuses:
+
+- **live** — servable, and eligible to be the head.
+- **proposed** — moderated. Its metadata is listed to anyone holding the
+  capability URL, but its *content* is readable only by the artifact owner and
+  the version's own author, until the owner promotes it.
+
+Who may submit what:
+
+| Caller | `accept_versions` | Result |
+|---|---|---|
+| The owning project | any | version added as **live** |
+| Another project | `false` (default) | **403** — the artifact is closed |
+| Another project | `true` | version added as **proposed** |
+
+The canonical copy of a version is always stored in the **submitter's own**
+Keboola project, with the submitter's token — whoever wrote a version keeps its
+source of truth.
+
+### Submit a version
+
+```bash
+curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/versions" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "markdown": "# Q3 review\n\nCorrected the revenue table.",
+    "note": "fix Q3 totals"
+  }'
+```
+
+The body takes the same content fields as publishing (exactly one of `html`,
+`markdown`, `git_url`, plus the `git_*` extras), an optional `title`, and an
+optional `note` describing what changed (max 500 characters). The response is:
+
+```json
+{
+  "id": "aBcD3fGhIjKlMnOpQrStUvWx",
+  "version": 2,
+  "status": "proposed",
+  "note": "fix Q3 totals",
+  "url": "https://<hub-host>/a/aBcD3fGhIjKlMnOpQrStUvWx/v/2"
+}
+```
+
+### List versions
+
+```bash
+curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/versions"
+```
+
+Returns `{"id", "head_version", "accept_versions", "protected", "versions": [...]}`
+newest first; each entry carries `version`, `title`, `status`, `note`,
+`created_at`, `is_head`, `size_bytes`, `source_type`, the author's project, and
+a `url`. Add `?format=html` for a human-readable picker page with links to each
+version and to the diff of every adjacent pair.
+
+### Read one version
+
+```bash
+curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/v/2"
+```
+
+For a **proposed** version, send your management headers
+(`X-StorageApi-Token` + `X-Storage-Stack`) on this read too — the hub serves it
+only to the artifact owner and the version's author, and answers 403 to
+everyone else.
+
+### Diff two versions
+
+```bash
+# Side-by-side HTML page (default)
+curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2"
+
+# Unified diff, text/plain — the best format for an agent to read
+curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2?format=unified"
+
+# JSON: the unified diff plus added/removed line counts
+curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2?format=json"
+```
+
+The spec is always `{older}..{newer}`. Markdown is compared when both versions
+carry it, otherwise the built HTML. Formats other than `html`, `unified` and
+`json` are a 400; a side larger than the configured diff limit is a 413.
+
+### Promote a proposal (owner only)
+
+```bash
+curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/versions/2/promote" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu"
+```
+
+The version becomes live, and — with the default head mode — immediately
+becomes what `/a/{id}` serves. Promoting an already-live version is a 409.
+
+### Delete a version
+
+```bash
+curl -s -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/versions/2" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu"
+```
+
+The owner may delete any version except the last live one (409 — an artifact
+must keep one). A contributor may delete only their own proposal, which is how
+you withdraw a submission.
+
+### Pin the head
+
+```bash
+# Always serve the newest live version (the default)
+curl -s -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/head" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{"mode": "latest"}'
+
+# Freeze the artifact on one live version
+curl -s -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/head" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{"mode": "pinned", "version": 1}'
+```
+
+Owner only. The pinned version must exist and be live (422 otherwise), and it
+is protected from retention pruning. The response reports
+`head_version_served`.
+
+### Limits
+
+- **Retention** — at most `HUB_MAX_VERSIONS` (default 50) live versions per
+  artifact. The oldest live versions that are neither the head nor pinned are
+  pruned. Proposals are never pruned.
+- **Rate limit** — `HUB_MAX_VERSIONS_PER_DAY` (default 20) submitted versions
+  per contributing project, per artifact, per UTC day. Past that, 429.
 
 ## Reading (public, no token required)
 
 | Endpoint | Returns |
 |---|---|
-| `GET /a/{id}` | Human-readable rendered page (or the password unlock form) |
+| `GET /a/{id}` | Head version as a human-readable page (or the password unlock form) |
+| `GET /a/{id}/v/{n}` | One specific version (owner/author only when proposed) |
+| `GET /a/{id}/versions` | Version history JSON, or `?format=html` for a picker page |
+| `GET /a/{id}/diff/{a}..{b}` | Diff of two versions (`?format=html\|unified\|json`) |
 | `GET /a/{id}/raw` | Exact HTML that will be rendered — no chrome around it |
 | `GET /a/{id}/source` | Original source you submitted (markdown or html) |
-| `GET /a/{id}/meta` | JSON metadata (title, created/updated time, content type — no owner details) |
+| `GET /a/{id}/meta` | JSON metadata (title, timestamps, head version, version counts, content type — no owner details) |
 
 If the artifact is password-protected, machine clients pass
 `X-Artifact-Password: <password>` on these requests; browsers get an HTML
@@ -229,11 +390,14 @@ mind:
 
 | Status | Meaning |
 |---|---|
-| 400 | Unknown or disallowed `X-Storage-Stack` value |
+| 400 | Unknown or disallowed `X-Storage-Stack` value, a malformed diff spec (use `{older}..{newer}`), or an unknown diff `format` |
 | 401 | Storage token rejected by the stack, or wrong artifact password |
-| 403 | Token is valid but not from the owning project (update/delete) |
-| 404 | Unknown artifact id (identical response whether it never existed or was deleted) |
-| 422 | Build failure — bad git repo, no entry file found, markdown render error, or `git_token`/`git_username` sent without `git_url` |
+| 403 | Token is valid but not from the owning project (update, delete, promote, head); the artifact does not accept versions from other projects; or you asked for a proposal you did not author |
+| 404 | Unknown artifact id (identical response whether it never existed or was deleted), or no such version |
+| 409 | Promoting a version that is already live, or deleting the only live version of an artifact |
+| 413 | Built HTML over the size limit, or a diff side over `HUB_DIFF_MAX_BYTES` |
+| 422 | Build failure — bad git repo, no entry file found, markdown render error, `git_token`/`git_username` sent without `git_url`, a `title` sent without content, or pinning the head to a version that does not exist or is not live |
+| 429 | Your project reached the daily version-submission cap for this artifact |
 | 502 | The Keboola stack itself could not be reached to verify the token |
 
 ## Safety notes
@@ -246,6 +410,11 @@ mind:
   content private from anyone the URL is deliberately shared with.
 - Publishing, updating, and deleting always require a valid Keboola Storage
   token — only reading is anonymous.
+- `accept_versions` lets **anyone with a Keboola token** attach content to your
+  artifact. Their submissions can never be served on their own — they stay
+  proposals until you promote one — but their metadata (project name, note,
+  timestamps) is visible to everyone holding the capability URL. Review the
+  diff before promoting; a promoted version becomes what `/a/{id}` serves.
 - Publishing from a private repository publishes its content to a **public**
   URL. The `git_token` protects the clone, not the artifact; add a `password`
   if the result should not be readable by everyone holding the link.

@@ -38,4 +38,5 @@ def tmp_store(backend: InMemoryFilesBackend, tmp_path, settings: Settings) -> Ar
         backend=backend,
         cache_dir=cache_dir,
         cache_max_entries=settings.cache_max_entries,
+        max_versions=settings.max_versions,
     )

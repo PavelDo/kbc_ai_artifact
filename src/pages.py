@@ -1,140 +1,371 @@
-"""Human-facing HTML shell pages.
+"""Human-facing HTML shell pages and their shared mini design system.
 
-Only two pages are rendered by the service itself: the landing page served at
-``/`` (what the hub is, how to authenticate, copy-pasteable curl examples) and
-the unlock form shown when a password-protected artifact is opened in a
-browser. Artifact content itself is never templated here — it is served
-verbatim from the envelope.
+Three pages are rendered by the service itself:
+
+- the landing page at ``/`` — what the hub is, what it does, and how to drive
+  it from a terminal,
+- the unlock form shown when a password-protected artifact is opened in a
+  browser, and
+- the version picker at ``/a/{id}/versions?format=html``.
+
+Artifact content itself is never templated here — it is served verbatim from
+the version envelope.
+
+**Design system.** One shared stylesheet (:data:`_CSS`) backs all three pages:
+light-first (a dark variant follows ``prefers-color-scheme``), monospace-forward
+(JetBrains Mono for headings, labels and code; Inter for prose, both with full
+local fallback stacks), a single electric-blue accent, a faint graph-paper grid
+behind the page, ``//`` small-caps section labels, and dark terminal cards that
+carry the ``$ curl`` examples as first-class content rather than decoration.
+Google Fonts are linked but never required: every family has a local fallback
+stack, so the pages degrade cleanly behind a proxy that blocks them.
 
 Every dynamic value is escaped with :func:`html.escape` before it reaches the
-markup. Styling is embedded (no external assets, no fonts, no scripts) so the
-pages work behind any proxy and in any network environment.
+markup.
 """
 
 from __future__ import annotations
 
 import html
 
-#: Shared stylesheet for both pages: system font stack, light/dark via
-#: ``prefers-color-scheme``, no external resources.
+#: Google Fonts, linked with ``display=swap``. Both families have full local
+#: fallback stacks in ``--font-*`` below, so a blocked CDN costs nothing but
+#: the exact letterforms.
+_FONT_LINKS = (
+    '<link rel="preconnect" href="https://fonts.googleapis.com">\n'
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+    '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+    "family=Inter:wght@400;500;600&"
+    'family=JetBrains+Mono:wght@400;500;700&display=swap">\n'
+)
+
+#: The shared design system. Light is the designed-for mode; the dark block
+#: only re-points the tokens.
 _CSS = """
 :root {
   color-scheme: light dark;
-  --bg: #ffffff;
-  --fg: #1b1f24;
-  --muted: #5b6470;
-  --border: #e2e6ea;
-  --card: #f7f8fa;
-  --code-bg: #f2f4f7;
-  --accent: #1f6feb;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+    Consolas, "Liberation Mono", monospace;
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+
+  --paper: #f6f8fb;
+  --panel: #ffffff;
+  --ink: #0d1622;
+  --ink-2: #38455a;
+  --muted: #697687;
+  --line: #d8e0ea;
+  --grid: #e6ecf3;
+  --accent: #1442e0;
+  --accent-ink: #1442e0;
+  --accent-soft: #e7ecfd;
+  --on-accent: #ffffff;
+  --term-bg: #0d1622;
+  --term-fg: #d9e3f0;
+  --term-dim: #7d8ca3;
+  --term-line: #24324a;
+  --live: #0a7043;
+  --live-soft: #dcf3e7;
+  --proposed: #8a5300;
+  --proposed-soft: #fbeeda;
   --danger: #b42318;
+  --radius: 10px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #11151a;
-    --fg: #e8ecf1;
-    --muted: #9aa4b1;
-    --border: #262d36;
-    --card: #171c23;
-    --code-bg: #0d1117;
-    --accent: #6ea8ff;
-    --danger: #ff7b72;
+    --paper: #0b1119;
+    --panel: #111a25;
+    --ink: #e7edf5;
+    --ink-2: #b3c0d1;
+    --muted: #8e9cae;
+    --line: #22303f;
+    --grid: #141e2b;
+    --accent: #7aa2ff;
+    --accent-ink: #9dbaff;
+    --accent-soft: #16233d;
+    --on-accent: #0b1119;
+    --term-bg: #060b12;
+    --term-fg: #d9e3f0;
+    --term-line: #1d2839;
+    --live: #4ec98a;
+    --live-soft: #10261c;
+    --proposed: #e0a33f;
+    --proposed-soft: #2a2010;
+    --danger: #ff8a80;
   }
 }
+
 * { box-sizing: border-box; }
+
 body {
   margin: 0;
-  padding: 0;
-  background: var(--bg);
-  color: var(--fg);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-    "Helvetica Neue", Arial, sans-serif;
-  line-height: 1.6;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-sans);
   font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
 }
-main { max-width: 52rem; margin: 0 auto; padding: 3rem 1.25rem 5rem; }
-h1 { font-size: 2rem; line-height: 1.2; margin: 0 0 .25rem; letter-spacing: -.02em; }
-h2 { font-size: 1.15rem; margin: 2.5rem 0 .75rem; letter-spacing: -.01em; }
-p { margin: .75rem 0; }
-a { color: var(--accent); }
-.lead { color: var(--muted); font-size: 1.05rem; margin-top: 0; }
-code, pre {
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
-    "Liberation Mono", monospace;
-  font-size: .875rem;
+
+/* Graph-paper texture: the only ornament on the page. Painted as a plain
+   background on <html> rather than a fixed overlay, so it never becomes its
+   own compositing layer. */
+html {
+  background-color: var(--paper);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 34px 34px;
 }
-code { background: var(--code-bg); padding: .1rem .35rem; border-radius: 4px; }
-pre {
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: .9rem 1rem;
-  overflow-x: auto;
-  margin: .5rem 0 1.25rem;
-}
-pre code { background: none; padding: 0; }
-table { border-collapse: collapse; width: 100%; margin: .5rem 0 1.25rem; display: block;
-  overflow-x: auto; }
-th, td {
-  text-align: left;
-  padding: .45rem .7rem;
-  border-bottom: 1px solid var(--border);
-  vertical-align: top;
-}
-th { font-weight: 600; font-size: .8rem; text-transform: uppercase;
-  letter-spacing: .04em; color: var(--muted); }
-td code { white-space: nowrap; }
-.note {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: .75rem 1rem;
+
+main { max-width: 60rem; margin: 0 auto; padding: 3.5rem 1.25rem 4rem; }
+
+a { color: var(--accent-ink); text-decoration-thickness: 1px;
+  text-underline-offset: .18em; }
+a:hover { text-decoration-thickness: 2px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px;
+  border-radius: 4px; }
+
+h1, h2, h3 { font-family: var(--font-mono); font-weight: 700;
+  letter-spacing: -.02em; }
+h1 { font-size: clamp(1.9rem, 1.2rem + 2.4vw, 2.9rem); line-height: 1.08;
+  margin: 0 0 .6rem; }
+h2 { font-size: 1.15rem; margin: 0 0 1rem; letter-spacing: -.01em; }
+h3 { font-size: .95rem; margin: 0 0 .35rem; }
+p { margin: .7rem 0; color: var(--ink-2); }
+
+code, pre, .mono { font-family: var(--font-mono); font-size: .85rem; }
+code { background: var(--accent-soft); color: var(--accent-ink);
+  padding: .08rem .32rem; border-radius: 4px; }
+
+/* -------- section label: "// what it does" -------------------------------- */
+.label {
+  font-family: var(--font-mono);
+  font-size: .72rem;
+  font-weight: 500;
+  letter-spacing: .16em;
+  text-transform: uppercase;
   color: var(--muted);
-  font-size: .925rem;
+  margin: 3.25rem 0 .85rem;
+  display: flex;
+  align-items: center;
+  gap: .6rem;
 }
-footer { margin-top: 3rem; color: var(--muted); font-size: .875rem; }
+.label::before { content: "//"; color: var(--accent); font-weight: 700; }
+.label::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+
+/* -------- badges ---------------------------------------------------------- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+  font-family: var(--font-mono);
+  font-size: .74rem;
+  font-weight: 500;
+  letter-spacing: .02em;
+  padding: .2rem .55rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.badge--version { border-color: var(--accent); color: var(--accent-ink);
+  background: var(--accent-soft); }
+.badge--live { border-color: transparent; background: var(--live-soft);
+  color: var(--live); }
+.badge--proposed { border-color: transparent; background: var(--proposed-soft);
+  color: var(--proposed); }
+.badge--head { border-color: var(--accent); color: var(--accent-ink);
+  background: transparent; }
+
+/* -------- hero ------------------------------------------------------------ */
+.hero { margin-bottom: 1rem; }
+.hero .lead { font-size: 1.12rem; color: var(--ink-2); max-width: 44rem;
+  margin: 0 0 1.25rem; }
+.hero-meta { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem;
+  margin-bottom: 1.5rem; }
+.hero-links { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1.5rem 0 0; }
+.hero-links a {
+  font-family: var(--font-mono);
+  font-size: .82rem;
+  text-decoration: none;
+  padding: .38rem .8rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--ink);
+}
+.hero-links a:hover { border-color: var(--accent); color: var(--accent-ink); }
+.hero-links a.primary { background: var(--accent); border-color: var(--accent);
+  color: var(--on-accent); }
+.hero-links a.primary:hover { filter: brightness(1.1);
+  color: var(--on-accent); }
+
+/* -------- terminal card (the signature element) --------------------------- */
+.term {
+  background: var(--term-bg);
+  border: 1px solid var(--term-line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin: .5rem 0 1.5rem;
+  box-shadow: 0 1px 2px rgba(13, 22, 34, .06), 0 10px 24px rgba(13, 22, 34, .06);
+}
+.term-bar {
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  padding: .5rem .85rem;
+  border-bottom: 1px solid var(--term-line);
+  font-family: var(--font-mono);
+  font-size: .72rem;
+  letter-spacing: .1em;
+  color: var(--term-dim);
+}
+.term-bar .dot { width: 9px; height: 9px; border-radius: 50%;
+  background: #2f3f59; flex: none; }
+.term-bar .dot:nth-child(2) { background: #2a3852; }
+.term-bar .dot:nth-child(3) { background: #253048; }
+.term-bar .term-title { margin-left: .35rem; }
+.term pre {
+  margin: 0;
+  padding: 1rem 1.1rem;
+  overflow-x: auto;
+  color: var(--term-fg);
+  font-family: var(--font-mono);
+  font-size: .82rem;
+  line-height: 1.75;
+  white-space: pre;
+}
+.term code { background: none; color: inherit; padding: 0; font-size: inherit; }
+.term .p { color: #5fd3a0; user-select: none; }
+.term .c { color: #7d8ca3; }
+.term .s { color: #ffc98a; }
+.term .k { color: #8fb6ff; }
+
+/* -------- feature grid ---------------------------------------------------- */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15.5rem, 1fr));
+  gap: .8rem;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1rem 1.1rem 1.1rem;
+}
+.card h3 { font-size: .88rem; letter-spacing: .01em; color: var(--ink); }
+.card h3::before { content: "┌ "; color: var(--accent); font-weight: 400; }
+.card p { margin: 0; font-size: .9rem; line-height: 1.6; color: var(--muted); }
+
+/* -------- tables ---------------------------------------------------------- */
+.table-wrap { overflow-x: auto; border: 1px solid var(--line);
+  border-radius: var(--radius); background: var(--panel); }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: .55rem .85rem;
+  border-bottom: 1px solid var(--line); vertical-align: top; font-size: .9rem; }
+tr:last-child td { border-bottom: 0; }
+th { font-family: var(--font-mono); font-weight: 500; font-size: .7rem;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+td .mono, td code { white-space: nowrap; }
+
+.note {
+  border-left: 2px solid var(--accent);
+  background: var(--panel);
+  padding: .7rem 1rem;
+  margin: 1rem 0;
+  color: var(--muted);
+  font-size: .9rem;
+  border-radius: 0 var(--radius) var(--radius) 0;
+}
+
+footer {
+  margin-top: 3.5rem;
+  padding-top: 1.1rem;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .75rem;
+  font-family: var(--font-mono);
+  font-size: .78rem;
+  color: var(--muted);
+}
+footer .spacer { flex: 1; }
 """
 
 _UNLOCK_CSS = """
 body { display: flex; align-items: center; justify-content: center;
   min-height: 100vh; padding: 1.25rem; }
-.card {
-  width: 100%;
-  max-width: 24rem;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 1.75rem;
-}
-.card h1 { font-size: 1.25rem; margin: 0 0 .35rem; }
-.card p { color: var(--muted); font-size: .925rem; margin: 0 0 1.25rem; }
-label { display: block; font-size: .8rem; text-transform: uppercase;
-  letter-spacing: .04em; color: var(--muted); margin-bottom: .35rem; }
+.gate { width: 100%; max-width: 25rem; }
+.gate .rule { font-family: var(--font-mono); font-size: .72rem;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--muted);
+  margin-bottom: .6rem; }
+.gate .rule::before { content: "//"; color: var(--accent); font-weight: 700;
+  margin-right: .5rem; }
+.gate .card { padding: 1.5rem; }
+.gate h1 { font-size: 1.3rem; margin: 0 0 .3rem; }
+.gate p { margin: 0 0 1.25rem; font-size: .9rem; color: var(--muted); }
+label { display: block; font-family: var(--font-mono); font-size: .7rem;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
+  margin-bottom: .4rem; }
 input[type=password] {
   width: 100%;
   padding: .6rem .7rem;
-  font: inherit;
-  color: var(--fg);
-  background: var(--bg);
-  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: .9rem;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
   border-radius: 8px;
 }
-input[type=password]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 button {
-  margin-top: 1rem;
+  margin-top: .9rem;
   width: 100%;
   padding: .6rem 1rem;
-  font: inherit;
-  font-weight: 600;
-  color: #fff;
+  font-family: var(--font-mono);
+  font-size: .85rem;
+  font-weight: 500;
+  letter-spacing: .04em;
+  color: var(--on-accent);
   background: var(--accent);
   border: 0;
   border-radius: 8px;
   cursor: pointer;
 }
-button:hover { filter: brightness(1.08); }
-.error { color: var(--danger); font-size: .875rem; margin: .75rem 0 0; }
-.hint { font-size: .8rem; margin-top: 1.25rem; }
+button:hover { filter: brightness(1.1); }
+.error { color: var(--danger); font-family: var(--font-mono); font-size: .8rem;
+  margin: .8rem 0 0; }
+.hint { font-size: .8rem; margin: 1.1rem 0 0; color: var(--muted); }
+"""
+
+_VERSIONS_CSS = """
+.vhead { display: flex; flex-wrap: wrap; align-items: baseline; gap: .6rem;
+  margin-bottom: .4rem; }
+.vlist { list-style: none; margin: 0; padding: 0; }
+.vrow {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: .85rem 1rem;
+  margin-bottom: .55rem;
+}
+.vrow.is-head { border-color: var(--accent); }
+.vrow-top { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+.vrow-n { font-family: var(--font-mono); font-weight: 700; font-size: 1rem;
+  color: var(--ink); }
+.vrow-title { font-size: .92rem; color: var(--ink-2); flex: 1 1 12rem;
+  min-width: 0; overflow-wrap: anywhere; }
+.vrow-meta { font-family: var(--font-mono); font-size: .74rem;
+  color: var(--muted); margin-top: .4rem; display: flex; flex-wrap: wrap;
+  gap: .25rem .9rem; }
+.vrow-note { font-size: .88rem; color: var(--ink-2); margin: .45rem 0 0;
+  padding-left: .7rem; border-left: 2px solid var(--line);
+  overflow-wrap: anywhere; }
+.vrow-links { margin-top: .55rem; display: flex; flex-wrap: wrap; gap: .9rem;
+  font-family: var(--font-mono); font-size: .78rem; }
+.empty { font-family: var(--font-mono); font-size: .85rem; color: var(--muted); }
 """
 
 
@@ -146,6 +377,7 @@ def _page(title: str, extra_css: str, body: str) -> str:
         '<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
         f"<title>{html.escape(title)}</title>\n"
+        f"{_FONT_LINKS}"
         f"<style>{_CSS}{extra_css}</style>\n"
         "</head>\n<body>\n"
         f"{body}\n"
@@ -153,110 +385,215 @@ def _page(title: str, extra_css: str, body: str) -> str:
     )
 
 
-def landing_page(base_url: str) -> str:
-    """Render the public landing page documenting the service."""
+def _term(title: str, body: str) -> str:
+    """A terminal card. ``body`` is pre-escaped markup with optional spans."""
+    return (
+        f'<div class="term"><div class="term-bar">'
+        '<span class="dot"></span><span class="dot"></span><span class="dot"></span>'
+        f'<span class="term-title">{html.escape(title)}</span></div>'
+        f"<pre><code>{body}</code></pre></div>"
+    )
+
+
+def _badge(text: str, kind: str = "") -> str:
+    suffix = f" badge--{kind}" if kind else ""
+    return f'<span class="badge{suffix}">{html.escape(text)}</span>'
+
+
+def _card(heading: str, text: str) -> str:
+    return (
+        f'<div class="card"><h3>{html.escape(heading)}</h3>'
+        f"<p>{text}</p></div>"
+    )
+
+
+def landing_page(base_url: str, service_version: str, github_url: str) -> str:
+    """Render the public landing page: what the hub is and how to drive it."""
     base = html.escape(base_url.rstrip("/"))
+    version = html.escape(service_version)
+    repo = html.escape(github_url.rstrip("/"))
+
+    hero_term = _term(
+        "PUBLISH → PUBLIC URL",
+        '<span class="p">$</span> curl -sX POST '
+        f'<span class="s">"{base}/api/artifacts"</span> \\\n'
+        '    -H <span class="s">"X-StorageApi-Token: $KBC_TOKEN"</span> \\\n'
+        '    -H <span class="s">"X-Storage-Stack: eu"</span> \\\n'
+        '    -d <span class="s">\'{"markdown": "# Q3 review\\n\\nShipped."}\'</span>\n'
+        '<span class="c">'
+        '{"id": "aBcD3fGhIjKlMnOpQrSt", "version": 1, "head_version": 1,\n'
+        f' "url": "{base}/a/aBcD3fGhIjKlMnOpQrSt"}}</span>\n'
+        '<span class="p">$</span> open '
+        f'<span class="k">{base}/a/aBcD3fGhIjKlMnOpQrSt</span>',
+    )
+
+    features = "".join(
+        [
+            _card(
+                "publish anything",
+                "HTML served as-is, Markdown rendered by the built-in template, "
+                "or a git repository — public, or private with a transient "
+                "access token that is used for the clone and never stored.",
+            ),
+            _card(
+                "urls are capabilities",
+                "Every artifact gets an unguessable id. There is no public "
+                "listing and no index, and every read carries "
+                "<code>X-Robots-Tag: noindex</code>.",
+            ),
+            _card(
+                "optional password",
+                "PBKDF2-hashed, with a browser unlock form and an "
+                "<code>X-Artifact-Password</code> header for machines.",
+            ),
+            _card(
+                "community versioning",
+                "Every update is a new version. Open an artifact to "
+                "contributions and other projects can submit proposals for you "
+                "to review, diff and promote.",
+            ),
+            _card(
+                "built for agents",
+                f'<a href="{base}/context">/context</a> is a machine-readable '
+                f'manifest, <a href="{base}/skill">/skill</a> is a SKILL.md an '
+                "agent reads to publish unassisted, and every read endpoint "
+                "answers JSON or raw HTML.",
+            ),
+            _card(
+                "your project, your content",
+                "The canonical copy of what you publish is a Storage File in "
+                "your own Keboola project. The hub keeps only a serving copy, "
+                "so a restart rebuilds everything from Storage.",
+            ),
+        ]
+    )
+
+    publish_term = _term(
+        "POST /api/artifacts",
+        '<span class="c"># Markdown — GFM tables, task lists, mermaid, '
+        "highlighting</span>\n"
+        f'<span class="p">$</span> curl -sX POST <span class="s">"{base}/api/artifacts"</span> \\\n'
+        '    -H <span class="s">"X-StorageApi-Token: $KBC_TOKEN"</span> \\\n'
+        '    -H <span class="s">"X-Storage-Stack: eu"</span> \\\n'
+        '    -H <span class="s">"Content-Type: application/json"</span> \\\n'
+        '    -d <span class="s">\'{"markdown": "# Report\\n\\nBody.", '
+        '"title": "Report", "accept_versions": true}\'</span>\n'
+        "\n"
+        '<span class="c"># A git repository (add git_token for a private one)</span>\n'
+        f'<span class="p">$</span> curl -sX POST <span class="s">"{base}/api/artifacts"</span> \\\n'
+        '    -H <span class="s">"X-StorageApi-Token: $KBC_TOKEN"</span> \\\n'
+        '    -H <span class="s">"X-Storage-Stack: eu"</span> \\\n'
+        '    -d <span class="s">\'{"git_url": "https://github.com/org/repo", '
+        '"git_path": "docs/report.md"}\'</span>',
+    )
+
+    versions_term = _term(
+        "VERSIONING",
+        '<span class="c"># Submit a version to someone else\'s artifact</span>\n'
+        f'<span class="p">$</span> curl -sX POST <span class="s">"{base}/api/artifacts/$ID/versions"</span> \\\n'
+        '    -H <span class="s">"X-StorageApi-Token: $KBC_TOKEN"</span> \\\n'
+        '    -H <span class="s">"X-Storage-Stack: eu"</span> \\\n'
+        '    -d <span class="s">\'{"markdown": "# Report\\n\\nFixed the totals.", '
+        '"note": "fix Q3 totals"}\'</span>\n'
+        '<span class="c">{"version": 2, "status": "proposed"}</span>\n'
+        "\n"
+        '<span class="c"># Owner reviews, diffs, and promotes it</span>\n'
+        f'<span class="p">$</span> open <span class="k">{base}/a/$ID/versions?format=html</span>\n'
+        f'<span class="p">$</span> open <span class="k">{base}/a/$ID/diff/1..2</span>\n'
+        f'<span class="p">$</span> curl -sX POST <span class="s">"{base}/api/artifacts/$ID/versions/2/promote"</span> \\\n'
+        '    -H <span class="s">"X-StorageApi-Token: $KBC_TOKEN"</span> '
+        '-H <span class="s">"X-Storage-Stack: eu"</span>',
+    )
+
     return _page(
         "KBC Artifact Hub",
         "",
         f"""<main>
+<section class="hero">
 <h1>KBC Artifact Hub</h1>
-<p class="lead">Public hosting for self-contained HTML artifacts, backed by
-Keboola Storage. Publish with any Keboola Storage API token, from any stack,
-and get back an unguessable public URL.</p>
+<p class="lead">Turn a document into a public URL with one curl call. Any
+Keboola Storage API token, on any stack, is the only credential you need.</p>
+<div class="hero-meta">
+{_badge(f"kbc-artifact-hub v{service_version}", "version")}
+{_badge("no sign-up")}
+{_badge("no build step")}
+</div>
+{hero_term}
+<div class="hero-links">
+<a class="primary" href="{repo}">GitHub repo</a>
+<a href="{base}/docs">/docs</a>
+<a href="{base}/skill">/skill</a>
+<a href="{base}/context">/context</a>
+</div>
+</section>
 
-<p>The canonical copy of what you publish is stored as a Storage File in
-<strong>your own</strong> Keboola project, so you keep ownership of the
-content. A serving copy lives in the hub's project so reads stay fast and do
-not depend on your project. There is no public listing: artifact URLs are
-capabilities, and an optional password adds a second layer on top.</p>
+<h2 class="label">what it does</h2>
+<div class="grid">{features}</div>
 
-<h2>Authentication</h2>
+<h2 class="label">authentication</h2>
 <p>Everything under <code>/api/artifacts</code> is authenticated with two
-headers. The hub verifies the token against your stack's own
+headers. The hub verifies the token against your own stack's
 <code>/v2/storage/tokens/verify</code> endpoint and never stores it.</p>
-<pre><code>X-StorageApi-Token: &lt;your Keboola Storage API token&gt;
-X-Storage-Stack: &lt;alias or https URL&gt;</code></pre>
-<p><code>X-Storage-Stack</code> accepts an alias (<code>us</code>,
-<code>gcp-us</code>, <code>eu</code>, <code>azure-eu</code>,
-<code>gcp-eu</code>) or any full <code>https://*.keboola.com</code> URL.
-Ownership is the pair (stack, project id); updating or deleting an artifact
-requires a token from the project that published it.</p>
+{_term(
+    "HEADERS",
+    '<span class="k">X-StorageApi-Token</span>: &lt;your Keboola Storage API token&gt;\n'
+    '<span class="k">X-Storage-Stack</span>: us | gcp-us | eu | azure-eu | gcp-eu\n'
+    '                 | https://*.keboola.com',
+)}
+<p>Ownership is the pair (stack, project id). Updating, deleting, promoting and
+pinning all require a token from the project that published the artifact.</p>
 
-<h2>Publish HTML</h2>
-<pre><code>curl -s -X POST "{base}/api/artifacts" \\
-  -H "X-StorageApi-Token: $KBC_TOKEN" \\
-  -H "X-Storage-Stack: eu" \\
-  -H "Content-Type: application/json" \\
-  -d '{{"html": "&lt;h1&gt;Hello&lt;/h1&gt;", "title": "My report"}}'</code></pre>
+<h2 class="label">quick start</h2>
+{publish_term}
+<p class="note">Add <code>"password": "secret"</code> to protect the artifact,
+or <code>"accept_versions": true</code> to let other projects submit versions
+for your review.</p>
 
-<h2>Publish Markdown</h2>
-<p>Markdown is rendered by the built-in template: GFM tables, task lists,
-mermaid fences and syntax highlighting.</p>
-<pre><code>curl -s -X POST "{base}/api/artifacts" \\
-  -H "X-StorageApi-Token: $KBC_TOKEN" \\
-  -H "X-Storage-Stack: eu" \\
-  -H "Content-Type: application/json" \\
-  -d '{{"markdown": "# Q3 review\\n\\n- shipped\\n- measured\\n",
-       "title": "Q3 review", "password": "optional"}}'</code></pre>
+<h2 class="label">community versioning</h2>
+<p>Every update is a new version, and nothing is overwritten. Owners publish
+live versions; other projects submit <strong>proposals</strong> that stay
+private to their author and the owner until the owner promotes one. The head
+pointer decides what <code>/a/{{id}}</code> serves — the newest live version,
+or one you pin.</p>
+{versions_term}
 
-<h2>Publish from a git repository</h2>
-<p>The repository is shallow-cloned; the entry document is
-<code>git_path</code>, otherwise <code>index.html</code>, then
-<code>README.md</code>, then a single root-level <code>*.html</code>. Relative
-images are inlined as data URIs so the result is self-contained.</p>
-<pre><code>curl -s -X POST "{base}/api/artifacts" \\
-  -H "X-StorageApi-Token: $KBC_TOKEN" \\
-  -H "X-Storage-Stack: eu" \\
-  -H "Content-Type: application/json" \\
-  -d '{{"git_url": "https://github.com/owner/repo",
-       "git_ref": "main", "git_path": "docs/report.md"}}'</code></pre>
-<p>For a private repository, add <code>git_token</code> (a personal access
-token for the git host) and, only if the host needs one,
-<code>git_username</code> — it defaults to <code>x-access-token</code>. Like
-your Storage token, it is used only for the clone during that request: it is
-never stored, logged, or returned.</p>
-
-<h2>Reading an artifact</h2>
-<table>
+<h2 class="label">reading an artifact</h2>
+<div class="table-wrap"><table>
 <tr><th>Method</th><th>Path</th><th>Returns</th></tr>
-<tr><td>GET</td><td><code>/a/{{id}}</code></td><td>Rendered page (or the unlock
-form when protected)</td></tr>
-<tr><td>POST</td><td><code>/a/{{id}}/unlock</code></td><td>Password form target;
-sets a signed cookie scoped to the artifact</td></tr>
-<tr><td>GET</td><td><code>/a/{{id}}/raw</code></td><td>The HTML itself, for
-machines</td></tr>
-<tr><td>GET</td><td><code>/a/{{id}}/source</code></td><td>Original source
-(Markdown or HTML)</td></tr>
-<tr><td>GET</td><td><code>/a/{{id}}/meta</code></td><td>Public metadata JSON,
-no owner details</td></tr>
-</table>
+<tr><td class="mono">GET</td><td><code>/a/{{id}}</code></td><td>The head version, rendered (or the unlock form)</td></tr>
+<tr><td class="mono">GET</td><td><code>/a/{{id}}/v/{{n}}</code></td><td>One specific version</td></tr>
+<tr><td class="mono">GET</td><td><code>/a/{{id}}/versions</code></td><td>Version history as JSON, or <code>?format=html</code> for a picker page</td></tr>
+<tr><td class="mono">GET</td><td><code>/a/{{id}}/diff/{{a}}..{{b}}</code></td><td>Side-by-side diff; <code>?format=unified</code> or <code>json</code> for machines</td></tr>
+<tr><td class="mono">GET</td><td><code>/a/{{id}}/raw</code></td><td>The HTML itself, no chrome</td></tr>
+<tr><td class="mono">GET</td><td><code>/a/{{id}}/source</code></td><td>Original submitted source (Markdown or HTML)</td></tr>
+<tr><td class="mono">GET</td><td><code>/a/{{id}}/meta</code></td><td>Public metadata JSON, no owner details</td></tr>
+<tr><td class="mono">POST</td><td><code>/a/{{id}}/unlock</code></td><td>Password form target; sets a signed, path-scoped cookie</td></tr>
+</table></div>
 <p class="note">Protected artifacts accept the password over the
-<code>X-Artifact-Password</code> header on <code>/raw</code> and
-<code>/source</code>; <code>/meta</code> stays public either way.</p>
+<code>X-Artifact-Password</code> header on every read;
+<code>/meta</code> stays public either way. Proposed versions are visible only
+to the artifact owner and the version's author, who authenticate with the same
+two management headers.</p>
 
-<h2>Managing your artifacts</h2>
-<table>
+<h2 class="label">managing your artifacts</h2>
+<div class="table-wrap"><table>
 <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
-<tr><td>POST</td><td><code>/api/artifacts</code></td><td>Publish</td></tr>
-<tr><td>PUT</td><td><code>/api/artifacts/{{id}}</code></td><td>Update content
-and/or password (owner only)</td></tr>
-<tr><td>GET</td><td><code>/api/artifacts</code></td><td>List your project's
-artifacts</td></tr>
-<tr><td>DELETE</td><td><code>/api/artifacts/{{id}}</code></td><td>Delete the
-serving copy (owner only)</td></tr>
-</table>
+<tr><td class="mono">POST</td><td><code>/api/artifacts</code></td><td>Publish a new artifact</td></tr>
+<tr><td class="mono">PUT</td><td><code>/api/artifacts/{{id}}</code></td><td>Add a live version, or change password / <code>accept_versions</code></td></tr>
+<tr><td class="mono">GET</td><td><code>/api/artifacts</code></td><td>List your project's artifacts</td></tr>
+<tr><td class="mono">DELETE</td><td><code>/api/artifacts/{{id}}</code></td><td>Delete every version and the meta record</td></tr>
+<tr><td class="mono">POST</td><td><code>/api/artifacts/{{id}}/versions</code></td><td>Submit a version (live for the owner, proposed for everyone else)</td></tr>
+<tr><td class="mono">POST</td><td><code>/api/artifacts/{{id}}/versions/{{n}}/promote</code></td><td>Owner approves a proposal</td></tr>
+<tr><td class="mono">DELETE</td><td><code>/api/artifacts/{{id}}/versions/{{n}}</code></td><td>Owner removes a version; a contributor withdraws their own proposal</td></tr>
+<tr><td class="mono">PUT</td><td><code>/api/artifacts/{{id}}/head</code></td><td>Serve the latest live version, or pin one</td></tr>
+</table></div>
 
-<h2>For agents</h2>
-<p><a href="{base}/skill">{base}/skill</a> — SKILL.md teaching an agent how to
-author and publish artifacts.<br>
-<a href="{base}/context">{base}/context</a> — machine-readable manifest:
-endpoints, auth model, limits.<br>
-<a href="{base}/docs">{base}/docs</a> — interactive Swagger UI for this API,
-with a machine-readable schema at <a href="{base}/openapi.json">{base}/openapi.json</a>.</p>
-
-<footer>kbc-artifact-hub 0.1.0 &middot;
-<a href="{base}/health">/health</a></footer>
+<footer>
+<span>kbc-artifact-hub v{version}</span>
+<span class="spacer"></span>
+<a href="{repo}">github.com/padak/kbc_ai_artifact</a>
+<a href="{base}/health">/health</a>
+</footer>
 </main>""",
     )
 
@@ -264,23 +601,162 @@ with a machine-readable schema at <a href="{base}/openapi.json">{base}/openapi.j
 def unlock_page(artifact_id: str, error: str | None) -> str:
     """Render the password form for a protected artifact."""
     safe_id = html.escape(artifact_id)
-    error_html = (
-        f'<p class="error">{html.escape(error)}</p>' if error else ""
-    )
+    error_html = f'<p class="error">&gt; {html.escape(error)}</p>' if error else ""
     return _page(
         "Password required",
         _UNLOCK_CSS,
-        f"""<div class="card">
+        f"""<div class="gate">
+<div class="rule">locked artifact</div>
+<div class="card">
 <h1>Password required</h1>
 <p>This artifact is protected. Enter its password to continue.</p>
 <form method="post" action="/a/{safe_id}/unlock">
 <label for="password">Password</label>
-<input type="password" id="password" name="password" autocomplete="current-password"
-  autofocus required>
+<input type="password" id="password" name="password"
+  autocomplete="current-password" autofocus required>
 <button type="submit">Unlock</button>
 {error_html}
 </form>
-<p class="hint">Machines can send the password in the
+<p class="hint">Machines send the password in the
 <code>X-Artifact-Password</code> header instead.</p>
+</div>
 </div>""",
+    )
+
+
+def _version_row(
+    base: str,
+    artifact_id: str,
+    version_meta: dict,
+    older: int | None,
+) -> str:
+    """One row of the version picker; ``older`` is the adjacent older version."""
+    number = version_meta.get("version")
+    status = str(version_meta.get("status") or "live")
+    is_head = bool(version_meta.get("is_head"))
+    title = str(version_meta.get("title") or "untitled")
+    note = version_meta.get("note")
+    created = str(version_meta.get("created_at") or "")
+    size = version_meta.get("size_bytes")
+    author = version_meta.get("author") or {}
+    project = author.get("project_name") or author.get("project_id") or "unknown"
+
+    badges = _badge(status, "proposed" if status == "proposed" else "live")
+    if is_head:
+        badges += _badge("head", "head")
+
+    meta_bits = [f"by {html.escape(str(project))}"]
+    if created:
+        meta_bits.append(html.escape(created))
+    if isinstance(size, int):
+        meta_bits.append(f"{size:,} bytes".replace(",", " "))
+    source_type = version_meta.get("source_type")
+    if source_type:
+        meta_bits.append(html.escape(str(source_type)))
+
+    note_html = (
+        f'<p class="vrow-note">{html.escape(str(note))}</p>' if note else ""
+    )
+
+    links = [f'<a href="{base}/a/{artifact_id}/v/{number}">view v{number}</a>']
+    if older is not None:
+        links.append(
+            f'<a href="{base}/a/{artifact_id}/diff/{older}..{number}">'
+            f"diff v{older}..v{number}</a>"
+        )
+
+    return (
+        f'<li class="vrow{" is-head" if is_head else ""}">'
+        f'<div class="vrow-top"><span class="vrow-n">v{number}</span>'
+        f'<span class="vrow-title">{html.escape(title)}</span>{badges}</div>'
+        f'<div class="vrow-meta">{"".join(f"<span>{bit}</span>" for bit in meta_bits)}</div>'
+        f"{note_html}"
+        f'<div class="vrow-links">{"".join(links)}</div>'
+        "</li>"
+    )
+
+
+def versions_page(
+    base_url: str,
+    artifact_id: str,
+    versions: list[dict],
+    head_version: int | None,
+    accept_versions: bool,
+    protected: bool,
+) -> str:
+    """Render the human-facing version history for one artifact.
+
+    ``versions`` is the store's public metadata list, newest first, as returned
+    by :meth:`~src.store.ArtifactStore.list_versions`.
+    """
+    base = html.escape(base_url.rstrip("/"))
+    safe_id = html.escape(artifact_id)
+
+    rows = "".join(
+        _version_row(
+            base,
+            safe_id,
+            version_meta,
+            versions[index + 1].get("version") if index + 1 < len(versions) else None,
+        )
+        for index, version_meta in enumerate(versions)
+    )
+    if not rows:
+        rows = '<li class="vrow"><span class="empty">no versions</span></li>'
+
+    proposed = sum(1 for v in versions if v.get("status") == "proposed")
+    facts = [
+        _badge(f"{len(versions)} versions"),
+        _badge(f"head v{head_version}" if head_version else "no live head", "head"),
+    ]
+    if proposed:
+        facts.append(_badge(f"{proposed} proposed", "proposed"))
+    facts.append(
+        _badge("open to contributions" if accept_versions else "owner only")
+    )
+    if protected:
+        facts.append(_badge("password protected"))
+
+    submit = ""
+    if accept_versions:
+        submit = (
+            '<h2 class="label">submit a version</h2>'
+            "<p>Anyone with a Keboola Storage API token can propose a new "
+            "version. Proposals stay private to you and the owner until the "
+            "owner promotes one.</p>"
+            + _term(
+                "POST /api/artifacts/…/versions",
+                f'<span class="p">$</span> curl -sX POST '
+                f'<span class="s">"{base}/api/artifacts/{safe_id}/versions"</span> \\\n'
+                '    -H <span class="s">"X-StorageApi-Token: $KBC_TOKEN"</span> \\\n'
+                '    -H <span class="s">"X-Storage-Stack: eu"</span> \\\n'
+                '    -H <span class="s">"Content-Type: application/json"</span> \\\n'
+                '    -d <span class="s">\'{"markdown": "# Updated\\n\\n...", '
+                '"note": "what changed"}\'</span>',
+            )
+        )
+
+    return _page(
+        f"Versions — {artifact_id}",
+        _VERSIONS_CSS,
+        f"""<main>
+<div class="vhead"><h1>Version history</h1></div>
+<p class="lead"><code>{safe_id}</code></p>
+<div class="hero-meta">{"".join(facts)}</div>
+<div class="hero-links">
+<a class="primary" href="{base}/a/{safe_id}">open head version</a>
+<a href="{base}/a/{safe_id}/versions">JSON</a>
+<a href="{base}/a/{safe_id}/meta">metadata</a>
+</div>
+
+<h2 class="label">versions</h2>
+<ul class="vlist">{rows}</ul>
+{submit}
+
+<footer>
+<span>kbc-artifact-hub</span>
+<span class="spacer"></span>
+<a href="{base}/">hub home</a>
+</footer>
+</main>""",
     )

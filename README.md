@@ -1,5 +1,15 @@
 # KBC Artifact Hub
 
+[![repo](https://img.shields.io/badge/github-padak%2Fkbc__ai__artifact-1442e0)](https://github.com/padak/kbc_ai_artifact)
+[![releases](https://img.shields.io/badge/releases-latest-1442e0)](https://github.com/padak/kbc_ai_artifact/releases)
+[![python](https://img.shields.io/badge/python-3.11%2B-1442e0)](https://www.python.org/)
+
+Source, issues and tagged releases live at
+<https://github.com/padak/kbc_ai_artifact> — the deployed service reports the
+version it is running at `GET /health` and `GET /context`, which is the single
+source of truth (read from the installed package metadata, itself derived from
+`pyproject.toml`).
+
 A Keboola App (FastAPI) that hosts self-contained HTML/Markdown artifacts
 under public, unguessable URLs. Anyone holding **any** Keboola Storage API
 token, on **any** Keboola stack, can publish a document; the service returns
@@ -13,8 +23,16 @@ content, source, or metadata over a small JSON API.
 - Unguessable capability URLs (`token_urlsafe`, 24 chars) — no public listing,
   `X-Robots-Tag: noindex` on every artifact response
 - Optional password protection, with a web unlock form and a machine header
+- **Community versioning**: every update adds a version instead of overwriting,
+  and `accept_versions` lets other Keboola projects submit versions of your
+  artifact
+- **Moderated proposals**: a submission from another project lands as a
+  proposal whose content only you and its author can read, until you promote it
+- **Diffs**: side-by-side HTML, unified text, or JSON with add/remove counts —
+  standard library only, no new dependencies
+- **Head pointer**: `/a/{id}` serves the newest live version, or one you pin
 - Machine-readable API: `/context` manifest and a `/skill` SKILL.md an AI
-  agent can read to learn how to publish, unassisted
+  agent can read to learn how to publish and contribute, unassisted
 - Markdown rendering with GFM tables, task lists, mermaid diagrams, and
   syntax-highlighted code
 - Survives restarts: the only durable state is Keboola Storage Files; local
@@ -33,9 +51,18 @@ needed). Two copies are written:
 - a **canonical copy** of the built HTML as a Storage File in the **author's
   own project**, uploaded with the author's token, tagged `kbc-artifact` and
   `artifact-id-<id>`;
-- a **serving envelope** (HTML + metadata + password hash, as JSON) as a
-  Storage File in the **host project**, tagged `artifact-hub`,
-  `artifact-id-<id>`, and `artifact-owner-<key>`.
+- a **version envelope** (HTML + source + verified author + status, as JSON) as
+  a Storage File in the **host project**, named `artifact-<id>-v<n>.json` and
+  tagged `artifact-hub`, `artifact-id-<id>`, `artifact-ver-<n>`, alongside an
+  artifact-level **meta record** `artifact-<id>-meta.json` (owner, password
+  hash, `accept_versions`, head pointer) tagged `artifact-hub`,
+  `artifact-id-<id>`, `artifact-meta`, `artifact-owner-<key>`.
+
+Updates never overwrite a version: each one uploads the next version file. A
+submission from a project other than the owner is stored with status
+`proposed` and is not served until the owner promotes it. Legacy single-file
+envelopes from before versioning are read as version 1 and migrated on the
+next write.
 
 The service never persists client tokens; they are used only for the
 duration of the request. The same holds for an optional `git_token` used to
@@ -43,9 +70,11 @@ clone a private repository: it lives only in the clone subprocess argument,
 and git's output is scrubbed of credentials before any of it reaches a log
 line or an error message.
 
-**Read flow.** `GET /a/{id}` (and `/raw`, `/source`, `/meta`) is served from
-an in-memory index that maps artifact ids to their envelopes, backed by a
-disk LRU cache. On startup, since the app container has no permanent disk,
+**Read flow.** `GET /a/{id}` (and `/raw`, `/source`, `/meta`, `/v/{n}`,
+`/versions`, `/diff/{a}..{b}`) is served from an in-memory index that maps
+artifact ids to their version and meta files, backed by a disk LRU cache.
+`/a/{id}` resolves the *head* — the newest live version, or the one the owner
+pinned. On startup, since the app container has no permanent disk,
 the service rebuilds this index from scratch by listing every Storage File
 tagged `artifact-hub` in the host project — the Storage Files of the host
 project are the single source of truth, and local disk holds only a cache of
@@ -63,21 +92,28 @@ Public (no auth):
 | GET | `/skill` | SKILL.md (`text/markdown`) teaching agents how to publish |
 | GET | `/docs` | Interactive Swagger UI for this API |
 | GET | `/openapi.json` | Machine-readable OpenAPI schema for this API |
-| GET | `/a/{id}` | Rendered artifact, or the password unlock form |
+| GET | `/a/{id}` | Head version rendered, or the password unlock form |
 | POST | `/a/{id}/unlock` | Password form target; sets a signed unlock cookie |
+| GET | `/a/{id}/v/{n}` | One specific version (owner/author only when proposed) |
+| GET | `/a/{id}/versions` | Version history JSON; `?format=html` renders a picker page |
+| GET | `/a/{id}/diff/{a}..{b}` | Diff two versions; `?format=html\|unified\|json` |
 | GET | `/a/{id}/raw` | Raw built HTML (password via `X-Artifact-Password` if protected) |
 | GET | `/a/{id}/source` | Original submitted source (markdown or html) |
 | GET | `/a/{id}/meta` | Public metadata JSON (no owner details) |
-| GET | `/health` | Liveness check + index stats |
+| GET | `/health` | Liveness check + service version + index stats |
 
 Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/artifacts` | Publish `{html \| markdown \| git_url[, git_ref, git_path, git_token, git_username], title?, password?}` → `{id, url, raw_url, meta_url, ...}` |
-| PUT | `/api/artifacts/{id}` | Update content and/or password (owner project only) |
+| POST | `/api/artifacts` | Publish `{html \| markdown \| git_url[, git_ref, git_path, git_token, git_username], title?, password?, accept_versions?}` → `{id, version, head_version, url, raw_url, meta_url, versions_url, ...}` |
+| PUT | `/api/artifacts/{id}` | Add a live version and/or change `password` / `clear_password` / `accept_versions` (owner project only) |
 | GET | `/api/artifacts` | List the caller's project's own artifacts |
-| DELETE | `/api/artifacts/{id}` | Delete the serving copy (owner project only) |
+| DELETE | `/api/artifacts/{id}` | Delete every version and the meta record (owner project only) |
+| POST | `/api/artifacts/{id}/versions` | Submit a version `{html \| markdown \| git_url, title?, note?}` — live for the owner, proposed for any other project |
+| POST | `/api/artifacts/{id}/versions/{n}/promote` | Promote a proposal to live (owner project only) |
+| DELETE | `/api/artifacts/{id}/versions/{n}` | Delete a version (owner), or withdraw your own proposal (contributor) |
+| PUT | `/api/artifacts/{id}/head` | `{"mode": "latest"}` or `{"mode": "pinned", "version": n}` (owner project only) |
 
 ## Quick start (curl)
 
@@ -133,6 +169,44 @@ curl -s -X DELETE "$HUB/api/artifacts/<id>" \
 Add `"password": "secret"` to any publish/update body to protect the
 artifact; readers then need `X-Artifact-Password: secret` (machines) or the
 web unlock form (browsers).
+
+### Versioning (curl)
+
+```bash
+# Open an artifact to submissions from other projects
+curl -s -X PUT "$HUB/api/artifacts/<id>" \
+  -H "X-StorageApi-Token: your-token" -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{"accept_versions": true}'
+
+# Submit a version (any project; live for the owner, proposed for others)
+curl -s -X POST "$HUB/api/artifacts/<id>/versions" \
+  -H "X-StorageApi-Token: contributor-token" -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{"markdown": "# Updated", "note": "fix the totals table"}'
+
+# Review: history, one version, and the diff
+curl -s "$HUB/a/<id>/versions"
+curl -s "$HUB/a/<id>/v/2" -H "X-StorageApi-Token: your-token" -H "X-Storage-Stack: eu"
+curl -s "$HUB/a/<id>/diff/1..2?format=unified"
+
+# Promote a proposal (owner project only)
+curl -s -X POST "$HUB/api/artifacts/<id>/versions/2/promote" \
+  -H "X-StorageApi-Token: your-token" -H "X-Storage-Stack: eu"
+
+# Pin the head to one live version, or go back to "latest"
+curl -s -X PUT "$HUB/api/artifacts/<id>/head" \
+  -H "X-StorageApi-Token: your-token" -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{"mode": "pinned", "version": 1}'
+
+# Withdraw your own proposal (contributor project)
+curl -s -X DELETE "$HUB/api/artifacts/<id>/versions/2" \
+  -H "X-StorageApi-Token: contributor-token" -H "X-Storage-Stack: eu"
+```
+
+`GET /a/{id}/versions?format=html` renders the same history as a styled page
+with status badges and a diff link for every adjacent pair.
 
 ### Private repositories
 
@@ -193,6 +267,9 @@ are missing. Everything else has a documented default, overridable via env.
 | `HUB_CACHE_MAX_ENTRIES` | `200` | Max number of envelopes kept in the disk LRU cache |
 | `HUB_UNLOCK_COOKIE_MAX_AGE_S` | `43200` (12 h) | Lifetime of a signed password-unlock cookie |
 | `HUB_TOKEN_VERIFY_TIMEOUT_S` | `15` | Timeout for the `token verify` call to a caller's stack |
+| `HUB_MAX_VERSIONS` | `50` | Live versions kept per artifact; older non-head, non-pinned ones are pruned (proposals are never pruned) |
+| `HUB_MAX_VERSIONS_PER_DAY` | `20` | Versions one project may submit for one artifact per UTC day (in-memory, per replica) |
+| `HUB_DIFF_MAX_BYTES` | `2097152` (2 MB) | Largest per-side payload the diff renderer will process (413 above it) |
 | `HUB_EXTRA_STACKS` | empty | Comma-separated extra stack URLs allowed beyond the `*.keboola.com` rule |
 
 ## Deployment to Keboola
@@ -228,7 +305,19 @@ discover them. Every artifact response sets `X-Robots-Tag: noindex` to keep
 search engines out. Passwords are hashed with PBKDF2-SHA256 before storage in
 the serving envelope, and unlocking one sets a signed cookie (via
 `itsdangerous`) scoped to that artifact's own path (`path=/a/<id>`), so an
-unlock on one artifact does not unlock another. As a v1 caveat, all artifacts
+unlock on one artifact does not unlock another.
+
+Community versioning is deliberately **moderated**: a version submitted by any
+project other than the owner is stored as a proposal, is never served as the
+head, and its content is readable only by the artifact owner and the version's
+own author (both authenticate with the usual two management headers). Proposal
+*metadata* — project name, note, timestamps, size — is listed to anyone holding
+the capability URL, so treat notes as public. Submissions are capped per
+contributing project per artifact per day (`HUB_MAX_VERSIONS_PER_DAY`); that
+counter is in-memory and therefore per replica, so it is a guard against
+accidental floods rather than a hard security control.
+
+As a v1 caveat, all artifacts
 are served from the same application origin, which makes the path-scoped
 cookie a soft boundary rather than a hard one; this is an accepted risk for
 v1 and may be revisited (e.g. per-artifact subdomains) later.

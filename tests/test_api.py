@@ -106,6 +106,9 @@ def api(tmp_path, settings, monkeypatch):
 
     monkeypatch.setattr(main, "KbcFilesBackend", fake_kbc_files_backend)
     monkeypatch.setattr(main, "verify_token", fake_verify_token)
+    # The per-contributor submission counter is module-level state; a test must
+    # never inherit another test's tally.
+    main._submission_counts.clear()
 
     with TestClient(main.app, base_url="https://testserver") as client:
         yield Api(
@@ -122,6 +125,7 @@ def _publish_markdown(
     *,
     title: str | None = None,
     password: str | None = None,
+    accept_versions: bool | None = None,
     headers: dict[str, str] = AUTH_HEADERS,
 ) -> str:
     """Publish a markdown artifact and return its id, asserting success."""
@@ -130,9 +134,28 @@ def _publish_markdown(
         payload["title"] = title
     if password is not None:
         payload["password"] = password
+    if accept_versions is not None:
+        payload["accept_versions"] = accept_versions
     resp = api.client.post("/api/artifacts", json=payload, headers=headers)
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
+
+
+def _submit_version(
+    api: Api,
+    artifact_id: str,
+    markdown: str,
+    *,
+    note: str | None = None,
+    headers: dict[str, str] = AUTH_HEADERS,
+):
+    """POST one version; returns the raw response so tests can assert status."""
+    payload: dict[str, Any] = {"markdown": markdown}
+    if note is not None:
+        payload["note"] = note
+    return api.client.post(
+        f"/api/artifacts/{artifact_id}/versions", json=payload, headers=headers
+    )
 
 
 def _assert_no_sensitive_keys(obj: Any) -> None:
@@ -161,8 +184,10 @@ def test_health_shape(api: Api) -> None:
     resp = api.client.get("/health")
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body) == {"status", "artifacts", "hydrated"}
+    assert set(body) == {"status", "version", "artifacts", "hydrated"}
     assert body["status"] == "ok"
+    assert body["version"] == main.SERVICE_VERSION
+    assert body["version"]
     assert isinstance(body["artifacts"], int)
     assert isinstance(body["hydrated"], bool)
     assert body["hydrated"] is True
@@ -173,7 +198,8 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
     resp = api.client.get("/context")
     assert resp.status_code == 200
     body = resp.json()
-    assert len(body["endpoints"]) == 16
+    assert body["version"] == main.SERVICE_VERSION
+    assert body["repository"] == main.GITHUB_REPO_URL
     assert body["auth"]["stack_aliases"] == dict(STACK_ALIASES)
     paths = {(e["method"], e["path"]) for e in body["endpoints"]}
     expected = {
@@ -189,12 +215,20 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("GET", "/a/{id}/raw"),
         ("GET", "/a/{id}/source"),
         ("GET", "/a/{id}/meta"),
+        ("GET", "/a/{id}/v/{n}"),
+        ("GET", "/a/{id}/versions"),
+        ("GET", "/a/{id}/diff/{a}..{b}"),
         ("POST", "/api/artifacts"),
         ("PUT", "/api/artifacts/{id}"),
         ("GET", "/api/artifacts"),
         ("DELETE", "/api/artifacts/{id}"),
+        ("POST", "/api/artifacts/{id}/versions"),
+        ("POST", "/api/artifacts/{id}/versions/{n}/promote"),
+        ("DELETE", "/api/artifacts/{id}/versions/{n}"),
+        ("PUT", "/api/artifacts/{id}/head"),
     }
     assert paths == expected
+    assert len(body["endpoints"]) == len(expected)
 
 
 def test_skill_returns_markdown(api: Api) -> None:
@@ -493,7 +527,7 @@ def test_publish_private_git_never_stores_or_echoes_the_token(
     assert GIT_TOKEN not in resp.text
 
     artifact_id = resp.json()["id"]
-    envelope = main.app.state.store.get(artifact_id)
+    envelope = main.app.state.store.get_head(artifact_id)
     assert envelope is not None
 
     serialized = envelope.to_json().decode("utf-8")
@@ -703,10 +737,431 @@ def test_restart_survival_second_store_over_same_backend(api: Api, tmp_path) -> 
         backend=api.backend,
         cache_dir=tmp_path / "restart-cache",
         cache_max_entries=api.settings.cache_max_entries,
+        max_versions=api.settings.max_versions,
     )
     count = second_store.hydrate()
     assert count >= 1
 
-    envelope = second_store.get(artifact_id)
+    envelope = second_store.get_head(artifact_id)
     assert envelope is not None
     assert "Survives restart" in envelope.html
+    assert second_store.get_meta(artifact_id) is not None
+
+
+# --------------------------------------------------------------------------
+# Shell pages
+# --------------------------------------------------------------------------
+
+
+def test_landing_page_advertises_repo_and_version(api: Api) -> None:
+    resp = api.client.get("/")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert main.GITHUB_REPO_URL in resp.text
+    assert main.SERVICE_VERSION in resp.text
+    assert "kbc-artifact-hub" in resp.text
+
+
+# --------------------------------------------------------------------------
+# Versioning: owner updates
+# --------------------------------------------------------------------------
+
+
+def test_put_by_owner_creates_version_two_and_both_are_listed(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    put = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"markdown": "# Two"},
+        headers=AUTH_HEADERS,
+    )
+    assert put.status_code == 200, put.text
+    assert put.json()["version"] == 2
+    assert put.json()["head_version"] == 2
+
+    listing = api.client.get(f"/a/{artifact_id}/versions")
+    assert listing.status_code == 200
+    body = listing.json()
+    assert body["head_version"] == 2
+    assert [v["version"] for v in body["versions"]] == [2, 1]
+    assert body["versions"][0]["is_head"] is True
+    assert body["versions"][1]["is_head"] is False
+    assert body["versions"][0]["url"] == f"https://testserver/a/{artifact_id}/v/2"
+
+    assert "Two" in api.client.get(f"/a/{artifact_id}/v/2").text
+    assert "One" in api.client.get(f"/a/{artifact_id}/v/1").text
+
+
+def test_put_title_without_content_is_422(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    resp = api.client.put(
+        f"/api/artifacts/{artifact_id}", json={"title": "Renamed"}, headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 422
+    assert "title" in resp.json()["detail"]
+
+
+def test_owner_submitted_version_is_live_immediately(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    resp = _submit_version(api, artifact_id, "# Owner two", note="second cut")
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["version"] == 2
+    assert body["status"] == "live"
+    assert body["note"] == "second cut"
+    assert body["url"] == f"https://testserver/a/{artifact_id}/v/2"
+    assert "Owner two" in api.client.get(f"/a/{artifact_id}").text
+
+
+# --------------------------------------------------------------------------
+# Versioning: moderated proposals
+# --------------------------------------------------------------------------
+
+
+def test_foreign_version_without_accept_versions_is_403(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Closed")
+    resp = _submit_version(
+        api, artifact_id, "# Hijack", headers=OTHER_AUTH_HEADERS
+    )
+    assert resp.status_code == 403
+    assert "accept_versions" in resp.json()["detail"]
+
+
+def test_foreign_proposal_is_private_until_promoted(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Open one", accept_versions=True)
+
+    proposal = _submit_version(
+        api,
+        artifact_id,
+        "# Contributed two",
+        note="typo fix",
+        headers=OTHER_AUTH_HEADERS,
+    )
+    assert proposal.status_code == 201, proposal.text
+    assert proposal.json()["status"] == "proposed"
+    assert proposal.json()["version"] == 2
+
+    # The head is untouched: /a/{id} still serves version 1.
+    head = api.client.get(f"/a/{artifact_id}")
+    assert head.status_code == 200
+    assert "Open one" in head.text
+    assert "Contributed two" not in head.text
+
+    # The proposal's *content* is private...
+    anonymous = api.client.get(f"/a/{artifact_id}/v/2")
+    assert anonymous.status_code == 403
+    assert "proposed" in anonymous.json()["error"]
+
+    # ...to everyone but its author and the artifact owner.
+    author = api.client.get(f"/a/{artifact_id}/v/2", headers=OTHER_AUTH_HEADERS)
+    assert author.status_code == 200
+    assert "Contributed two" in author.text
+
+    owner = api.client.get(f"/a/{artifact_id}/v/2", headers=AUTH_HEADERS)
+    assert owner.status_code == 200
+
+    # Its *metadata* is listed for anyone holding the capability URL.
+    listing = api.client.get(f"/a/{artifact_id}/versions").json()
+    proposed = next(v for v in listing["versions"] if v["version"] == 2)
+    assert proposed["status"] == "proposed"
+    assert proposed["note"] == "typo fix"
+    assert proposed["author"]["project_id"] == 999
+    assert listing["accept_versions"] is True
+
+
+def test_promote_is_owner_only_and_moves_the_head(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Open one", accept_versions=True)
+    assert (
+        _submit_version(
+            api, artifact_id, "# Promoted two", headers=OTHER_AUTH_HEADERS
+        ).status_code
+        == 201
+    )
+
+    foreign = api.client.post(
+        f"/api/artifacts/{artifact_id}/versions/2/promote",
+        headers=OTHER_AUTH_HEADERS,
+    )
+    assert foreign.status_code == 403
+
+    promoted = api.client.post(
+        f"/api/artifacts/{artifact_id}/versions/2/promote", headers=AUTH_HEADERS
+    )
+    assert promoted.status_code == 200, promoted.text
+    assert promoted.json()["status"] == "live"
+    assert promoted.json()["head_version"] == 2
+
+    head = api.client.get(f"/a/{artifact_id}")
+    assert head.status_code == 200
+    assert "Promoted two" in head.text
+
+    again = api.client.post(
+        f"/api/artifacts/{artifact_id}/versions/2/promote", headers=AUTH_HEADERS
+    )
+    assert again.status_code == 409
+
+    unknown = api.client.post(
+        f"/api/artifacts/{artifact_id}/versions/77/promote", headers=AUTH_HEADERS
+    )
+    assert unknown.status_code == 404
+
+
+def test_contributor_withdraws_own_proposal(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Open one", accept_versions=True)
+    assert (
+        _submit_version(
+            api, artifact_id, "# Withdrawn", headers=OTHER_AUTH_HEADERS
+        ).status_code
+        == 201
+    )
+
+    withdrawn = api.client.delete(
+        f"/api/artifacts/{artifact_id}/versions/2", headers=OTHER_AUTH_HEADERS
+    )
+    assert withdrawn.status_code == 200, withdrawn.text
+    assert withdrawn.json()["deleted"] is True
+
+    listing = api.client.get(f"/a/{artifact_id}/versions").json()
+    assert [v["version"] for v in listing["versions"]] == [1]
+
+
+def test_contributor_cannot_delete_someone_elses_version(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Open one", accept_versions=True)
+    resp = api.client.delete(
+        f"/api/artifacts/{artifact_id}/versions/1", headers=OTHER_AUTH_HEADERS
+    )
+    assert resp.status_code == 403
+
+
+def test_owner_cannot_delete_the_only_live_version(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Only one")
+    resp = api.client.delete(
+        f"/api/artifacts/{artifact_id}/versions/1", headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 409
+    assert "only live version" in resp.json()["error"]
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+
+
+def test_version_submissions_are_rate_limited_per_day(api: Api, monkeypatch) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    monkeypatch.setattr(
+        main,
+        "settings",
+        dataclasses.replace(api.settings, max_versions_per_day=2),
+    )
+
+    assert _submit_version(api, artifact_id, "# Two").status_code == 201
+    assert _submit_version(api, artifact_id, "# Three").status_code == 201
+
+    limited = _submit_version(api, artifact_id, "# Four")
+    assert limited.status_code == 429
+    assert limited.json()["limit"] == 2
+
+
+# --------------------------------------------------------------------------
+# Diffs
+# --------------------------------------------------------------------------
+
+
+def _publish_and_update(api: Api) -> str:
+    artifact_id = _publish_markdown(api, "# Report\n\nOld line\n")
+    resp = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"markdown": "# Report\n\nNew line\n"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    return artifact_id
+
+
+def test_diff_json_reports_stats(api: Api) -> None:
+    artifact_id = _publish_and_update(api)
+    resp = api.client.get(f"/a/{artifact_id}/diff/1..2?format=json")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["from"] == 1 and body["to"] == 2
+    assert body["kind"] == "markdown"
+    assert body["stats"]["added"] >= 1
+    assert body["stats"]["removed"] >= 1
+    assert "New line" in body["unified"]
+
+
+def test_diff_html_and_unified_render(api: Api) -> None:
+    artifact_id = _publish_and_update(api)
+
+    html_diff = api.client.get(f"/a/{artifact_id}/diff/1..2")
+    assert html_diff.status_code == 200
+    assert html_diff.headers["content-type"].startswith("text/html")
+    assert "New line" in html_diff.text
+
+    unified = api.client.get(f"/a/{artifact_id}/diff/1..2?format=unified")
+    assert unified.status_code == 200
+    assert unified.headers["content-type"].startswith("text/plain")
+    assert "+New line" in unified.text
+
+
+def test_diff_unknown_format_is_400(api: Api) -> None:
+    artifact_id = _publish_and_update(api)
+    resp = api.client.get(f"/a/{artifact_id}/diff/1..2?format=pdf")
+    assert resp.status_code == 400
+    assert "format" in resp.json()["error"].lower()
+
+
+def test_diff_malformed_spec_is_400_and_missing_version_is_404(api: Api) -> None:
+    artifact_id = _publish_and_update(api)
+    assert api.client.get(f"/a/{artifact_id}/diff/1-2").status_code == 400
+    assert api.client.get(f"/a/{artifact_id}/diff/1..9").status_code == 404
+
+
+# --------------------------------------------------------------------------
+# Head pointer
+# --------------------------------------------------------------------------
+
+
+def test_pinning_the_head_freezes_what_is_served(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Pinned one")
+    assert _submit_version(api, artifact_id, "# Latest two").status_code == 201
+    assert "Latest two" in api.client.get(f"/a/{artifact_id}").text
+
+    pinned = api.client.put(
+        f"/api/artifacts/{artifact_id}/head",
+        json={"mode": "pinned", "version": 1},
+        headers=AUTH_HEADERS,
+    )
+    assert pinned.status_code == 200, pinned.text
+    assert pinned.json() == {
+        "id": artifact_id,
+        "head_mode": "pinned",
+        "head_version_served": 1,
+    }
+
+    served = api.client.get(f"/a/{artifact_id}")
+    assert "Pinned one" in served.text
+    assert "Latest two" not in served.text
+
+    listing = api.client.get(f"/a/{artifact_id}/versions").json()
+    assert listing["head_version"] == 1
+    by_number = {v["version"]: v for v in listing["versions"]}
+    assert by_number[1]["is_head"] is True
+    assert by_number[2]["is_head"] is False
+
+    back = api.client.put(
+        f"/api/artifacts/{artifact_id}/head",
+        json={"mode": "latest"},
+        headers=AUTH_HEADERS,
+    )
+    assert back.status_code == 200
+    assert back.json()["head_version_served"] == 2
+
+
+def test_head_rejects_unknown_mode_and_missing_version(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    bad_mode = api.client.put(
+        f"/api/artifacts/{artifact_id}/head",
+        json={"mode": "whatever"},
+        headers=AUTH_HEADERS,
+    )
+    assert bad_mode.status_code == 422
+
+    no_version = api.client.put(
+        f"/api/artifacts/{artifact_id}/head",
+        json={"mode": "pinned"},
+        headers=AUTH_HEADERS,
+    )
+    assert no_version.status_code == 422
+
+    missing = api.client.put(
+        f"/api/artifacts/{artifact_id}/head",
+        json={"mode": "pinned", "version": 42},
+        headers=AUTH_HEADERS,
+    )
+    assert missing.status_code == 422
+
+    foreign = api.client.put(
+        f"/api/artifacts/{artifact_id}/head",
+        json={"mode": "latest"},
+        headers=OTHER_AUTH_HEADERS,
+    )
+    assert foreign.status_code == 403
+
+
+def test_head_cannot_be_pinned_to_a_proposal(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Open one", accept_versions=True)
+    assert (
+        _submit_version(
+            api, artifact_id, "# Proposed two", headers=OTHER_AUTH_HEADERS
+        ).status_code
+        == 201
+    )
+    resp = api.client.put(
+        f"/api/artifacts/{artifact_id}/head",
+        json={"mode": "pinned", "version": 2},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert "proposed" in resp.json()["detail"]
+
+
+# --------------------------------------------------------------------------
+# Version history page
+# --------------------------------------------------------------------------
+
+
+def test_versions_html_page_lists_every_version(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+    assert _submit_version(api, artifact_id, "# Two", note="second cut").status_code == 201
+
+    resp = api.client.get(f"/a/{artifact_id}/versions?format=html")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert resp.headers["x-robots-tag"] == "noindex, nofollow"
+
+    text = resp.text
+    assert "Version history" in text
+    assert ">v1<" in text and ">v2<" in text
+    assert f"/a/{artifact_id}/v/1" in text
+    assert f"/a/{artifact_id}/v/2" in text
+    assert f"/a/{artifact_id}/diff/1..2" in text
+    assert "second cut" in text
+    # accept_versions is on, so the page teaches how to contribute.
+    assert f"/api/artifacts/{artifact_id}/versions" in text
+
+
+def test_versions_of_unknown_artifact_is_404(api: Api) -> None:
+    assert api.client.get("/a/nope/versions").status_code == 404
+    assert api.client.get("/a/nope/v/1").status_code == 404
+
+
+def test_protected_artifact_gates_versions_and_diff(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Secret one", password="hunter2")
+    assert _submit_version(api, artifact_id, "# Secret two").status_code == 201
+
+    assert api.client.get(f"/a/{artifact_id}/versions").status_code == 401
+    assert api.client.get(f"/a/{artifact_id}/diff/1..2").status_code == 401
+
+    unlocked = {"X-Artifact-Password": "hunter2"}
+    assert api.client.get(f"/a/{artifact_id}/versions", headers=unlocked).status_code == 200
+    assert api.client.get(f"/a/{artifact_id}/diff/1..2", headers=unlocked).status_code == 200
+
+
+# --------------------------------------------------------------------------
+# Metadata with versions
+# --------------------------------------------------------------------------
+
+
+def test_meta_reports_version_counts(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+    assert (
+        _submit_version(
+            api, artifact_id, "# Two", headers=OTHER_AUTH_HEADERS
+        ).status_code
+        == 201
+    )
+
+    body = api.client.get(f"/a/{artifact_id}/meta").json()
+    _assert_no_sensitive_keys(body)
+    assert body["head_version"] == 1
+    assert body["versions_count"] == 2
+    assert body["proposed_count"] == 1
+    assert body["accept_versions"] is True
+    assert body["versions_url"] == f"https://testserver/a/{artifact_id}/versions"

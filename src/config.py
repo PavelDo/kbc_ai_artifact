@@ -37,6 +37,13 @@ class Settings:
     cache_max_entries: int = 200
     unlock_cookie_max_age_s: int = 12 * 3600
     token_verify_timeout_s: int = 15
+    # Community versioning (phase 2)
+    # Live versions kept per artifact; older non-head, non-pinned ones are pruned.
+    max_versions: int = 50
+    # Per-contributor cap on submitted versions per rolling day.
+    max_versions_per_day: int = 20
+    # Largest per-side payload the diff renderer will process.
+    diff_max_bytes: int = 2 * 1024 * 1024
     # Extra stack URLs (comma-separated) beyond the *.keboola.com rule
     extra_stacks: tuple[str, ...] = ()
 
@@ -66,5 +73,8 @@ def load_settings() -> Settings:
         cache_max_entries=_int_env("HUB_CACHE_MAX_ENTRIES", 200),
         unlock_cookie_max_age_s=_int_env("HUB_UNLOCK_COOKIE_MAX_AGE_S", 12 * 3600),
         token_verify_timeout_s=_int_env("HUB_TOKEN_VERIFY_TIMEOUT_S", 15),
+        max_versions=_int_env("HUB_MAX_VERSIONS", 50),
+        max_versions_per_day=_int_env("HUB_MAX_VERSIONS_PER_DAY", 20),
+        diff_max_bytes=_int_env("HUB_DIFF_MAX_BYTES", 2 * 1024 * 1024),
         extra_stacks=extra,
     )

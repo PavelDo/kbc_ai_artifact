@@ -9,6 +9,15 @@ src/__init__.py
 src/auth.py
 src/builder.py
 src/config.py
+src/diff.py
 src/kbc.py
+src/main.py
+src/pages.py
 src/security.py
 src/store.py
+tests/test_api.py
+tests/test_auth.py
+tests/test_builder.py
+tests/test_diff.py
+tests/test_security.py
+tests/test_store.py
