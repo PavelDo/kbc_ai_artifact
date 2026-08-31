@@ -1,1 +1,0 @@
-{"id": "legacy1", "owner": {"stack_url": "https://connection.keboola.com", "project_id": 1, "project_name": "Proj", "key": "1@connection.keboola.com"}, "password": null, "accept_versions": false, "head_mode": "latest", "head_version": null, "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-01T00:00:00+00:00", "schema": 2}

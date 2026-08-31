@@ -1,2 +1,0 @@
-{"lead":"_validate_git_url accepts arbitrary HTTPS hostnames and build_from_git invokes git clone against them; review for SSRF/egress restrictions.","file":"src/builder.py","suspected_discipline":"ssrf-egress"}
-{"lead":"Raw HTML and rendered Markdown become HTMLResponse content; review for script injection and browser-boundary controls.","file":"src/builder.py","suspected_discipline":"web-boundaries"}

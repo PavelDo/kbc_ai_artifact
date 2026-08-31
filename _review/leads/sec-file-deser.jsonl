@@ -1,1 +1,0 @@
-{"lead":"Private git_token is embedded in clone_url and passed as a subprocess argv element, making transient credentials observable to local process inspection (ps/proc/audit); investigate under secrets/process-boundary discipline.","file":"src/builder.py","suspected_discipline":"secrets/process-boundary"}

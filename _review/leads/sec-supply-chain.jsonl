@@ -1,1 +1,0 @@
-{"lead":"Dependency advisory/CVE status was not checked because this review has no network access or current safe local vulnerability database; no claim of CVE coverage should be made.","file":"pyproject.toml,uv.lock","suspected_discipline":"supply-chain"}

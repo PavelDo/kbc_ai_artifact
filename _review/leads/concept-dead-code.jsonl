@@ -1,1 +1,0 @@
-{"lead":"GET /health/headers is a registered route and appears in OpenAPI but is omitted from the /context endpoint catalog; assess whether this advertised diagnostic is intentionally excluded or a manifest completeness defect.","file":"src/main.py:640-666,1227-1565","suspected_discipline":"surface-parity"}

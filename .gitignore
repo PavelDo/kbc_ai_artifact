@@ -7,3 +7,4 @@ __pycache__/
 logs/
 .pytest_cache/
 uv.lock
+_review/
