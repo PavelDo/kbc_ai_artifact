@@ -8,7 +8,8 @@ content, source, or metadata over a small JSON API.
 
 ## Features
 
-- Publish HTML, Markdown, or a public git repository as a hosted artifact
+- Publish HTML, Markdown, or a git repository (public, or private via a
+  transient access token) as a hosted artifact
 - Unguessable capability URLs (`token_urlsafe`, 24 chars) — no public listing,
   `X-Robots-Tag: noindex` on every artifact response
 - Optional password protection, with a web unlock form and a machine header
@@ -18,6 +19,8 @@ content, source, or metadata over a small JSON API.
   syntax-highlighted code
 - Survives restarts: the only durable state is Keboola Storage Files; local
   disk is a cache, not a source of truth
+- Interactive API docs at `/docs` (Swagger UI) and a machine-readable schema
+  at `/openapi.json`
 
 ## Architecture
 
@@ -35,7 +38,10 @@ needed). Two copies are written:
   `artifact-id-<id>`, and `artifact-owner-<key>`.
 
 The service never persists client tokens; they are used only for the
-duration of the request.
+duration of the request. The same holds for an optional `git_token` used to
+clone a private repository: it lives only in the clone subprocess argument,
+and git's output is scrubbed of credentials before any of it reaches a log
+line or an error message.
 
 **Read flow.** `GET /a/{id}` (and `/raw`, `/source`, `/meta`) is served from
 an in-memory index that maps artifact ids to their envelopes, backed by a
@@ -55,6 +61,8 @@ Public (no auth):
 | POST | `/` | Returns 200 (platform health check) |
 | GET | `/context` | Machine-readable manifest |
 | GET | `/skill` | SKILL.md (`text/markdown`) teaching agents how to publish |
+| GET | `/docs` | Interactive Swagger UI for this API |
+| GET | `/openapi.json` | Machine-readable OpenAPI schema for this API |
 | GET | `/a/{id}` | Rendered artifact, or the password unlock form |
 | POST | `/a/{id}/unlock` | Password form target; sets a signed unlock cookie |
 | GET | `/a/{id}/raw` | Raw built HTML (password via `X-Artifact-Password` if protected) |
@@ -66,7 +74,7 @@ Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/artifacts` | Publish `{html \| markdown \| git_url[, git_ref, git_path], title?, password?}` → `{id, url, raw_url, meta_url, ...}` |
+| POST | `/api/artifacts` | Publish `{html \| markdown \| git_url[, git_ref, git_path, git_token, git_username], title?, password?}` → `{id, url, raw_url, meta_url, ...}` |
 | PUT | `/api/artifacts/{id}` | Update content and/or password (owner project only) |
 | GET | `/api/artifacts` | List the caller's project's own artifacts |
 | DELETE | `/api/artifacts/{id}` | Delete the serving copy (owner project only) |
@@ -99,6 +107,13 @@ curl -s -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{"git_url": "https://github.com/org/repo", "git_ref": "main", "git_path": "docs/report.md"}'
 
+# Publish from a private git repo (git_token is transient — see below)
+curl -s -X POST "$HUB/api/artifacts" \
+  -H "X-StorageApi-Token: your-token" \
+  -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{"git_url": "https://github.com/org/private-repo", "git_path": "docs/report.md", "git_token": "your-github-pat"}'
+
 # Read (public, no token)
 curl -s "$HUB/a/<id>/raw"
 
@@ -118,6 +133,23 @@ curl -s -X DELETE "$HUB/api/artifacts/<id>" \
 Add `"password": "secret"` to any publish/update body to protect the
 artifact; readers then need `X-Artifact-Password: secret` (machines) or the
 web unlock form (browsers).
+
+### Private repositories
+
+`git_token` is a personal access token for the git host (GitHub PAT, GitLab
+token, …); the optional `git_username` defaults to `x-access-token`, which is
+what GitHub PATs and GitLab deploy tokens expect. Both are only valid
+together with `git_url` — sending either on its own is a 422.
+
+The token is **transient, exactly like the Storage token**: it is injected
+into the clone URL for the duration of that one `git clone` subprocess and
+nothing else. It is never written to the stored envelope (the recorded
+`source.git` holds only the unauthenticated `url`, `ref`, `path` and
+`commit`), never logged, never included in an error message, and never
+returned in a response — so a later `PUT` re-publishing from the same private
+repository has to send it again. Use the narrowest scope possible and revoke
+the token when it is no longer needed. Note that the published artifact is
+still served from a public URL: the token protects the clone, not the result.
 
 ## Local development
 

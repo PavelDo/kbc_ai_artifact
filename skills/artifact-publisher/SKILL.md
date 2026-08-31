@@ -24,7 +24,8 @@ This SKILL.md is served at `GET /skill` on the hub itself — the base URL to
 use for every other call below is whatever host you fetched this file from.
 Call `GET /context` on that same host for a machine-readable manifest
 (supported inputs, current limits, endpoint list) if you need to confirm
-capabilities before publishing.
+capabilities before publishing. For interactive exploration, `GET /docs`
+serves a Swagger UI and `GET /openapi.json` the underlying OpenAPI schema.
 
 ## Authentication
 
@@ -117,12 +118,44 @@ curl -s -X POST "$HUB/api/artifacts" \
   }'
 ```
 
-The hub shallow-clones the repository (**public repos only**), then picks the
-entry point in this order: your `git_path` if given, otherwise `index.html`,
-otherwise `README.md`. Markdown entries are rendered the same way as a direct
-Markdown publish. Relative local images referenced by the entry file are
-inlined as data URIs so the resulting artifact stays a single, self-contained
-document.
+The hub shallow-clones the repository, then picks the entry point in this
+order: your `git_path` if given, otherwise `index.html`, otherwise
+`README.md`. Markdown entries are rendered the same way as a direct Markdown
+publish. Relative local images referenced by the entry file are inlined as
+data URIs so the resulting artifact stays a single, self-contained document.
+
+### Publish from a private git repository
+
+Add `git_token` — a personal access token for the git host (GitHub PAT, GitLab
+token, …) — to clone a repository that is not public:
+
+```bash
+curl -s -X POST "$HUB/api/artifacts" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "git_url": "https://github.com/org/private-repo",
+    "git_ref": "main",
+    "git_path": "docs/report.md",
+    "git_token": "your-github-pat"
+  }'
+```
+
+`git_username` is optional and defaults to `x-access-token`, which is what
+GitHub PATs and GitLab deploy tokens expect. Set it only for hosts that
+require a real username.
+
+**Transient credentials.** Exactly like your Storage token, `git_token` is
+used only for the clone inside that one request: it is never written to the
+stored artifact, never appears in logs or error messages, and is never
+returned in any response. Nothing is remembered, so a later `PUT` that
+re-publishes from the same private repository must send the token again. Use a
+token with the narrowest possible scope (read-only, single repository) and
+revoke it when you no longer need it.
+
+Both `git_token` and `git_username` are only meaningful alongside `git_url`;
+sending either without it is a 422.
 
 ### Password protection
 
@@ -200,7 +233,7 @@ mind:
 | 401 | Storage token rejected by the stack, or wrong artifact password |
 | 403 | Token is valid but not from the owning project (update/delete) |
 | 404 | Unknown artifact id (identical response whether it never existed or was deleted) |
-| 422 | Build failure — bad git repo, no entry file found, markdown render error |
+| 422 | Build failure — bad git repo, no entry file found, markdown render error, or `git_token`/`git_username` sent without `git_url` |
 | 502 | The Keboola stack itself could not be reached to verify the token |
 
 ## Safety notes
@@ -213,3 +246,6 @@ mind:
   content private from anyone the URL is deliberately shared with.
 - Publishing, updating, and deleting always require a valid Keboola Storage
   token — only reading is anonymous.
+- Publishing from a private repository publishes its content to a **public**
+  URL. The `git_token` protects the clone, not the artifact; add a `password`
+  if the result should not be readable by everyone holding the link.

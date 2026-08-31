@@ -211,6 +211,11 @@ images are inlined as data URIs so the result is self-contained.</p>
   -H "Content-Type: application/json" \\
   -d '{{"git_url": "https://github.com/owner/repo",
        "git_ref": "main", "git_path": "docs/report.md"}}'</code></pre>
+<p>For a private repository, add <code>git_token</code> (a personal access
+token for the git host) and, only if the host needs one,
+<code>git_username</code> — it defaults to <code>x-access-token</code>. Like
+your Storage token, it is used only for the clone during that request: it is
+never stored, logged, or returned.</p>
 
 <h2>Reading an artifact</h2>
 <table>
@@ -246,7 +251,9 @@ serving copy (owner only)</td></tr>
 <p><a href="{base}/skill">{base}/skill</a> — SKILL.md teaching an agent how to
 author and publish artifacts.<br>
 <a href="{base}/context">{base}/context</a> — machine-readable manifest:
-endpoints, auth model, limits.</p>
+endpoints, auth model, limits.<br>
+<a href="{base}/docs">{base}/docs</a> — interactive Swagger UI for this API,
+with a machine-readable schema at <a href="{base}/openapi.json">{base}/openapi.json</a>.</p>
 
 <footer>kbc-artifact-hub 0.1.0 &middot;
 <a href="{base}/health">/health</a></footer>

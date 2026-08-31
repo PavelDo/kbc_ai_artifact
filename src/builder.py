@@ -16,6 +16,13 @@ is user-facing and is mapped to HTTP 422 by the API layer.
 
 The only outbound network access in this module is the ``git clone``
 subprocess. Everything else is local.
+
+Private repositories are supported by passing a transient ``git_token`` (and
+optionally ``git_username``) to :func:`build_from_git`. The credentials are
+injected into the clone URL for the duration of that one subprocess call and
+nothing else: the *unauthenticated* URL is what gets logged, recorded and
+echoed back, and every string that can reach a :class:`BuildError` message goes
+through :func:`_scrub` with the token as an extra literal to redact.
 """
 
 from __future__ import annotations
@@ -31,7 +38,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse, urlunparse
 
 from markdown_it import MarkdownIt
 from mdit_py_plugins.anchors import anchors_plugin
@@ -65,6 +72,13 @@ ANCHOR_MAX_LEVEL = 3
 GIT_METADATA_DIR = ".git"
 
 DEFAULT_MIME_TYPE = "application/octet-stream"
+
+#: Username used when a git token is supplied without one. Works for GitHub
+#: personal access tokens and GitLab deploy tokens alike.
+DEFAULT_GIT_USERNAME = "x-access-token"
+
+#: What a redacted secret is replaced with in anything shown to a caller.
+REDACTED = "***"
 
 #: Schemes that are never inlined as data URIs.
 EXTERNAL_URL_PREFIXES: tuple[str, ...] = (
@@ -485,14 +499,43 @@ def build_from_markdown(md: str, title: str | None = None) -> BuiltArtifact:
 # --------------------------------------------------------------------------
 
 
-def _scrub(text: str) -> str:
-    """Remove any embedded credentials before echoing text back to a user."""
-    return _CREDENTIALS_RE.sub("//", text)
+def _scrub(text: str, secret: str | None = None) -> str:
+    """Remove any embedded credentials before echoing text back to a user.
+
+    Two independent passes, deliberately overlapping:
+
+    1. the ``//user:pass@host`` form is rewritten to ``//host`` — this catches
+       credentials in any URL git echoes back, whatever the secret was;
+    2. when ``secret`` is given, both its literal and its percent-encoded form
+       are replaced with :data:`REDACTED`, so a token that leaked in some shape
+       the regex does not model still never reaches the caller.
+    """
+    cleaned = _CREDENTIALS_RE.sub("//", text)
+    if secret:
+        for form in (secret, quote(secret, safe="")):
+            cleaned = cleaned.replace(form, REDACTED)
+    return cleaned
 
 
-def _last_line(text: str) -> str:
+def _last_line(text: str, secret: str | None = None) -> str:
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    return _scrub(lines[-1]) if lines else ""
+    return _scrub(lines[-1], secret) if lines else ""
+
+
+def _authed_clone_url(git_url: str, username: str | None, token: str) -> str:
+    """Return ``git_url`` with transient clone credentials in its userinfo.
+
+    The result is passed to ``git clone`` and to nothing else: it is never
+    logged, stored, or included in an error message. Both parts are
+    percent-encoded with ``safe=""`` so that a token containing ``@``, ``:``
+    or ``/`` cannot break out of the userinfo section. Any userinfo already
+    present in ``git_url`` is replaced.
+    """
+    parsed = urlparse(git_url)
+    host = parsed.netloc.rsplit("@", 1)[-1]
+    user = quote(username or DEFAULT_GIT_USERNAME, safe="")
+    secret = quote(token, safe="")
+    return urlunparse(parsed._replace(netloc=f"{user}:{secret}@{host}"))
 
 
 def _validate_git_url(git_url: str) -> str:
@@ -532,21 +575,41 @@ def _run_git(args: list[str], timeout_s: int) -> subprocess.CompletedProcess[str
         ) from exc
 
 
-def _clone(git_url: str, ref: str | None, dest: Path, timeout_s: int) -> None:
-    """Shallow-clone ``git_url`` (optionally at ``ref``) into ``dest``."""
+def _clone(
+    git_url: str,
+    ref: str | None,
+    dest: Path,
+    timeout_s: int,
+    *,
+    username: str | None = None,
+    token: str | None = None,
+) -> None:
+    """Shallow-clone ``git_url`` (optionally at ``ref``) into ``dest``.
+
+    With ``token`` set, the clone runs against a credentialed variant of the
+    URL (see :func:`_authed_clone_url`); ``git_url`` itself stays the
+    unauthenticated URL used for every message raised from here.
+    """
+    clone_url = _authed_clone_url(git_url, username, token) if token else git_url
     args = ["git", "clone", "--depth", "1"]
     if ref:
         args += ["--branch", ref]
-    args += [git_url, str(dest)]
+    args += [clone_url, str(dest)]
     result = _run_git(args, timeout_s)
     if result.returncode == 0:
         return
-    reason = _last_line(result.stderr) or _last_line(result.stdout)
+    reason = _last_line(result.stderr, token) or _last_line(result.stdout, token)
     lowered = (result.stderr or "").lower()
     if "could not read username" in lowered or "authentication failed" in lowered:
+        hint = (
+            "The supplied git_token was rejected, or git_username is wrong for "
+            "this host."
+            if token
+            else "Pass git_token (and optionally git_username) to publish from "
+            "a private repository."
+        )
         raise BuildError(
-            "Could not clone the repository: it is private or does not exist. "
-            "Only public https repositories are supported."
+            f"Could not clone the repository: it is private or does not exist. {hint}"
         )
     detail = f" git said: {reason}" if reason else ""
     if ref:
@@ -574,10 +637,13 @@ def _repo_size_bytes(root: Path) -> int:
     return total
 
 
-def _head_commit(root: Path, timeout_s: int) -> str | None:
+def _head_commit(root: Path, timeout_s: int, secret: str | None = None) -> str | None:
     result = _run_git(["git", "-C", str(root), "rev-parse", "HEAD"], timeout_s)
     if result.returncode != 0:
-        logger.warning("rev-parse HEAD failed: %s", _last_line(result.stderr))
+        # ``secret`` is passed through purely defensively: rev-parse never
+        # touches the remote, but a cloned .git/config does hold the authed
+        # remote URL, so nothing derived from git output is logged unscrubbed.
+        logger.warning("rev-parse HEAD failed: %s", _last_line(result.stderr, secret))
         return None
     return result.stdout.strip() or None
 
@@ -741,20 +807,38 @@ def build_from_git(
     path: str | None,
     title: str | None,
     settings: "Settings",
+    *,
+    git_username: str | None = None,
+    git_token: str | None = None,
 ) -> BuiltArtifact:
-    """Shallow-clone a public https repository and build its entry document.
+    """Shallow-clone an https repository and build its entry document.
 
     Entry selection: explicit ``path`` (file or directory), otherwise
     ``index.html`` → ``README.md`` → a single root-level ``*.html``. Markdown
     entries go through the same rendering as :func:`build_from_markdown`; HTML
     entries are used verbatim. Relative images are inlined as ``data:`` URIs.
+
+    ``git_token`` (with the optional ``git_username``, defaulting to
+    :data:`DEFAULT_GIT_USERNAME`) makes private repositories reachable. It is
+    used for the clone subprocess only: the unauthenticated ``git_url`` is what
+    is logged and reported, and it is the caller's job never to persist the
+    token.
     """
     url = _validate_git_url(git_url)
 
     with tempfile.TemporaryDirectory(prefix="artifact-git-") as tmp:
         dest = Path(tmp) / "repo"
-        logger.info("Cloning %s (ref=%r)", _scrub(url), ref)
-        _clone(url, ref, dest, settings.git_clone_timeout_s)
+        logger.info(
+            "Cloning %s (ref=%r, authenticated=%s)", _scrub(url), ref, bool(git_token)
+        )
+        _clone(
+            url,
+            ref,
+            dest,
+            settings.git_clone_timeout_s,
+            username=git_username,
+            token=git_token,
+        )
 
         size = _repo_size_bytes(dest)
         if size > settings.git_max_repo_bytes:
@@ -763,7 +847,7 @@ def build_from_git(
                 f"is {settings.git_max_repo_bytes // (1024 * 1024)} MB."
             )
 
-        commit = _head_commit(dest, settings.git_clone_timeout_s)
+        commit = _head_commit(dest, settings.git_clone_timeout_s, git_token)
         entry = _resolve_entry(dest, path)
         suffix = entry.suffix.lower()
         source = _read_text(entry)

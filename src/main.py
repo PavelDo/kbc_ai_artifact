@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -28,7 +29,7 @@ from fastapi.responses import (
     RedirectResponse,
     Response,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src import builder
 from src.auth import (
@@ -109,14 +110,119 @@ async def lifespan(app: FastAPI):
     yield
 
 
+#: Markdown shown at the top of the interactive docs (Swagger UI) and in the
+#: generated OpenAPI document's ``info.description``.
+API_DESCRIPTION = """\
+Public hosting for self-contained HTML/Markdown artifacts, backed by Keboola
+Storage. Anyone holding **any** Keboola Storage API token, on **any** Keboola
+stack, can publish a document and get back an unguessable public URL.
+
+## Authentication
+
+Everything under `/api/artifacts` is authenticated with two headers instead
+of a bearer token:
+
+| Header | Meaning |
+|---|---|
+| `X-StorageApi-Token` | Any Keboola Storage API token |
+| `X-Storage-Stack` | Stack alias (`us`, `gcp-us`, `eu`, `azure-eu`, `gcp-eu`) or a full `https://*.keboola.com` URL. `X-Kbc-Stack` is accepted as an alias for direct/local access. |
+
+Use the **Authorize** button above to set both headers once for every request
+made from this page.
+
+## Learn more
+
+- [`/skill`](/skill) — SKILL.md teaching an AI agent how to publish
+  artifacts, unassisted.
+- [`/context`](/context) — machine-readable manifest of endpoints, auth
+  model and limits.
+
+## Artifact URLs are capabilities
+
+Reading an artifact (`/a/{id}` and friends) needs no token: the unguessable
+id in the URL *is* the access control. There is no public listing. An
+optional password adds a second layer on top.
+"""
+
 app = FastAPI(
     title="KBC Artifact Hub",
     version=SERVICE_VERSION,
+    description=API_DESCRIPTION,
     lifespan=lifespan,
-    docs_url=None,
+    docs_url="/docs",
     redoc_url=None,
-    openapi_url=None,
+    openapi_url="/openapi.json",
+    openapi_tags=[
+        {
+            "name": "public",
+            "description": "Unauthenticated reads: artifact pages and service discovery.",
+        },
+        {
+            "name": "artifacts",
+            "description": "Authenticated artifact management (publish, update, list, delete).",
+        },
+        {
+            "name": "service",
+            "description": "Health, machine-readable manifest, and the agent-facing skill document.",
+        },
+    ],
 )
+
+
+#: Names of the two OpenAPI apiKey-in-header security schemes. Kept in one
+#: place so the custom openapi() override and the per-route `security` lists
+#: cannot drift apart.
+_TOKEN_SECURITY = "StorageApiToken"
+_STACK_SECURITY = "StorageStack"
+
+
+def custom_openapi() -> dict[str, Any]:
+    """Attach the two header-based auth schemes to every ``/api/*`` operation.
+
+    FastAPI has no first-class concept of "two headers act together as
+    credentials", so the schemes are declared as plain ``apiKey``-in-header
+    security schemes and wired onto the relevant operations here. This is
+    purely a documentation aid for Swagger UI's Authorize button — the actual
+    runtime check stays in :func:`require_owner`, untouched.
+    """
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=app.openapi_tags,
+    )
+    components = schema.setdefault("components", {})
+    security_schemes = components.setdefault("securitySchemes", {})
+    security_schemes[_TOKEN_SECURITY] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-StorageApi-Token",
+        "description": "Any Keboola Storage API token.",
+    }
+    security_schemes[_STACK_SECURITY] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Storage-Stack",
+        "description": (
+            "Stack alias (us, gcp-us, eu, azure-eu, gcp-eu) or a full "
+            "https://*.keboola.com URL."
+        ),
+    }
+    security_requirement = [{_TOKEN_SECURITY: [], _STACK_SECURITY: []}]
+    for path, methods in schema.get("paths", {}).items():
+        if not path.startswith("/api/"):
+            continue
+        for operation in methods.values():
+            if isinstance(operation, dict):
+                operation["security"] = security_requirement
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
 
 
 def ensure_hydrated(app_obj: FastAPI) -> None:
@@ -230,7 +336,18 @@ def reader_allowed(envelope: Envelope, request: Request) -> bool:
     return False
 
 
-@app.get("/health/headers")
+@app.get(
+    "/health/headers",
+    tags=["service"],
+    summary="Diagnostic: header names received by the app",
+    description=(
+        "Lists the names (never the values) of request headers that reached "
+        "this process. Exists to detect reverse proxies that silently strip "
+        "custom headers such as X-StorageApi-Token or X-Storage-Stack, which "
+        "would otherwise break header-based authentication in a way that is "
+        "hard to diagnose from the outside."
+    ),
+)
 def health_headers(request: Request) -> dict[str, Any]:
     """Diagnostic: names of request headers that reached the app.
 
@@ -270,28 +387,139 @@ def _load(request: Request, artifact_id: str) -> Envelope | None:
 
 
 class PublishBody(BaseModel):
-    """Body of ``POST /api/artifacts``: exactly one content field is required."""
+    """Body of ``POST /api/artifacts``: exactly one content field is required.
 
-    html: str | None = None
-    markdown: str | None = None
-    git_url: str | None = None
-    git_ref: str | None = None
-    git_path: str | None = None
-    title: str | None = None
-    password: str | None = None
+    Provide exactly one of ``html``, ``markdown`` or ``git_url``.
+    ``git_token``/``git_username`` are transient clone credentials for a
+    private repository: like the Storage token, they are used during the
+    request and never stored, logged or echoed back.
+    """
+
+    html: str | None = Field(
+        None,
+        description=(
+            "Complete HTML document, served as-is. Mutually exclusive with "
+            "'markdown' and 'git_url'."
+        ),
+    )
+    markdown: str | None = Field(
+        None,
+        description=(
+            "Markdown source, rendered by the hub's built-in template (GFM "
+            "tables, task lists, mermaid fences, syntax highlighting). "
+            "Mutually exclusive with 'html' and 'git_url'."
+        ),
+    )
+    git_url: str | None = Field(
+        None,
+        description=(
+            "HTTPS git repository to clone (public, or private with "
+            "'git_token'). Mutually exclusive with 'html' and 'markdown'."
+        ),
+    )
+    git_ref: str | None = Field(
+        None, description="Optional branch, tag or commit to check out for 'git_url'."
+    )
+    git_path: str | None = Field(
+        None,
+        description=(
+            "Optional entry file or directory inside the repository. "
+            "Defaults to index.html, then README.md, then a single root "
+            "*.html file."
+        ),
+    )
+    git_username: str | None = Field(
+        None,
+        description=(
+            "Username for git hosts that require one alongside 'git_token'. "
+            "Defaults to 'x-access-token', which works for GitHub PATs and "
+            "GitLab deploy tokens. Only valid together with 'git_url' (422 "
+            "otherwise)."
+        ),
+    )
+    git_token: str | None = Field(
+        None,
+        description=(
+            "Personal access token for the git host (GitHub PAT, GitLab "
+            "token, ...), used to clone a private repository. Transient: "
+            "used only for the clone during this request, never stored, "
+            "logged or returned. Only valid together with 'git_url' (422 "
+            "otherwise)."
+        ),
+    )
+    title: str | None = Field(
+        None, description="Optional title; derived from the content when omitted."
+    )
+    password: str | None = Field(
+        None,
+        description=(
+            "Optional reader password. Readers unlock via the "
+            "X-Artifact-Password header or the web unlock form."
+        ),
+    )
 
 
 class UpdateBody(BaseModel):
-    """Body of ``PUT /api/artifacts/{id}``: every field is optional."""
+    """Body of ``PUT /api/artifacts/{id}``: every field is optional.
 
-    html: str | None = None
-    markdown: str | None = None
-    git_url: str | None = None
-    git_ref: str | None = None
-    git_path: str | None = None
-    title: str | None = None
-    password: str | None = None
-    clear_password: bool = False
+    At most one content field (``html``, ``markdown``, ``git_url``) may be
+    given; omit all of them to leave the content unchanged.
+    """
+
+    html: str | None = Field(
+        None,
+        description=(
+            "Complete HTML document, served as-is. At most one of 'html', "
+            "'markdown', 'git_url' may be given."
+        ),
+    )
+    markdown: str | None = Field(
+        None,
+        description=(
+            "Markdown source, rendered by the hub's built-in template. At "
+            "most one of 'html', 'markdown', 'git_url' may be given."
+        ),
+    )
+    git_url: str | None = Field(
+        None,
+        description=(
+            "HTTPS git repository to clone. At most one of 'html', "
+            "'markdown', 'git_url' may be given."
+        ),
+    )
+    git_ref: str | None = Field(
+        None, description="Optional branch, tag or commit to check out for 'git_url'."
+    )
+    git_path: str | None = Field(
+        None,
+        description=(
+            "Optional entry file or directory inside the repository; see "
+            "the same field on the publish body for the resolution order."
+        ),
+    )
+    git_username: str | None = Field(
+        None,
+        description=(
+            "Username for git hosts that require one. Only valid together "
+            "with 'git_url' (422 otherwise)."
+        ),
+    )
+    git_token: str | None = Field(
+        None,
+        description=(
+            "Personal access token for the git host; transient, never "
+            "stored, logged or returned. Only valid together with "
+            "'git_url' (422 otherwise). Must be resent on every update that "
+            "re-publishes from a private repository."
+        ),
+    )
+    title: str | None = Field(None, description="New title; leaves it unchanged when omitted.")
+    password: str | None = Field(
+        None, description="Set or replace the reader password."
+    )
+    clear_password: bool = Field(
+        False, description="When true, remove any existing reader password."
+    )
 
 
 def _content_fields(body: PublishBody | UpdateBody) -> list[str]:
@@ -301,6 +529,30 @@ def _content_fields(body: PublishBody | UpdateBody) -> list[str]:
         for name in ("html", "markdown", "git_url")
         if getattr(body, name) is not None
     ]
+
+
+def _check_git_credentials(body: PublishBody | UpdateBody) -> None:
+    """Reject clone credentials that were sent without a ``git_url``.
+
+    Silently ignoring them would leave the caller believing a token was used
+    when it was not, so this is a hard 422.
+    """
+    if body.git_url is not None:
+        return
+    stray = [
+        name
+        for name in ("git_username", "git_token")
+        if getattr(body, name) is not None
+    ]
+    if stray:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{' and '.join(repr(name) for name in stray)} "
+                f"{'is' if len(stray) == 1 else 'are'} only valid together with "
+                "'git_url'"
+            ),
+        )
 
 
 def _build(body: PublishBody | UpdateBody) -> tuple[BuiltArtifact, dict[str, Any]]:
@@ -335,8 +587,16 @@ def _build(body: PublishBody | UpdateBody) -> tuple[BuiltArtifact, dict[str, Any
             return built, {"markdown": body.markdown}
 
         built = builder.build_from_git(
-            str(body.git_url), body.git_ref, body.git_path, body.title, settings
+            str(body.git_url),
+            body.git_ref,
+            body.git_path,
+            body.title,
+            settings,
+            git_username=body.git_username,
+            git_token=body.git_token,
         )
+        # Deliberately only url/ref/path/commit: the clone credentials are
+        # transient and must not reach the stored envelope.
         source = {
             "git": {
                 "url": str(body.git_url),
@@ -393,19 +653,36 @@ def _artifact_response(
 # --------------------------------------------------------------------------
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get(
+    "/",
+    response_class=HTMLResponse,
+    tags=["public"],
+    summary="Landing page",
+    description="Human-facing HTML documentation of the hub: what it is, how to authenticate, and copy-pasteable curl examples.",
+)
 def landing(request: Request) -> HTMLResponse:
     """Human-facing documentation page."""
     return HTMLResponse(landing_page(base_url(request)))
 
 
-@app.post("/", response_class=PlainTextResponse)
+@app.post(
+    "/",
+    response_class=PlainTextResponse,
+    tags=["service"],
+    summary="Platform startup probe",
+    description="Always returns 200 'OK'. Used by the Keboola Data App platform to check the process is up; not meant to be called by clients.",
+)
 def landing_probe() -> PlainTextResponse:
     """Platform startup check — the proxy POSTs to ``/`` to see if we are up."""
     return PlainTextResponse("OK")
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    tags=["service"],
+    summary="Liveness and index statistics",
+    description="Reports process liveness plus whether the in-memory artifact index has finished hydrating from Storage, and how many artifacts it holds.",
+)
 def health(request: Request) -> dict:
     """Liveness plus index statistics."""
     return {
@@ -415,7 +692,12 @@ def health(request: Request) -> dict:
     }
 
 
-@app.get("/context")
+@app.get(
+    "/context",
+    tags=["service"],
+    summary="Machine-readable service manifest",
+    description="Full manifest for agents: endpoints, auth model, stack aliases, publish body schema, and configured limits. Intended to be fetched once before scripting against the API.",
+)
 def context(request: Request) -> dict:
     """Machine-readable manifest of the service, for agents."""
     base = base_url(request)
@@ -482,6 +764,18 @@ def context(request: Request) -> dict:
             },
             {
                 "method": "GET",
+                "path": "/docs",
+                "auth": "none",
+                "purpose": "interactive Swagger UI for this API",
+            },
+            {
+                "method": "GET",
+                "path": "/openapi.json",
+                "auth": "none",
+                "purpose": "machine-readable OpenAPI schema for this API",
+            },
+            {
+                "method": "GET",
                 "path": "/a/{id}",
                 "auth": "url capability; password form when protected",
                 "purpose": "rendered artifact page",
@@ -541,16 +835,29 @@ def context(request: Request) -> dict:
                 "string, rendered by the built-in template (GFM tables, task "
                 "lists, mermaid fences, syntax highlighting)"
             ),
-            "git_url": "string, public https git repository to clone",
+            "git_url": "string, https git repository to clone (public, or private with git_token)",
             "git_ref": "string, optional branch/tag/commit for git_url",
             "git_path": (
                 "string, optional entry file or directory inside the repository; "
                 "defaults to index.html, then README.md, then a single root *.html"
             ),
+            "git_token": (
+                "string, optional personal access token for the git host "
+                "(GitHub PAT, GitLab token, ...) used to clone a private "
+                "repository; transient — used only for the clone during this "
+                "request, never stored, logged or returned"
+            ),
+            "git_username": (
+                "string, optional username for git hosts that require one; "
+                "defaults to 'x-access-token', which works for GitHub PATs and "
+                "GitLab deploy tokens"
+            ),
             "title": "string, optional; derived from the content when omitted",
             "password": "string, optional reader password",
             "rules": [
                 "exactly one of html, markdown, git_url",
+                "git_token and git_username are only valid together with git_url "
+                "(422 otherwise)",
                 "PUT accepts the same fields, all optional, plus clear_password",
             ],
         },
@@ -569,11 +876,20 @@ def context(request: Request) -> dict:
             "An optional password adds a second layer; readers unlock in the "
             "browser (signed cookie scoped to the artifact path) or send the "
             "X-Artifact-Password header.",
+            "git_token follows the same rule as the Storage token: it is used "
+            "only for the clone inside the request and is never written to the "
+            "stored artifact, the logs, or any response.",
         ],
     }
 
 
-@app.get("/skill")
+@app.get(
+    "/skill",
+    tags=["service"],
+    summary="Agent-facing SKILL.md",
+    description="Serves skills/artifact-publisher/SKILL.md verbatim, teaching an AI agent how to authenticate and publish artifacts unassisted.",
+    responses={404: {"description": "SKILL.md is not readable on this deployment."}},
+)
 def skill() -> Response:
     """Serve the agent-facing SKILL.md."""
     try:
@@ -586,7 +902,16 @@ def skill() -> Response:
     return Response(content=text, media_type="text/markdown; charset=utf-8")
 
 
-@app.get("/a/{artifact_id}")
+@app.get(
+    "/a/{artifact_id}",
+    tags=["public"],
+    summary="Rendered artifact page",
+    description="Serves the artifact's built HTML as-is. When the artifact is password-protected and the caller has not unlocked it, returns the HTML unlock form instead.",
+    responses={
+        401: {"description": "Password-protected artifact; the unlock form is returned."},
+        404: {"description": "No artifact exists with this id."},
+    },
+)
 def read_artifact(artifact_id: str, request: Request) -> Response:
     """Serve the rendered artifact, or the unlock form when protected."""
     envelope = _load(request, artifact_id)
@@ -597,7 +922,17 @@ def read_artifact(artifact_id: str, request: Request) -> Response:
     return HTMLResponse(envelope.html)
 
 
-@app.post("/a/{artifact_id}/unlock")
+@app.post(
+    "/a/{artifact_id}/unlock",
+    tags=["public"],
+    summary="Unlock a password-protected artifact",
+    description="Target of the HTML unlock form. On a correct password, redirects to the artifact page and sets a signed, path-scoped cookie so future browser visits do not need the password again.",
+    responses={
+        303: {"description": "Correct password; redirects to the artifact page with an unlock cookie set."},
+        401: {"description": "Wrong password; the unlock form is returned with an error message."},
+        404: {"description": "No artifact exists with this id."},
+    },
+)
 def unlock_artifact(
     artifact_id: str, request: Request, password: str = Form("")
 ) -> Response:
@@ -622,7 +957,16 @@ def unlock_artifact(
     return response
 
 
-@app.get("/a/{artifact_id}/raw")
+@app.get(
+    "/a/{artifact_id}/raw",
+    tags=["public"],
+    summary="Raw artifact HTML",
+    description="The exact built HTML, with no unlock-form fallback — meant for machine consumption. When protected, send the password via the X-Artifact-Password header.",
+    responses={
+        401: {"description": "Password required or wrong (see X-Artifact-Password header)."},
+        404: {"description": "No artifact exists with this id."},
+    },
+)
 def read_raw(artifact_id: str, request: Request) -> Response:
     """The artifact HTML itself, for machines."""
     envelope = _load(request, artifact_id)
@@ -633,7 +977,16 @@ def read_raw(artifact_id: str, request: Request) -> Response:
     return HTMLResponse(envelope.html)
 
 
-@app.get("/a/{artifact_id}/source")
+@app.get(
+    "/a/{artifact_id}/source",
+    tags=["public"],
+    summary="Original submitted source",
+    description="Returns the original Markdown for markdown-sourced artifacts, or the original HTML for html/git-html artifacts. Markdown rendered from a git repository has no retained source and returns 404 with a pointer back to the repository.",
+    responses={
+        401: {"description": "Password required or wrong (see X-Artifact-Password header)."},
+        404: {"description": "No artifact with this id, or its source was not retained (git-sourced Markdown)."},
+    },
+)
 def read_source(artifact_id: str, request: Request) -> Response:
     """The original source: markdown for markdown artifacts, HTML otherwise."""
     envelope = _load(request, artifact_id)
@@ -663,7 +1016,13 @@ def read_source(artifact_id: str, request: Request) -> Response:
     )
 
 
-@app.get("/a/{artifact_id}/meta")
+@app.get(
+    "/a/{artifact_id}/meta",
+    tags=["public"],
+    summary="Public artifact metadata",
+    description="JSON metadata (title, timestamps, version, protection flag, size) with no owner details. Available even when the artifact is password-protected.",
+    responses={404: {"description": "No artifact exists with this id."}},
+)
 def read_meta(artifact_id: str, request: Request) -> Response:
     """Public metadata; available even when the artifact is password-protected."""
     envelope = _load(request, artifact_id)
@@ -682,7 +1041,21 @@ def read_meta(artifact_id: str, request: Request) -> Response:
 # --------------------------------------------------------------------------
 
 
-@app.post("/api/artifacts", status_code=201)
+@app.post(
+    "/api/artifacts",
+    status_code=201,
+    tags=["artifacts"],
+    summary="Publish a new artifact",
+    description="Publish HTML, Markdown, or a git repository as a new artifact. Exactly one of 'html', 'markdown', 'git_url' must be provided. Requires a Storage token (X-StorageApi-Token) and stack (X-Storage-Stack); the token establishes the owning project and is used once to store a canonical copy there.",
+    responses={
+        201: {"description": "Artifact published; returns its id and URLs."},
+        400: {"description": "Unknown or disallowed X-Storage-Stack value."},
+        401: {"description": "Storage token missing or rejected by the stack."},
+        413: {"description": "Built HTML exceeds the configured size limit."},
+        422: {"description": "Invalid body: not exactly one content field, git credentials without git_url, or a build failure (bad repo, no entry file, markdown render error)."},
+        502: {"description": "The caller's Keboola stack could not be reached to verify the token, or the canonical upload failed."},
+    },
+)
 def publish_artifact(
     body: PublishBody,
     request: Request,
@@ -692,6 +1065,7 @@ def publish_artifact(
     owner, token = auth
     ensure_hydrated(request.app)
 
+    _check_git_credentials(body)
     present = _content_fields(body)
     if len(present) != 1:
         raise HTTPException(
@@ -739,7 +1113,22 @@ def publish_artifact(
     return _artifact_response(request, envelope, 201)
 
 
-@app.put("/api/artifacts/{artifact_id}")
+@app.put(
+    "/api/artifacts/{artifact_id}",
+    tags=["artifacts"],
+    summary="Update an artifact",
+    description="Update the content and/or password of an artifact owned by the caller's project. All fields are optional; at most one content field ('html', 'markdown', 'git_url') may be given. Requires a Storage token from the owning project.",
+    responses={
+        200: {"description": "Artifact updated; returns its current state."},
+        400: {"description": "Unknown or disallowed X-Storage-Stack value."},
+        401: {"description": "Storage token missing or rejected by the stack."},
+        403: {"description": "Token is valid but not from the project that owns this artifact."},
+        404: {"description": "No artifact exists with this id."},
+        413: {"description": "Built HTML exceeds the configured size limit."},
+        422: {"description": "Invalid body: more than one content field, git credentials without git_url, or a build failure."},
+        502: {"description": "The caller's Keboola stack could not be reached to verify the token, or the canonical upload failed."},
+    },
+)
 def update_artifact(
     artifact_id: str,
     body: UpdateBody,
@@ -758,6 +1147,7 @@ def update_artifact(
             status_code=403, detail="this artifact belongs to another project"
         )
 
+    _check_git_credentials(body)
     present = _content_fields(body)
     if len(present) > 1:
         raise HTTPException(
@@ -801,7 +1191,17 @@ def update_artifact(
     return _artifact_response(request, envelope, 200)
 
 
-@app.get("/api/artifacts")
+@app.get(
+    "/api/artifacts",
+    tags=["artifacts"],
+    summary="List the caller's artifacts",
+    description="Lists artifacts published by the caller's own project (identified by the Storage token's owning project), with their URLs merged in.",
+    responses={
+        400: {"description": "Unknown or disallowed X-Storage-Stack value."},
+        401: {"description": "Storage token missing or rejected by the stack."},
+        502: {"description": "The caller's Keboola stack could not be reached to verify the token."},
+    },
+)
 def list_artifacts(
     request: Request, auth: tuple[Owner, str] = Depends(require_owner)
 ) -> dict:
@@ -818,7 +1218,19 @@ def list_artifacts(
     }
 
 
-@app.delete("/api/artifacts/{artifact_id}")
+@app.delete(
+    "/api/artifacts/{artifact_id}",
+    tags=["artifacts"],
+    summary="Delete an artifact's serving copy",
+    description="Deletes the serving copy in the hub's project. The canonical copy in the author's own project is left untouched. Requires a Storage token from the owning project.",
+    responses={
+        400: {"description": "Unknown or disallowed X-Storage-Stack value."},
+        401: {"description": "Storage token missing or rejected by the stack."},
+        403: {"description": "Token is valid but not from the project that owns this artifact."},
+        404: {"description": "No artifact exists with this id."},
+        502: {"description": "The caller's Keboola stack could not be reached to verify the token."},
+    },
+)
 def delete_artifact(
     artifact_id: str,
     request: Request,

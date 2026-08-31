@@ -33,6 +33,7 @@ from fastapi.testclient import TestClient
 
 import src.main as main
 from src.auth import STACK_ALIASES, AuthError, Owner
+from src.builder import BuiltArtifact
 from src.kbc import InMemoryFilesBackend
 from src.store import ArtifactStore
 
@@ -172,7 +173,7 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
     resp = api.client.get("/context")
     assert resp.status_code == 200
     body = resp.json()
-    assert len(body["endpoints"]) == 14
+    assert len(body["endpoints"]) == 16
     assert body["auth"]["stack_aliases"] == dict(STACK_ALIASES)
     paths = {(e["method"], e["path"]) for e in body["endpoints"]}
     expected = {
@@ -181,6 +182,8 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("GET", "/health"),
         ("GET", "/context"),
         ("GET", "/skill"),
+        ("GET", "/docs"),
+        ("GET", "/openapi.json"),
         ("GET", "/a/{id}"),
         ("POST", "/a/{id}/unlock"),
         ("GET", "/a/{id}/raw"),
@@ -199,6 +202,40 @@ def test_skill_returns_markdown(api: Api) -> None:
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/markdown")
     assert resp.text.strip() != ""
+
+
+# --------------------------------------------------------------------------
+# Interactive API docs
+# --------------------------------------------------------------------------
+
+
+def test_docs_serves_swagger_ui(api: Api) -> None:
+    resp = api.client.get("/docs")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "swagger" in resp.text.lower()
+
+
+def test_openapi_json_has_expected_paths_and_security_schemes(api: Api) -> None:
+    resp = api.client.get("/openapi.json")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/json")
+    schema = resp.json()
+
+    assert "openapi" in schema
+    assert "/api/artifacts" in schema["paths"]
+    assert "/a/{artifact_id}" in schema["paths"]
+
+    security_schemes = schema["components"]["securitySchemes"]
+    scheme_headers = {s["name"] for s in security_schemes.values()}
+    assert "X-StorageApi-Token" in scheme_headers
+    assert "X-Storage-Stack" in scheme_headers
+
+
+def test_openapi_json_never_leaks_the_hub_storage_token(api: Api) -> None:
+    resp = api.client.get("/openapi.json")
+    assert resp.status_code == 200
+    assert api.settings.hub_storage_token not in resp.text
 
 
 # --------------------------------------------------------------------------
@@ -344,6 +381,144 @@ def test_publish_bad_stack_header_is_400(api: Api) -> None:
         headers={"X-StorageApi-Token": "good-token", "X-Kbc-Stack": "not-a-stack"},
     )
     assert resp.status_code == 400
+
+
+# --------------------------------------------------------------------------
+# Private-repository publishing (transient git credentials)
+# --------------------------------------------------------------------------
+
+#: Token used by the private-repo tests; distinctive so a substring search for
+#: it across a whole serialized response/envelope is meaningful.
+GIT_TOKEN = "ghp_TestOnlyPrivateRepoToken0001"
+
+
+def test_publish_git_token_without_git_url_is_422(api: Api) -> None:
+    resp = api.client.post(
+        "/api/artifacts", json={"git_token": GIT_TOKEN}, headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "git_url" in detail and "git_token" in detail
+
+
+def test_publish_git_username_with_markdown_is_422(api: Api) -> None:
+    resp = api.client.post(
+        "/api/artifacts",
+        json={"markdown": "# Hi", "git_username": "someone"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert "git_url" in resp.json()["detail"]
+
+
+def test_put_git_token_without_git_url_is_422(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Original")
+    resp = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"markdown": "# Updated", "git_token": GIT_TOKEN},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert "git_url" in resp.json()["detail"]
+
+
+def _stub_build_from_git(monkeypatch) -> dict[str, Any]:
+    """Replace the git builder with a capture stub; returns the captured kwargs.
+
+    A real clone is not available in tests, so the seam under test is the
+    hand-off from the API layer into the builder: the token must arrive there,
+    and must appear nowhere else afterwards.
+    """
+    captured: dict[str, Any] = {}
+
+    def fake_build_from_git(
+        git_url, ref, path, title, settings, *, git_username=None, git_token=None
+    ):
+        captured.update(
+            git_url=git_url,
+            ref=ref,
+            path=path,
+            title=title,
+            git_username=git_username,
+            git_token=git_token,
+        )
+        return BuiltArtifact(
+            html="<html><body><h1>From a private repo</h1></body></html>",
+            title="From a private repo",
+            source_type="git-html",
+            git_commit="0123456789abcdef0123456789abcdef01234567",
+        )
+
+    monkeypatch.setattr(main.builder, "build_from_git", fake_build_from_git)
+    return captured
+
+
+def test_publish_private_git_passes_credentials_to_the_builder(
+    api: Api, monkeypatch
+) -> None:
+    captured = _stub_build_from_git(monkeypatch)
+    resp = api.client.post(
+        "/api/artifacts",
+        json={
+            "git_url": "https://github.com/org/private-repo",
+            "git_ref": "main",
+            "git_path": "docs/report.html",
+            "git_username": "deploy-user",
+            "git_token": GIT_TOKEN,
+        },
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    assert captured["git_token"] == GIT_TOKEN
+    assert captured["git_username"] == "deploy-user"
+    assert captured["git_url"] == "https://github.com/org/private-repo"
+    assert captured["ref"] == "main"
+    assert captured["path"] == "docs/report.html"
+
+
+def test_publish_private_git_never_stores_or_echoes_the_token(
+    api: Api, monkeypatch
+) -> None:
+    _stub_build_from_git(monkeypatch)
+    resp = api.client.post(
+        "/api/artifacts",
+        json={
+            "git_url": "https://github.com/org/private-repo",
+            "git_username": "deploy-user",
+            "git_token": GIT_TOKEN,
+        },
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    assert GIT_TOKEN not in resp.text
+
+    artifact_id = resp.json()["id"]
+    envelope = main.app.state.store.get(artifact_id)
+    assert envelope is not None
+
+    serialized = envelope.to_json().decode("utf-8")
+    assert GIT_TOKEN not in serialized
+    assert "deploy-user" not in serialized
+    assert "git_token" not in serialized
+    assert envelope.source["git"] == {
+        "url": "https://github.com/org/private-repo",
+        "ref": None,
+        "path": None,
+        "commit": "0123456789abcdef0123456789abcdef01234567",
+    }
+
+    # The same for every public read surface of the artifact.
+    for path in (
+        f"/a/{artifact_id}",
+        f"/a/{artifact_id}/raw",
+        f"/a/{artifact_id}/meta",
+    ):
+        read = api.client.get(path)
+        assert GIT_TOKEN not in read.text, path
+
+    # ...and for the canonical copy uploaded into the author's own project.
+    assert api.canonical_calls
+    assert GIT_TOKEN.encode() not in api.canonical_calls[-1]["content"]
 
 
 # --------------------------------------------------------------------------

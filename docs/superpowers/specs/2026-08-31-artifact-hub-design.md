@@ -100,6 +100,51 @@ Authenticated (`X-StorageApi-Token` + `X-Kbc-Stack`):
 - No rate limiting in v1 (platform proxy in front; revisit if abused).
 - Password protects reads only; publishing is always token-authenticated.
 
+## Community versioning (phase 2)
+
+User decisions: moderated-only in v1; version history public to capability-URL
+holders; diff = unified + side-by-side HTML (difflib, no new deps).
+
+Data model:
+- Versions are never deleted on update. Each version is its own Storage file
+  `artifact-{id}-v{n}.json`, tags `artifact-hub`, `artifact-id-{id}`,
+  `artifact-ver-{n}`. A version envelope carries content (html/source/title),
+  `version`, `author` (verified project identity), `status` ("live" |
+  "proposed"), optional `note`, `created_at`.
+- Artifact-level state lives in a small meta file `artifact-{id}-meta.json`
+  (tags `artifact-hub`, `artifact-id-{id}`, `artifact-meta`): owner, password
+  record, `accept_versions` (bool, default false = moderated opt-in),
+  `head_mode` ("latest" | "pinned"), `head_version`, timestamps. The head
+  pointer is what `/a/{id}` serves: latest live version, or a pinned one.
+- Legacy schema-1 envelopes are migrated lazily: treated as version 1 live;
+  the meta file is materialized on the next write.
+
+Rules:
+- Owner submissions are always accepted and go live. Non-owner submissions
+  require `accept_versions=true` (else 403) and always land as "proposed"
+  (moderated). Proposed content is readable only by the owner or its author
+  (token headers); everyone else sees it listed as metadata only.
+- Contributors authenticate exactly like publishers; every version records a
+  verified author. The contributor's canonical copy goes to the contributor's
+  own project.
+- Retention: `HUB_MAX_VERSIONS` (default 50) live versions per artifact;
+  oldest non-pinned, non-head versions are pruned. Per-contributor rate cap
+  `HUB_MAX_VERSIONS_PER_DAY` (default 20, in-memory counter).
+
+Endpoints (password gate applies to all reads):
+- `GET /a/{id}` — head version. `GET /a/{id}/v/{n}` — one version.
+- `GET /a/{id}/versions` — history (JSON; `?format=html` simple picker page).
+- `GET /a/{id}/diff/{a}..{b}` — side-by-side HTML; `?format=unified|json`
+  for machines. Diffs markdown source when both versions have it, else HTML.
+- `POST /api/artifacts/{id}/versions` — submit a version (+ `note`).
+- `POST /api/artifacts/{id}/versions/{n}/promote` — owner approves a proposal.
+- `DELETE /api/artifacts/{id}/versions/{n}` — owner removes any non-head
+  version; a contributor may withdraw their own proposal.
+- `PUT /api/artifacts/{id}/head` — `{"mode": "latest"}` or
+  `{"mode": "pinned", "version": n}` (owner only).
+- `PUT /api/artifacts/{id}` — existing update becomes "owner adds a live
+  version"; body additionally accepts `accept_versions`.
+
 ## Testing
 
 pytest + FastAPI TestClient. `InMemoryFilesBackend` for store tests; auth

@@ -15,12 +15,18 @@ from pathlib import Path
 
 import pytest
 
+import src.builder as builder_module
 from src.builder import (
     BuildError,
+    DEFAULT_GIT_USERNAME,
     DEFAULT_TITLE,
+    REDACTED,
+    _authed_clone_url,
     _default_entry,
     _inline_images,
+    _last_line,
     _resolve_entry,
+    _scrub,
     _validate_git_url,
     build_from_git,
     build_from_html,
@@ -186,6 +192,144 @@ class TestBuildFromGitRejectsNonHttps(object):
             build_from_git(
                 "git@github.com:owner/repo.git", None, None, None, settings
             )
+
+
+# --------------------------------------------------------------------------
+# Private-repository clone credentials
+# --------------------------------------------------------------------------
+
+
+class TestAuthedCloneUrl:
+    """URL construction for an authenticated clone.
+
+    This is the only place the git token is ever materialized, so its exact
+    shape (and its quoting) is worth pinning down.
+    """
+
+    def test_default_username_is_used_when_none_given(self):
+        assert (
+            _authed_clone_url("https://github.com/owner/repo.git", None, "ghp_abc")
+            == f"https://{DEFAULT_GIT_USERNAME}:ghp_abc@github.com/owner/repo.git"
+        )
+
+    def test_explicit_username_is_used(self):
+        assert (
+            _authed_clone_url("https://gitlab.com/g/p.git", "deploy-user", "s3cr3t")
+            == "https://deploy-user:s3cr3t@gitlab.com/g/p.git"
+        )
+
+    def test_special_characters_are_percent_encoded(self):
+        # A token containing '@', ':' and '/' must not be able to break out of
+        # the userinfo section and rewrite the host or the path.
+        url = _authed_clone_url(
+            "https://github.com/owner/repo.git", "user@example.com", "p@ss:w/rd +x"
+        )
+        assert url == (
+            "https://user%40example.com:p%40ss%3Aw%2Frd%20%2Bx"
+            "@github.com/owner/repo.git"
+        )
+
+    def test_host_and_port_are_preserved(self):
+        url = _authed_clone_url("https://git.example.com:8443/g/p.git", None, "tok")
+        assert url.endswith("@git.example.com:8443/g/p.git")
+
+    def test_existing_userinfo_is_replaced_not_appended(self):
+        url = _authed_clone_url("https://someone:old@github.com/o/r.git", None, "new")
+        assert url == f"https://{DEFAULT_GIT_USERNAME}:new@github.com/o/r.git"
+        assert "old" not in url
+
+    def test_no_credentials_leak_into_the_unauthenticated_url(self):
+        original = "https://github.com/owner/repo.git"
+        _authed_clone_url(original, None, "ghp_abc")
+        assert original == "https://github.com/owner/repo.git"
+
+
+class _FailedGit:
+    """Stand-in for a ``subprocess.CompletedProcess`` from a failed git call."""
+
+    returncode = 128
+    stdout = ""
+
+    def __init__(self, stderr: str) -> None:
+        self.stderr = stderr
+
+
+class TestScrubbing:
+    """Nothing derived from git output may carry the token back to the caller."""
+
+    def test_authed_clone_url_in_git_stderr_is_scrubbed(self):
+        token = "ghp_SuperSecretToken123"
+        authed = _authed_clone_url("https://github.com/o/private.git", None, token)
+        stderr = (
+            "Cloning into '/tmp/artifact-git-x/repo'...\n"
+            f"fatal: unable to access '{authed}/': "
+            "The requested URL returned error: 403\n"
+        )
+        # Exactly how _clone builds the user-facing detail of a BuildError.
+        reason = _last_line(stderr, token)
+        message = str(BuildError(f"Could not clone the repository. git said: {reason}"))
+
+        assert token not in message
+        assert DEFAULT_GIT_USERNAME not in message
+        assert "github.com" in message  # the useful part survives
+
+    def test_token_with_special_chars_is_scrubbed_in_encoded_form(self):
+        token = "p@ss/w:rd"
+        authed = _authed_clone_url("https://github.com/o/p.git", None, token)
+        assert _scrub(f"fatal: could not read from {authed}", token) == (
+            "fatal: could not read from https://github.com/o/p.git"
+        )
+
+    def test_bare_token_without_url_is_still_redacted(self):
+        token = "glpat-Abc123"
+        scrubbed = _scrub(f"remote: token {token} is expired", token)
+        assert token not in scrubbed
+        assert REDACTED in scrubbed
+
+    def test_scrub_without_secret_still_strips_userinfo(self):
+        assert _scrub("https://user:pw@example.com/r.git") == (
+            "https://example.com/r.git"
+        )
+
+    def test_private_repo_error_points_at_git_token(self, monkeypatch, tmp_path):
+        """An unauthenticated clone of a private repo must suggest git_token."""
+        monkeypatch.setattr(
+            builder_module,
+            "_run_git",
+            lambda args, timeout_s: _FailedGit(
+                "fatal: could not read Username for 'https://github.com': "
+                "terminal prompts disabled\n"
+            ),
+        )
+        with pytest.raises(BuildError) as exc:
+            builder_module._clone(
+                "https://github.com/o/private.git", None, tmp_path / "repo", 5
+            )
+        assert "git_token" in str(exc.value)
+
+    def test_failed_authed_clone_error_carries_no_token(self, monkeypatch, tmp_path):
+        """The end-to-end path: a rejected authenticated clone leaks nothing."""
+        token = "ghp_LeakMeIfYouCan"
+        authed = _authed_clone_url("https://github.com/o/private.git", None, token)
+        monkeypatch.setattr(
+            builder_module,
+            "_run_git",
+            lambda args, timeout_s: _FailedGit(
+                f"fatal: unable to access '{authed}/': "
+                "The requested URL returned error: 403\n"
+            ),
+        )
+        with pytest.raises(BuildError) as exc:
+            builder_module._clone(
+                "https://github.com/o/private.git",
+                "main",
+                tmp_path / "repo",
+                5,
+                token=token,
+            )
+        message = str(exc.value)
+        assert token not in message
+        assert DEFAULT_GIT_USERNAME not in message
 
 
 # --------------------------------------------------------------------------
