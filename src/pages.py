@@ -505,6 +505,15 @@ def landing_page(base_url: str, service_version: str, github_url: str) -> str:
         '-H <span class="s">"X-Storage-Stack: eu"</span>',
     )
 
+    # Hoisted out of the f-string below: Python 3.11 (the app runtime) does
+    # not allow backslashes inside f-string expressions (PEP 701 is 3.12+).
+    headers_term = _term(
+        "HEADERS",
+        '<span class="k">X-StorageApi-Token</span>: &lt;your Keboola Storage API token&gt;\n'
+        '<span class="k">X-Storage-Stack</span>: us | gcp-us | eu | azure-eu | gcp-eu\n'
+        "                 | https://*.keboola.com",
+    )
+
     return _page(
         "KBC Artifact Hub",
         "",
@@ -534,12 +543,7 @@ Keboola Storage API token, on any stack, is the only credential you need.</p>
 <p>Everything under <code>/api/artifacts</code> is authenticated with two
 headers. The hub verifies the token against your own stack's
 <code>/v2/storage/tokens/verify</code> endpoint and never stores it.</p>
-{_term(
-    "HEADERS",
-    '<span class="k">X-StorageApi-Token</span>: &lt;your Keboola Storage API token&gt;\n'
-    '<span class="k">X-Storage-Stack</span>: us | gcp-us | eu | azure-eu | gcp-eu\n'
-    '                 | https://*.keboola.com',
-)}
+{headers_term}
 <p>Ownership is the pair (stack, project id). Updating, deleting, promoting and
 pinning all require a token from the project that published the artifact.</p>
 
