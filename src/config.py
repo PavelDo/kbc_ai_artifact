@@ -44,6 +44,9 @@ class Settings:
     max_versions_per_day: int = 20
     # Largest per-side payload the diff renderer will process.
     diff_max_bytes: int = 2 * 1024 * 1024
+    # Project brain (phase 3)
+    # Per-contributor cap on inline comments (threads + replies) per rolling day.
+    max_comments_per_day: int = 100
     # Extra stack URLs (comma-separated) beyond the *.keboola.com rule
     extra_stacks: tuple[str, ...] = ()
 
@@ -76,5 +79,6 @@ def load_settings() -> Settings:
         max_versions=_int_env("HUB_MAX_VERSIONS", 50),
         max_versions_per_day=_int_env("HUB_MAX_VERSIONS_PER_DAY", 20),
         diff_max_bytes=_int_env("HUB_DIFF_MAX_BYTES", 2 * 1024 * 1024),
+        max_comments_per_day=_int_env("HUB_MAX_COMMENTS_PER_DAY", 100),
         extra_stacks=extra,
     )

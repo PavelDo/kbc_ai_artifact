@@ -145,6 +145,62 @@ Endpoints (password gate applies to all reads):
 - `PUT /api/artifacts/{id}` — existing update becomes "owner adds a live
   version"; body additionally accepts `accept_versions`.
 
+## Project brain (phase 3)
+
+User decisions (2026-09-01): inline comments writable by anyone with the link
+plus any valid Storage token (owner may restrict via allowlist), publicly
+readable to capability-URL holders; scope = inline comments + review web UI,
+Obsidian vault export, contributor allowlist + final status.
+
+### Inline comments
+
+- Anchoring: W3C-style TextQuoteSelector — `exact` + `prefix` + `suffix`
+  (~32 chars each) captured from the RENDERED text of one specific version.
+  Comments stay bound to the version they were made on (no cross-version
+  re-anchoring in v1).
+- Thread = one Storage file `comment-{artifact_id}-{thread_id}.json`, tags
+  `artifact-hub-cmt`, `artifact-cmt-{artifact_id}`, `cmt-id-{thread_id}`.
+  Payload: id, artifact_id, version, selector, body (plain text, capped),
+  author (verified project identity), created_at, resolved, replies[]
+  (author, body, created_at). Rewritten on reply/resolve (same pattern as
+  version status changes). Separate CommentStore with its own tag-driven
+  hydration; the artifact index never confuses comment files (distinct tags).
+- API: `GET /a/{id}/comments` (public, password-gated);
+  `POST /api/artifacts/{id}/comments` (create thread),
+  `POST .../comments/{tid}/replies`, `POST .../comments/{tid}/resolve`
+  (owner or thread author), `DELETE .../comments/{tid}` (owner or author).
+  Per-contributor daily cap `HUB_MAX_COMMENTS_PER_DAY` (default 100).
+- Review UI `GET /a/{id}/review`: two-pane page in the shell design system.
+  The artifact renders in a SANDBOXED srcdoc iframe (allow-scripts, no
+  allow-same-origin); the review shell injects a small annotation script
+  into the srcdoc which captures selections and does text-quote highlight
+  wrapping, talking to the shell strictly via postMessage. The Storage token
+  lives only in the shell (sessionStorage, /admin pattern) — the artifact's
+  own scripts run cross-origin and can never reach it. Sidebar lists
+  threads; select text → compose; click highlight → scroll thread.
+
+### Contributor allowlist and final status
+
+- `ArtifactMeta.accept_versions` becomes `"off" | "anyone" | "allowlist"`
+  (legacy bools parse: false→off, true→anyone). New `contributors:
+  list[str]` of owner keys (`project@stackhost`) used when mode is
+  allowlist. New `comments_mode: "anyone" | "allowlist" | "off"` (default
+  anyone). New `status: "draft" | "final"` — final freezes new versions and
+  comments (409) and shows a banner; the owner may reopen.
+
+### Export
+
+- `GET /a/{id}/export/markdown` — head version's markdown source (or the
+  HTML document when no markdown exists).
+- `GET /a/{id}/export/vault` — in-memory ZIP, a ready-to-open Obsidian
+  vault: `INDEX.md` (wikilinks hub), `document.md` (final/head content),
+  `versions/v{n}.md` (frontmatter: author, date, status, note),
+  `comments/{tid}.md` (quote, thread, resolution), `reasoning.md`
+  (deterministic chronological timeline of versions and comments — the
+  "why it ended up this way" trail). Wikilinks make Obsidian's graph view
+  the knowledge graph; no separate graph engine in v1.
+- Password gate applies to both export endpoints.
+
 ## Testing
 
 pytest + FastAPI TestClient. `InMemoryFilesBackend` for store tests; auth

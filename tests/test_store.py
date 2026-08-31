@@ -5,6 +5,14 @@ import json
 import pytest
 
 from src.store import (
+    ACCEPT_ALLOWLIST,
+    ACCEPT_ANYONE,
+    ACCEPT_OFF,
+    ARTIFACT_DRAFT,
+    ARTIFACT_FINAL,
+    COMMENTS_ALLOWLIST,
+    COMMENTS_ANYONE,
+    COMMENTS_OFF,
     HEAD_LATEST,
     HEAD_PINNED,
     STATUS_LIVE,
@@ -40,7 +48,9 @@ def _make_meta(
         id=artifact_id,
         owner=_identity(key=owner_key),
         password=None,
-        accept_versions=False,
+        # accept_versions is deliberately not defaulted here: passing it
+        # explicitly wins over accept_versions_mode (see ArtifactMeta), so a
+        # default would stop tests from setting a mode.
         head_mode=HEAD_LATEST,
         head_version=None,
         created_at="2026-01-01T00:00:00+00:00",
@@ -186,6 +196,195 @@ class TestMetaSerialization:
     def test_missing_id_raises_value_error(self):
         with pytest.raises(ValueError):
             ArtifactMeta.from_json(json.dumps({"owner": {}}).encode("utf-8"))
+
+    def test_phase3_defaults(self):
+        meta = _make_meta()
+        assert meta.accept_versions_mode == ACCEPT_OFF
+        assert meta.accept_versions is False
+        assert meta.contributors == []
+        assert meta.comments_mode == COMMENTS_ANYONE
+        assert meta.status == ARTIFACT_DRAFT
+
+    def test_phase3_fields_round_trip(self):
+        meta = _make_meta(
+            accept_versions_mode=ACCEPT_ALLOWLIST,
+            contributors=[OWNER_B],
+            comments_mode=COMMENTS_OFF,
+            status=ARTIFACT_FINAL,
+        )
+        restored = ArtifactMeta.from_json(meta.to_json())
+        assert restored == meta
+        assert restored.accept_versions_mode == ACCEPT_ALLOWLIST
+        assert restored.contributors == [OWNER_B]
+        assert restored.comments_mode == COMMENTS_OFF
+        assert restored.status == ARTIFACT_FINAL
+
+    def test_unknown_enum_values_fall_back(self):
+        raw = json.dumps(
+            {
+                "id": "x",
+                "accept_versions_mode": "sideways",
+                "comments_mode": "sideways",
+                "status": "sideways",
+                "contributors": "not a list",
+            }
+        ).encode("utf-8")
+        meta = ArtifactMeta.from_json(raw)
+        assert meta.accept_versions_mode == ACCEPT_OFF
+        assert meta.comments_mode == COMMENTS_ANYONE
+        assert meta.status == ARTIFACT_DRAFT
+        assert meta.contributors == []
+
+    def test_constructor_normalizes_unknown_enum_values(self):
+        meta = _make_meta(
+            accept_versions_mode="sideways",
+            comments_mode="sideways",
+            status="sideways",
+            contributors=None,
+        )
+        assert meta.accept_versions_mode == ACCEPT_OFF
+        assert meta.comments_mode == COMMENTS_ANYONE
+        assert meta.status == ARTIFACT_DRAFT
+        assert meta.contributors == []
+
+
+class TestAcceptVersionsBackCompat:
+    """``accept_versions`` (bool) stays a working view of ``accept_versions_mode``."""
+
+    def test_legacy_true_reads_as_anyone(self):
+        raw = json.dumps({"id": "x", "accept_versions": True}).encode("utf-8")
+        meta = ArtifactMeta.from_json(raw)
+        assert meta.accept_versions_mode == ACCEPT_ANYONE
+        assert meta.accept_versions is True
+
+    def test_legacy_false_reads_as_off(self):
+        raw = json.dumps({"id": "x", "accept_versions": False}).encode("utf-8")
+        meta = ArtifactMeta.from_json(raw)
+        assert meta.accept_versions_mode == ACCEPT_OFF
+        assert meta.accept_versions is False
+
+    def test_mode_wins_over_a_disagreeing_legacy_bool(self):
+        raw = json.dumps(
+            {"id": "x", "accept_versions": False, "accept_versions_mode": "allowlist"}
+        ).encode("utf-8")
+        meta = ArtifactMeta.from_json(raw)
+        assert meta.accept_versions_mode == ACCEPT_ALLOWLIST
+        assert meta.accept_versions is True
+
+    def test_to_json_writes_both_representations(self):
+        payload = json.loads(_make_meta(accept_versions_mode=ACCEPT_ALLOWLIST).to_json())
+        assert payload["accept_versions"] is True
+        assert payload["accept_versions_mode"] == ACCEPT_ALLOWLIST
+
+        payload = json.loads(_make_meta().to_json())
+        assert payload["accept_versions"] is False
+        assert payload["accept_versions_mode"] == ACCEPT_OFF
+
+    def test_constructing_with_the_bool_sets_the_mode(self):
+        assert _make_meta(accept_versions=True).accept_versions_mode == ACCEPT_ANYONE
+        assert _make_meta(accept_versions=False).accept_versions_mode == ACCEPT_OFF
+
+    def test_assigning_the_bool_flips_the_mode(self):
+        meta = _make_meta()
+        meta.accept_versions = True
+        assert meta.accept_versions_mode == ACCEPT_ANYONE
+        meta.accept_versions = False
+        assert meta.accept_versions_mode == ACCEPT_OFF
+
+    def test_assigning_true_does_not_widen_an_allowlist(self):
+        meta = _make_meta(accept_versions_mode=ACCEPT_ALLOWLIST)
+        meta.accept_versions = True
+        assert meta.accept_versions_mode == ACCEPT_ALLOWLIST
+
+    def test_assigning_false_closes_an_allowlist(self):
+        meta = _make_meta(accept_versions_mode=ACCEPT_ALLOWLIST)
+        meta.accept_versions = False
+        assert meta.accept_versions_mode == ACCEPT_OFF
+
+    def test_bool_and_mode_together_keep_the_mode(self):
+        meta = _make_meta(accept_versions_mode=ACCEPT_ALLOWLIST, accept_versions=True)
+        assert meta.accept_versions_mode == ACCEPT_ALLOWLIST
+
+    def test_mode_only_construction_is_not_reset_by_the_bool_default(self):
+        meta = ArtifactMeta(id="x", accept_versions_mode=ACCEPT_ALLOWLIST)
+        assert meta.accept_versions_mode == ACCEPT_ALLOWLIST
+        assert meta.accept_versions is True
+
+    def test_the_flipped_bool_survives_a_storage_round_trip(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope())
+        meta = tmp_store.get_meta("abc123")
+        assert meta is not None
+        meta.accept_versions = True  # what the phase-2 API layer does
+        tmp_store.save_meta(meta)
+
+        reloaded = tmp_store.get_meta("abc123")
+        assert reloaded is not None
+        assert reloaded.accept_versions is True
+        assert reloaded.accept_versions_mode == ACCEPT_ANYONE
+
+
+class TestPermissionHelpers:
+    def test_owner_may_always_contribute_while_drafting(self):
+        for mode in (ACCEPT_OFF, ACCEPT_ANYONE, ACCEPT_ALLOWLIST):
+            meta = _make_meta(accept_versions_mode=mode)
+            assert meta.allows_versions_from(OWNER_A) is True
+        for mode in (COMMENTS_OFF, COMMENTS_ANYONE, COMMENTS_ALLOWLIST):
+            meta = _make_meta(comments_mode=mode)
+            assert meta.allows_comments_from(OWNER_A) is True
+
+    def test_versions_truth_table(self):
+        cases = {
+            ACCEPT_OFF: False,
+            ACCEPT_ANYONE: True,
+            ACCEPT_ALLOWLIST: False,
+        }
+        for mode, expected in cases.items():
+            meta = _make_meta(accept_versions_mode=mode)
+            assert meta.allows_versions_from(OWNER_B) is expected
+
+    def test_versions_allowlist_admits_listed_contributors(self):
+        meta = _make_meta(
+            accept_versions_mode=ACCEPT_ALLOWLIST, contributors=[OWNER_B]
+        )
+        assert meta.allows_versions_from(OWNER_B) is True
+        assert meta.allows_versions_from("9@connection.keboola.com") is False
+
+    def test_comments_truth_table(self):
+        cases = {
+            COMMENTS_OFF: False,
+            COMMENTS_ANYONE: True,
+            COMMENTS_ALLOWLIST: False,
+        }
+        for mode, expected in cases.items():
+            meta = _make_meta(comments_mode=mode)
+            assert meta.allows_comments_from(OWNER_B) is expected
+
+    def test_comments_allowlist_admits_listed_contributors(self):
+        meta = _make_meta(comments_mode=COMMENTS_ALLOWLIST, contributors=[OWNER_B])
+        assert meta.allows_comments_from(OWNER_B) is True
+        assert meta.allows_comments_from("9@connection.keboola.com") is False
+
+    def test_final_freezes_everyone_including_the_owner(self):
+        meta = _make_meta(
+            status=ARTIFACT_FINAL,
+            accept_versions_mode=ACCEPT_ANYONE,
+            comments_mode=COMMENTS_ANYONE,
+            contributors=[OWNER_B],
+        )
+        assert meta.is_final() is True
+        for key in (OWNER_A, OWNER_B, "", "9@connection.keboola.com"):
+            assert meta.allows_versions_from(key) is False
+            assert meta.allows_comments_from(key) is False
+
+    def test_an_empty_key_is_never_the_owner(self):
+        meta = _make_meta(
+            accept_versions_mode=ACCEPT_ALLOWLIST,
+            comments_mode=COMMENTS_ALLOWLIST,
+            contributors=[""],
+            owner_key="",
+        )
+        assert meta.allows_versions_from("") is False
+        assert meta.allows_comments_from("") is False
 
 
 # --------------------------------------------------------------------------
@@ -536,11 +735,30 @@ class TestListOwner:
             "created_at": "2026-01-01T00:00:00+00:00",
             "updated_at": "2026-01-03T00:00:00+00:00",
             "accept_versions": True,
+            "accept_versions_mode": ACCEPT_ANYONE,
+            "comments_mode": COMMENTS_ANYONE,
+            "status": ARTIFACT_DRAFT,
             "protected": True,
             "head_version": 1,
             "versions_count": 2,
             "proposed_count": 1,
         }
+
+    def test_rows_report_the_phase3_policy(self, tmp_store):
+        tmp_store.create(
+            _make_meta(
+                accept_versions_mode=ACCEPT_ALLOWLIST,
+                contributors=[OWNER_B],
+                comments_mode=COMMENTS_OFF,
+                status=ARTIFACT_FINAL,
+            ),
+            _make_envelope(),
+        )
+        row = tmp_store.list_owner(OWNER_A)[0]
+        assert row["accept_versions"] is True
+        assert row["accept_versions_mode"] == ACCEPT_ALLOWLIST
+        assert row["comments_mode"] == COMMENTS_OFF
+        assert row["status"] == ARTIFACT_FINAL
 
     def test_owner_key_of(self, tmp_store):
         tmp_store.create(

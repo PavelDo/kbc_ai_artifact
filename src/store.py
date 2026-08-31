@@ -10,9 +10,13 @@ several files:
   "proposed") and an optional ``note``.
 - one **meta** file ``artifact-{id}-meta.json``, tagged ``artifact-hub``,
   ``artifact-id-{id}``, ``artifact-meta`` and ``artifact-owner-{key}``. It holds
-  artifact-level state: owner, password record, ``accept_versions`` and the head
-  pointer. The owner tag lives on the meta file so listing an owner's artifacts
-  stays a single tag search.
+  artifact-level state: owner, password record, contribution and comment
+  policy (``accept_versions_mode``, ``contributors``, ``comments_mode``), the
+  draft/final ``status`` and the head pointer. The owner tag lives on the meta
+  file so listing an owner's artifacts stays a single tag search.
+
+Inline comment threads live in their own files with their own tags and their
+own store — see :mod:`src.comments`. The artifact index never sees them.
 
 Schema-1 artifacts (one ``artifact-{id}.json`` envelope carrying owner and
 password inline, tagged with the owner tag and no version/meta tag) are still
@@ -73,6 +77,27 @@ HEAD_LATEST = "latest"
 HEAD_PINNED = "pinned"
 _HEAD_MODES = (HEAD_LATEST, HEAD_PINNED)
 
+#: Who may submit a version (:attr:`ArtifactMeta.accept_versions_mode`).
+ACCEPT_OFF = "off"
+ACCEPT_ANYONE = "anyone"
+ACCEPT_ALLOWLIST = "allowlist"
+ACCEPT_MODES = (ACCEPT_OFF, ACCEPT_ANYONE, ACCEPT_ALLOWLIST)
+#: Modes that mean "someone other than the owner may contribute".
+_ACCEPT_ON_MODES = (ACCEPT_ANYONE, ACCEPT_ALLOWLIST)
+
+#: Who may comment (:attr:`ArtifactMeta.comments_mode`).
+COMMENTS_ANYONE = "anyone"
+COMMENTS_ALLOWLIST = "allowlist"
+COMMENTS_OFF = "off"
+COMMENTS_MODES = (COMMENTS_ANYONE, COMMENTS_ALLOWLIST, COMMENTS_OFF)
+
+#: Artifact lifecycle status. "final" freezes new versions and new comments for
+#: *everyone*, the owner included; reopening is an owner action in the API layer
+#: (set the status back to "draft").
+ARTIFACT_DRAFT = "draft"
+ARTIFACT_FINAL = "final"
+ARTIFACT_STATUSES = (ARTIFACT_DRAFT, ARTIFACT_FINAL)
+
 #: Schema version written by this module.
 SCHEMA_VERSION = 2
 
@@ -120,15 +145,54 @@ def _stack_host(stack_url: str) -> str:
 
 @dataclass
 class ArtifactMeta:
-    """Artifact-level state: who owns it, how it is read, where the head points."""
+    """Artifact-level state: who owns it, who may contribute, where head points.
+
+    **``accept_versions`` vs ``accept_versions_mode``.** Phase 3 turned the
+    old boolean "anyone may submit a version" switch into a three-way mode
+    (``off`` / ``anyone`` / ``allowlist``). To keep every existing caller and
+    every meta file already in Storage working, the two live side by side:
+
+    * :attr:`accept_versions_mode` is the **source of truth** — one of
+      :data:`ACCEPT_MODES`, default :data:`ACCEPT_OFF`.
+    * ``accept_versions`` is a **derived compatibility field**: a ``bool``
+      property that reads ``True`` iff the mode is not ``off``. Assigning to it
+      (``meta.accept_versions = True``) flips the mode between ``off`` and
+      ``anyone``, and is a no-op when the mode already agrees — so turning an
+      allowlisted artifact "on" does not silently widen it to ``anyone``.
+
+    Both keys are written by :meth:`to_json`; :meth:`from_json` prefers
+    ``accept_versions_mode`` when it carries a known mode and otherwise maps the
+    legacy boolean (``false`` -> ``off``, ``true`` -> ``anyone``).
+
+    Precedence when a caller passes both: the explicit ``accept_versions``
+    boolean wins, because the generated ``__init__`` assigns the mode first and
+    the compatibility setter second. Pass one or the other, not two
+    contradictory values.
+
+    The property is attached right after the class body (see
+    ``_accept_versions_get``/``_accept_versions_set`` below) because a dataclass
+    field and a property cannot be declared under the same name. The field is
+    declared *after* ``accept_versions_mode`` so the generated ``__init__``
+    assigns the mode first and the setter then sees the real mode; its default
+    is ``None``, meaning "the caller said nothing, leave the mode alone".
+    """
 
     id: str
     # {"stack_url": str, "project_id": int, "project_name": str, "key": str}
     owner: dict = field(default_factory=dict)
     # security.hash_password() record, or None when the artifact is public.
     password: dict | None = None
-    # False (default) = moderated: only the owner may add versions.
-    accept_versions: bool = False
+    # Source of truth for version contributions; one of ACCEPT_MODES.
+    accept_versions_mode: str = ACCEPT_OFF
+    # Compatibility alias for accept_versions_mode; see the class docstring.
+    # Replaced by a property below — never read this annotation as storage.
+    accept_versions: bool | None = None
+    # Owner keys ("project@stackhost") allowed when a mode is "allowlist".
+    contributors: list[str] = field(default_factory=list)
+    # One of COMMENTS_MODES; comments are open by default.
+    comments_mode: str = COMMENTS_ANYONE
+    # ARTIFACT_DRAFT or ARTIFACT_FINAL; "final" freezes versions and comments.
+    status: str = ARTIFACT_DRAFT
     # HEAD_LATEST -> serve the newest live version; HEAD_PINNED -> head_version.
     head_mode: str = HEAD_LATEST
     head_version: int | None = None
@@ -137,18 +201,73 @@ class ArtifactMeta:
     updated_at: str = ""
     schema: int = SCHEMA_VERSION
 
+    def __post_init__(self) -> None:
+        """Normalize the enum-ish fields so an unknown value can never leak in."""
+        if self.accept_versions_mode not in ACCEPT_MODES:
+            self.accept_versions_mode = ACCEPT_OFF
+        if self.comments_mode not in COMMENTS_MODES:
+            self.comments_mode = COMMENTS_ANYONE
+        if self.status not in ARTIFACT_STATUSES:
+            self.status = ARTIFACT_DRAFT
+        if isinstance(self.contributors, list):
+            self.contributors = [str(key) for key in self.contributors if key]
+        else:
+            self.contributors = []
+
     @property
     def owner_key(self) -> str:
         """Owner key (stack + project), or "" when the record has no owner."""
         return str(self.owner.get("key") or "")
 
+    def is_final(self) -> bool:
+        """True when the artifact is frozen: no new versions, no new comments."""
+        return self.status == ARTIFACT_FINAL
+
+    def allows_versions_from(self, key: str) -> bool:
+        """May the project identified by ``key`` submit a version?
+
+        A "final" artifact is frozen for everyone, the owner included — the API
+        layer offers the owner a reopen path instead. Otherwise the owner may
+        always contribute, ``anyone`` opens it up to every verified project and
+        ``allowlist`` restricts it to :attr:`contributors`.
+        """
+        if self.is_final():
+            return False
+        if key and key == self.owner_key:
+            return True
+        if self.accept_versions_mode == ACCEPT_ANYONE:
+            return True
+        if self.accept_versions_mode == ACCEPT_ALLOWLIST:
+            return bool(key) and key in self.contributors
+        return False
+
+    def allows_comments_from(self, key: str) -> bool:
+        """May the project identified by ``key`` comment? Same shape as versions."""
+        if self.is_final():
+            return False
+        if key and key == self.owner_key:
+            return True
+        if self.comments_mode == COMMENTS_ANYONE:
+            return True
+        if self.comments_mode == COMMENTS_ALLOWLIST:
+            return bool(key) and key in self.contributors
+        return False
+
     def to_json(self) -> bytes:
-        """Serialize the meta record to UTF-8 JSON bytes."""
+        """Serialize the meta record to UTF-8 JSON bytes.
+
+        Both ``accept_versions`` (legacy boolean) and ``accept_versions_mode``
+        are written, so a rollback to a phase-2 build still reads the file.
+        """
         payload = {
             "id": self.id,
             "owner": self.owner,
             "password": self.password,
             "accept_versions": self.accept_versions,
+            "accept_versions_mode": self.accept_versions_mode,
+            "contributors": self.contributors,
+            "comments_mode": self.comments_mode,
+            "status": self.status,
             "head_mode": self.head_mode,
             "head_version": self.head_version,
             "created_at": self.created_at,
@@ -160,6 +279,10 @@ class ArtifactMeta:
     @classmethod
     def from_json(cls, raw: bytes) -> "ArtifactMeta":
         """Parse meta JSON tolerantly (unknown keys ignored, defaults applied).
+
+        ``accept_versions_mode`` wins when it names a known mode; a file written
+        before phase 3 has only the boolean ``accept_versions`` and maps to
+        ``anyone``/``off``.
 
         Raises ``ValueError`` when the payload is not a JSON object or carries
         no usable artifact ID — callers treat that as a corrupt record.
@@ -176,11 +299,30 @@ class ArtifactMeta:
         head_version = data.get("head_version")
         schema = data.get("schema")
 
+        raw_mode = data.get("accept_versions_mode")
+        if raw_mode in ACCEPT_MODES:
+            accept_mode = str(raw_mode)
+        else:
+            accept_mode = ACCEPT_ANYONE if data.get("accept_versions") else ACCEPT_OFF
+
+        contributors = data.get("contributors")
+        comments_mode = data.get("comments_mode")
+        status = data.get("status")
+
         return cls(
             id=artifact_id,
             owner=owner if isinstance(owner, dict) else {},
             password=password if isinstance(password, dict) else None,
-            accept_versions=bool(data.get("accept_versions")),
+            accept_versions_mode=accept_mode,
+            contributors=(
+                [str(key) for key in contributors if key]
+                if isinstance(contributors, list)
+                else []
+            ),
+            comments_mode=(
+                comments_mode if comments_mode in COMMENTS_MODES else COMMENTS_ANYONE
+            ),
+            status=status if status in ARTIFACT_STATUSES else ARTIFACT_DRAFT,
             head_mode=head_mode if head_mode in _HEAD_MODES else HEAD_LATEST,
             head_version=(
                 head_version
@@ -191,6 +333,34 @@ class ArtifactMeta:
             updated_at=data.get("updated_at") or "",
             schema=schema if isinstance(schema, int) else SCHEMA_VERSION,
         )
+
+
+def _accept_versions_get(self: ArtifactMeta) -> bool:
+    """``True`` iff someone other than the owner may submit versions."""
+    return self.accept_versions_mode in _ACCEPT_ON_MODES
+
+
+def _accept_versions_set(self: ArtifactMeta, value: bool | None) -> None:
+    """Flip the mode on/off, preserving ``allowlist`` when it already agrees.
+
+    ``None`` means "not specified" — used by the generated ``__init__`` when a
+    caller passes only ``accept_versions_mode``.
+    """
+    if value is None:
+        return
+    wanted = bool(value)
+    if wanted == (self.accept_versions_mode in _ACCEPT_ON_MODES):
+        return
+    self.accept_versions_mode = ACCEPT_ANYONE if wanted else ACCEPT_OFF
+
+
+# Attached post-hoc: a dataclass field and a property cannot share a name, but a
+# property installed after the fact is what the generated ``__init__`` assigns
+# through, so ``ArtifactMeta(accept_versions=True)`` and
+# ``meta.accept_versions = False`` both keep the mode in sync.
+ArtifactMeta.accept_versions = property(  # type: ignore[assignment]
+    _accept_versions_get, _accept_versions_set
+)
 
 
 @dataclass
@@ -351,7 +521,7 @@ def migrate_legacy(raw: bytes) -> tuple[Envelope, ArtifactMeta]:
         id=envelope.id,
         owner=owner if isinstance(owner, dict) else dict(envelope.author),
         password=password if isinstance(password, dict) else None,
-        accept_versions=False,
+        accept_versions_mode=ACCEPT_OFF,
         head_mode=HEAD_LATEST,
         head_version=None,
         created_at=envelope.created_at,
@@ -771,6 +941,9 @@ class ArtifactStore:
             "created_at": meta.created_at,
             "updated_at": meta.updated_at,
             "accept_versions": meta.accept_versions,
+            "accept_versions_mode": meta.accept_versions_mode,
+            "comments_mode": meta.comments_mode,
+            "status": meta.status,
             "protected": bool(meta.password),
             "head_version": head.version if head is not None else None,
             "versions_count": versions_count,

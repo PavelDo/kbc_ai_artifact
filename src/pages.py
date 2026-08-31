@@ -1,14 +1,17 @@
 """Human-facing HTML shell pages and their shared mini design system.
 
-Four pages are rendered by the service itself:
+Five pages are rendered by the service itself:
 
 - the landing page at ``/`` — what the hub is, what it does, and how to drive
   it from a terminal,
 - the unlock form shown when a password-protected artifact is opened in a
   browser,
-- the version picker at ``/a/{id}/versions?format=html``, and
+- the version picker at ``/a/{id}/versions?format=html``,
 - the owner/moderation studio at ``/admin``, a single self-contained page whose
-  vanilla JS talks to the same public API a terminal would.
+  vanilla JS talks to the same public API a terminal would, and
+- the review UI at ``/a/{id}/review``, a two-pane reader that renders the
+  artifact inside a sandboxed ``srcdoc`` iframe and keeps inline comment
+  threads beside it.
 
 Artifact content itself is never templated here — it is served verbatim from
 the version envelope.
@@ -371,25 +374,15 @@ _VERSIONS_CSS = """
 """
 
 
-#: Studio-only styles. Everything structural (tokens, badges, cards, tables,
-#: terminal cards, footer) comes from :data:`_CSS`; this block only adds the
-#: widgets the admin page introduces — buttons, the sign-in card, the artifact
-#: rows with their expandable detail panel, and the preview modal.
-_ADMIN_CSS = """
-main { max-width: 68rem; }
-
-/* The studio toggles visibility with the `hidden` attribute, and several
-   widgets below set an explicit `display`, which would otherwise win over the
+#: Interactive-widget styles shared by every page whose JavaScript toggles
+#: things: the studio (``/admin``) and the review UI (``/a/{id}/review``).
+#: Structural tokens (colors, badges, cards, tables, terminal cards, footer)
+#: stay in :data:`_CSS`.
+_CONTROLS_CSS = """
+/* Both pages toggle visibility with the `hidden` attribute, and several
+   widgets set an explicit `display`, which would otherwise win over the
    user-agent's `[hidden] { display: none }`. */
 [hidden] { display: none !important; }
-
-.ahead { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 1rem;
-  margin-bottom: .5rem; }
-.ahead h1 { font-size: clamp(1.5rem, 1.1rem + 1.4vw, 2.1rem); margin: 0 0 .35rem; }
-.ahead .lead { margin: 0; color: var(--ink-2); font-size: .95rem;
-  max-width: 40rem; }
-.ahead-right { margin-left: auto; display: flex; align-items: center;
-  gap: .5rem; flex-wrap: wrap; }
 
 /* -------- buttons --------------------------------------------------------- */
 .btn {
@@ -421,6 +414,31 @@ main { max-width: 68rem; }
 .btn-wide { width: 100%; justify-content: center; padding: .55rem 1rem;
   font-size: .85rem; margin-top: .3rem; }
 
+/* -------- status lines ---------------------------------------------------- */
+.err { font-family: var(--font-mono); font-size: .78rem; color: var(--danger);
+  margin: .7rem 0 0; overflow-wrap: anywhere; }
+.err::before { content: "! "; font-weight: 700; }
+.loading { font-family: var(--font-mono); font-size: .8rem; color: var(--muted);
+  padding: .6rem 0; }
+.empty { font-family: var(--font-mono); font-size: .84rem; color: var(--muted);
+  padding: .8rem 0; }
+"""
+
+#: Studio-only styles. Everything structural comes from :data:`_CSS` and every
+#: button/status widget from :data:`_CONTROLS_CSS`; this block only adds what
+#: the admin page introduces — the sign-in card, the artifact rows with their
+#: expandable detail panel, and the preview modal.
+_ADMIN_CSS = """
+main { max-width: 68rem; }
+
+.ahead { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 1rem;
+  margin-bottom: .5rem; }
+.ahead h1 { font-size: clamp(1.5rem, 1.1rem + 1.4vw, 2.1rem); margin: 0 0 .35rem; }
+.ahead .lead { margin: 0; color: var(--ink-2); font-size: .95rem;
+  max-width: 40rem; }
+.ahead-right { margin-left: auto; display: flex; align-items: center;
+  gap: .5rem; flex-wrap: wrap; }
+
 /* -------- sign in --------------------------------------------------------- */
 .login-card { max-width: 30rem; padding: 1.35rem 1.4rem 1.5rem; }
 .login-card label { display: block; font-family: var(--font-mono);
@@ -440,14 +458,7 @@ main { max-width: 68rem; }
 .hint { font-size: .82rem; color: var(--muted); margin: 1rem 0 0; }
 .hint code { font-size: .78rem; }
 
-/* -------- status lines ---------------------------------------------------- */
-.err { font-family: var(--font-mono); font-size: .78rem; color: var(--danger);
-  margin: .7rem 0 0; overflow-wrap: anywhere; }
-.err::before { content: "! "; font-weight: 700; }
-.loading { font-family: var(--font-mono); font-size: .8rem; color: var(--muted);
-  padding: .6rem 0; }
-.empty { font-family: var(--font-mono); font-size: .84rem; color: var(--muted);
-  padding: .8rem 0; }
+/* -------- toolbar --------------------------------------------------------- */
 .toolbar { display: flex; align-items: center; gap: .6rem; margin-bottom: .7rem; }
 .toolbar .spacer { flex: 1; }
 .toolbar .mono { font-size: .76rem; color: var(--muted); }
@@ -814,6 +825,13 @@ _ADMIN_JS = """
     openLink.rel = "noopener";
     controls.appendChild(openLink);
 
+    /* The review UI: the same document with its inline comment threads. */
+    var reviewLink = el("a", "btn btn-sm", "Review");
+    reviewLink.href = publicUrl + "/review";
+    reviewLink.target = "_blank";
+    reviewLink.rel = "noopener";
+    controls.appendChild(reviewLink);
+
     var copyBtn = el("button", "btn btn-sm", "Copy public URL");
     copyBtn.type = "button";
     copyBtn.addEventListener("click", function () {
@@ -1143,6 +1161,13 @@ def landing_page(base_url: str, service_version: str, github_url: str) -> str:
                 "token never leaves the tab.",
             ),
             _card(
+                "review and comment",
+                "Every artifact has a review UI at "
+                "<code>/a/{id}/review</code>: highlight a passage, leave an "
+                "inline comment, reply and resolve — and export the whole "
+                "trail as an Obsidian vault.",
+            ),
+            _card(
                 "your project, your content",
                 "The canonical copy of what you publish is a Storage File in "
                 "your own Keboola project. The hub keeps only a serving copy, "
@@ -1284,6 +1309,10 @@ same public API.</p>
 <tr><td class="mono">GET</td><td><code>/a/{{id}}/raw</code></td><td>The HTML itself, no chrome</td></tr>
 <tr><td class="mono">GET</td><td><code>/a/{{id}}/source</code></td><td>Original submitted source (Markdown or HTML)</td></tr>
 <tr><td class="mono">GET</td><td><code>/a/{{id}}/meta</code></td><td>Public metadata JSON, no owner details</td></tr>
+<tr><td class="mono">GET</td><td><code>/a/{{id}}/review</code></td><td>Two-pane review UI: the document plus its inline comment threads</td></tr>
+<tr><td class="mono">GET</td><td><code>/a/{{id}}/comments</code></td><td>Every comment thread as JSON</td></tr>
+<tr><td class="mono">GET</td><td><code>/a/{{id}}/export/markdown</code></td><td>The head version's source as a downloadable file</td></tr>
+<tr><td class="mono">GET</td><td><code>/a/{{id}}/export/vault</code></td><td>A ready-to-open Obsidian vault (ZIP) of the whole history</td></tr>
 <tr><td class="mono">POST</td><td><code>/a/{{id}}/unlock</code></td><td>Password form target; sets a signed, path-scoped cookie</td></tr>
 </table></div>
 <p class="note">Protected artifacts accept the password over the
@@ -1303,6 +1332,10 @@ two management headers.</p>
 <tr><td class="mono">POST</td><td><code>/api/artifacts/{{id}}/versions/{{n}}/promote</code></td><td>Owner approves a proposal</td></tr>
 <tr><td class="mono">DELETE</td><td><code>/api/artifacts/{{id}}/versions/{{n}}</code></td><td>Owner removes a version; a contributor withdraws their own proposal</td></tr>
 <tr><td class="mono">PUT</td><td><code>/api/artifacts/{{id}}/head</code></td><td>Serve the latest live version, or pin one</td></tr>
+<tr><td class="mono">POST</td><td><code>/api/artifacts/{{id}}/comments</code></td><td>Open an inline comment thread on a quoted passage</td></tr>
+<tr><td class="mono">POST</td><td><code>/api/artifacts/{{id}}/comments/{{tid}}/replies</code></td><td>Reply in a thread</td></tr>
+<tr><td class="mono">POST</td><td><code>/api/artifacts/{{id}}/comments/{{tid}}/resolve</code></td><td>Resolve a thread, or reopen it with <code>{{"resolved": false}}</code></td></tr>
+<tr><td class="mono">DELETE</td><td><code>/api/artifacts/{{id}}/comments/{{tid}}</code></td><td>Delete a thread (owner, or its author)</td></tr>
 </table></div>
 
 <footer>
@@ -1416,7 +1449,7 @@ reload keeps you signed in and closing the tab forgets the token.
 
     return _page(
         "Artifact Hub · Admin studio",
-        _ADMIN_CSS,
+        _CONTROLS_CSS + _ADMIN_CSS,
         body + _ADMIN_JS + "</script>",
     )
 
@@ -1568,6 +1601,7 @@ def versions_page(
 <div class="hero-meta">{"".join(facts)}</div>
 <div class="hero-links">
 <a class="primary" href="{base}/a/{safe_id}">open head version</a>
+<a href="{base}/a/{safe_id}/review">review &amp; comment</a>
 <a href="{base}/a/{safe_id}/versions">JSON</a>
 <a href="{base}/a/{safe_id}/meta">metadata</a>
 </div>
@@ -1582,4 +1616,893 @@ def versions_page(
 <a href="{base}/">hub home</a>
 </footer>
 </main>""",
+    )
+
+
+# --------------------------------------------------------------------------
+# Review UI (/a/{id}/review)
+# --------------------------------------------------------------------------
+
+#: Review-only styles: the two-pane frame, the thread cards and the composer.
+#: Buttons and status lines come from :data:`_CONTROLS_CSS`.
+_REVIEW_CSS = """
+html, body { height: 100%; }
+html { background-image: none; }
+
+.rv { display: flex; flex-direction: column; height: 100vh; }
+
+.rv-top { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem;
+  padding: .5rem .85rem; border-bottom: 1px solid var(--line);
+  background: var(--panel); }
+.rv-brand { font-family: var(--font-mono); font-weight: 700; font-size: .88rem;
+  letter-spacing: -.01em; }
+.rv-top .spacer { flex: 1; }
+
+.rv-body { flex: 1; display: flex; min-height: 0; }
+.rv-doc { flex: 1; min-width: 0; background: #ffffff; }
+.rv-doc iframe { width: 100%; height: 100%; border: 0; background: #ffffff; }
+
+.rv-side { width: 25rem; max-width: 45vw; flex: none; overflow-y: auto;
+  border-left: 1px solid var(--line); background: var(--panel);
+  padding: .85rem .9rem 2rem; }
+.rv-side h2 { font-family: var(--font-mono); font-size: .72rem;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--muted);
+  margin: 1.1rem 0 .5rem; }
+.rv-side h2:first-child { margin-top: 0; }
+
+.rv-hint { font-size: .82rem; color: var(--muted); margin: .3rem 0 0; }
+.rv-quote { font-family: var(--font-mono); font-size: .78rem; color: var(--ink-2);
+  border-left: 2px solid var(--accent); padding: .25rem .55rem; margin: 0 0 .5rem;
+  background: var(--accent-soft); border-radius: 0 6px 6px 0;
+  overflow-wrap: anywhere; }
+
+.rv-field { width: 100%; padding: .5rem .6rem; font-family: var(--font-sans);
+  font-size: .86rem; color: var(--ink); background: var(--paper);
+  border: 1px solid var(--line); border-radius: 8px; }
+textarea.rv-field { min-height: 5rem; resize: vertical; }
+.rv-side label { display: block; font-family: var(--font-mono); font-size: .68rem;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
+  margin: .6rem 0 .3rem; }
+.rv-actions { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .5rem; }
+
+.rv-threads { list-style: none; margin: .3rem 0 0; padding: 0; }
+.rv-thread { border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--paper); padding: .6rem .7rem; margin-bottom: .5rem; }
+.rv-thread.is-active { border-color: var(--accent); }
+.rv-thread.is-resolved { opacity: .72; }
+.rv-thread-top { display: flex; flex-wrap: wrap; align-items: center;
+  gap: .35rem; margin-bottom: .35rem; }
+.rv-who { font-family: var(--font-mono); font-size: .74rem; color: var(--ink); }
+.rv-when { font-family: var(--font-mono); font-size: .7rem; color: var(--muted); }
+.rv-text { font-size: .88rem; color: var(--ink-2); margin: .35rem 0 0;
+  overflow-wrap: anywhere; white-space: pre-wrap; }
+.rv-replies { list-style: none; margin: .45rem 0 0; padding: 0 0 0 .6rem;
+  border-left: 2px solid var(--line); }
+.rv-replies li { margin-bottom: .35rem; }
+.rv-orphan { font-family: var(--font-mono); font-size: .7rem; color: var(--proposed); }
+"""
+
+#: The script injected into the artifact HTML before it is loaded into the
+#: sandboxed iframe.
+#:
+#: It runs in an **opaque origin** (the iframe declares
+#: ``sandbox="allow-scripts allow-popups"`` with no ``allow-same-origin``), so
+#: it can never read the shell's DOM, cookies or ``sessionStorage`` — the
+#: Storage token is structurally out of reach of anything an artifact author
+#: wrote. Its only channel to the shell is ``postMessage``:
+#:
+#: - out: ``ah-ready``, ``ah-select`` (a TextQuoteSelector for the current
+#:   selection), ``ah-open`` (a highlight was clicked) and ``ah-anchored``
+#:   (which thread IDs actually matched this rendering),
+#: - in: ``ah-anchors`` — the quotes to highlight.
+#:
+#: Served to the browser inside a ``<script type="text/plain">`` element and
+#: injected by the shell as a real script, so it must never contain the closing
+#: script tag sequence.
+_ANNOTATION_JS = """
+(function () {
+  "use strict";
+
+  var MAX_EXACT = 2000;
+  var CTX = 32;
+  var ATTR = "data-ah-tid";
+
+  var style = document.createElement("style");
+  style.textContent =
+    "mark[" + ATTR + "]{background:rgba(250,204,21,.35);color:inherit;" +
+    "outline:2px solid #f59e0b;outline-offset:1px;border-radius:2px;" +
+    "cursor:pointer}" +
+    "mark[" + ATTR + "]:hover{background:rgba(250,204,21,.62)}";
+  (document.head || document.documentElement).appendChild(style);
+
+  function post(message) {
+    try { parent.postMessage(message, "*"); } catch (err) { /* detached */ }
+  }
+
+  /* The rendered document as one string, plus the text nodes that built it.
+     Recomputed on demand: wrapping a quote in <mark> keeps the text identical
+     but rearranges the nodes. */
+  function flatten() {
+    var root = document.body || document.documentElement;
+    var parts = [];
+    var text = "";
+    if (!root) { return { text: text, parts: parts }; }
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    var node;
+    while ((node = walker.nextNode())) {
+      var tag = node.parentNode ? node.parentNode.nodeName : "";
+      if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") { continue; }
+      var value = node.nodeValue || "";
+      if (!value) { continue; }
+      parts.push({ node: node, start: text.length, end: text.length + value.length });
+      text += value;
+    }
+    return { text: text, parts: parts };
+  }
+
+  function offsetOf(flat, container, offset) {
+    for (var i = 0; i < flat.parts.length; i++) {
+      if (flat.parts[i].node === container) { return flat.parts[i].start + offset; }
+    }
+    return -1;
+  }
+
+  /* Longest common run of two strings, from the start or from the end. */
+  function overlap(a, b, fromEnd) {
+    var limit = Math.min(a.length, b.length);
+    var i = 0;
+    while (i < limit) {
+      var ca = fromEnd ? a.charAt(a.length - 1 - i) : a.charAt(i);
+      var cb = fromEnd ? b.charAt(b.length - 1 - i) : b.charAt(i);
+      if (ca !== cb) { break; }
+      i += 1;
+    }
+    return i;
+  }
+
+  /* Offset of the best occurrence of spec.exact, or -1. Ties between repeated
+     quotes are broken by how much of the recorded prefix/suffix matches. */
+  function locate(text, spec) {
+    var exact = String(spec.exact || "");
+    if (!exact) { return -1; }
+    var best = -1;
+    var bestScore = -1;
+    var from = 0;
+    for (;;) {
+      var at = text.indexOf(exact, from);
+      if (at < 0) { break; }
+      var before = text.slice(Math.max(0, at - CTX), at);
+      var after = text.slice(at + exact.length, at + exact.length + CTX);
+      var score = overlap(before, String(spec.prefix || ""), true) +
+        overlap(after, String(spec.suffix || ""), false);
+      if (score > bestScore) { bestScore = score; best = at; }
+      from = at + 1;
+    }
+    return best;
+  }
+
+  function rangeFor(flat, start, end) {
+    var range = document.createRange();
+    var started = false;
+    for (var i = 0; i < flat.parts.length; i++) {
+      var part = flat.parts[i];
+      if (!started && start >= part.start && start < part.end) {
+        range.setStart(part.node, start - part.start);
+        started = true;
+      }
+      if (started && end > part.start && end <= part.end) {
+        range.setEnd(part.node, end - part.start);
+        return range;
+      }
+    }
+    return null;
+  }
+
+  function clearMarks() {
+    var marks = document.querySelectorAll("mark[" + ATTR + "]");
+    for (var i = 0; i < marks.length; i++) {
+      var mark = marks[i];
+      var parent = mark.parentNode;
+      if (!parent) { continue; }
+      while (mark.firstChild) { parent.insertBefore(mark.firstChild, mark); }
+      parent.removeChild(mark);
+      if (parent.normalize) { parent.normalize(); }
+    }
+  }
+
+  function wrap(range, tid) {
+    var mark = document.createElement("mark");
+    mark.setAttribute(ATTR, tid);
+    try {
+      range.surroundContents(mark);
+      return true;
+    } catch (err) {
+      /* The quote crosses element boundaries; rebuild it instead. */
+    }
+    try {
+      mark.appendChild(range.extractContents());
+      range.insertNode(mark);
+      return true;
+    } catch (err2) {
+      return false;
+    }
+  }
+
+  /* Highlight every quote we can still find. A quote that no longer matches
+     this rendering is skipped silently; the shell learns which ones anchored
+     from the ah-anchored reply and labels the rest. */
+  function applyAnchors(list) {
+    clearMarks();
+    var done = [];
+    for (var i = 0; i < list.length; i++) {
+      var spec = list[i];
+      if (!spec || !spec.tid || !spec.exact) { continue; }
+      var flat = flatten();
+      var at = locate(flat.text, spec);
+      if (at < 0) { continue; }
+      var range = rangeFor(flat, at, at + String(spec.exact).length);
+      if (!range) { continue; }
+      if (wrap(range, String(spec.tid))) { done.push(String(spec.tid)); }
+    }
+    post({ type: "ah-anchored", tids: done });
+  }
+
+  document.addEventListener("mouseup", function () {
+    /* Let the browser finish updating the selection first. */
+    window.setTimeout(function () {
+      var selection = window.getSelection();
+      if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+        return;
+      }
+      var range = selection.getRangeAt(0);
+      var flat = flatten();
+      var start = offsetOf(flat, range.startContainer, range.startOffset);
+      var end = offsetOf(flat, range.endContainer, range.endOffset);
+      var exact;
+      if (start >= 0 && end > start) {
+        /* Slicing the flattened text guarantees the quote can be found again
+           by the very same code path that anchors it. */
+        exact = flat.text.slice(start, end);
+      } else {
+        exact = String(selection.toString());
+        start = flat.text.indexOf(exact);
+        end = start < 0 ? -1 : start + exact.length;
+      }
+      if (!exact || !exact.replace(/\\s+/g, "")) { return; }
+      if (exact.length > MAX_EXACT) {
+        exact = exact.slice(0, MAX_EXACT);
+        end = start + exact.length;
+      }
+      var prefix = "";
+      var suffix = "";
+      if (start >= 0) {
+        prefix = flat.text.slice(Math.max(0, start - CTX), start);
+        suffix = flat.text.slice(end, end + CTX);
+      }
+      post({ type: "ah-select", exact: exact, prefix: prefix, suffix: suffix });
+    }, 0);
+  });
+
+  document.addEventListener("click", function (event) {
+    var node = event.target;
+    while (node && node !== document) {
+      if (node.nodeType === 1 && node.hasAttribute && node.hasAttribute(ATTR)) {
+        post({ type: "ah-open", tid: node.getAttribute(ATTR) });
+        return;
+      }
+      node = node.parentNode;
+    }
+  });
+
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    if (!data || typeof data !== "object") { return; }
+    if (data.type === "ah-anchors") { applyAnchors(data.anchors || []); }
+  });
+
+  post({ type: "ah-ready" });
+})();
+"""
+
+#: The review shell, as one IIFE. It owns the credential; the artifact owns
+#: nothing but its own opaque-origin iframe.
+_REVIEW_JS = """
+(function () {
+  "use strict";
+
+  var BASE = String(window.HUB_BASE || "").replace(/\\/+$/, "");
+  var ID = String(window.HUB_ARTIFACT_ID || "");
+  var PATH = BASE + "/a/" + encodeURIComponent(ID);
+
+  /* Shared with /admin on purpose: one sign-in serves both pages. */
+  var AUTH_KEY = "hub_admin_auth";
+  var auth = null;
+
+  var threads = [];
+  var headVersion = null;
+  var commentsMode = "anyone";
+  var artifactStatus = "draft";
+  var anchoredIds = {};
+  var selection = null;
+  var activeId = null;
+
+  function $(id) { return document.getElementById(id); }
+  function show(node, on) { if (node) { node.hidden = !on; } }
+
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) { node.className = cls; }
+    if (text !== undefined && text !== null) { node.textContent = String(text); }
+    return node;
+  }
+
+  function badge(text, kind) {
+    return el("span", "badge" + (kind ? " badge--" + kind : ""), text);
+  }
+
+  function setError(node, message) {
+    node.textContent = message || "";
+    node.hidden = !message;
+  }
+
+  function when(value) {
+    return String(value || "").replace("T", " ").replace("+00:00", "");
+  }
+
+  function who(identity) {
+    var data = identity || {};
+    if (data.project_name) { return String(data.project_name); }
+    if (data.project_id !== undefined && data.project_id !== null) {
+      return "project " + data.project_id;
+    }
+    return "unknown project";
+  }
+
+  /* ---------------------------------------------------------------- auth */
+
+  function loadAuth() {
+    try {
+      var raw = window.sessionStorage.getItem(AUTH_KEY);
+      if (!raw) { return null; }
+      var parsed = JSON.parse(raw);
+      if (parsed && parsed.token && parsed.stack) {
+        return { token: parsed.token, stack: parsed.stack };
+      }
+    } catch (err) {
+      /* Storage disabled or unreadable: just sign in again. */
+    }
+    return null;
+  }
+
+  function storeAuth(value) {
+    try { window.sessionStorage.setItem(AUTH_KEY, JSON.stringify(value)); }
+    catch (err) { /* Non-fatal: the session will not survive a reload. */ }
+  }
+
+  function clearAuth() {
+    try { window.sessionStorage.removeItem(AUTH_KEY); } catch (err) {}
+  }
+
+  function headers(withBody) {
+    var out = {
+      "X-StorageApi-Token": auth.token,
+      "X-Storage-Stack": auth.stack
+    };
+    if (withBody) { out["Content-Type"] = "application/json"; }
+    return out;
+  }
+
+  function apiMessage(status, data, text) {
+    if (data && typeof data.detail === "string") { return data.detail; }
+    if (data && data.detail) { return JSON.stringify(data.detail); }
+    if (data && data.error) {
+      return data.error + (data.detail ? " \\u2014 " + data.detail : "");
+    }
+    if (text) { return "HTTP " + status + ": " + text.slice(0, 300); }
+    return "HTTP " + status;
+  }
+
+  async function api(path, options) {
+    var opts = options || {};
+    var hasBody = opts.body !== undefined;
+    var resp = await fetch(BASE + path, {
+      method: opts.method || "GET",
+      headers: headers(hasBody),
+      body: hasBody ? JSON.stringify(opts.body) : undefined
+    });
+    var text = await resp.text();
+    var data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (err) { data = null; }
+    if (!resp.ok) { throw new Error(apiMessage(resp.status, data, text)); }
+    return data;
+  }
+
+  /* Public reads. credentials:"same-origin" carries the unlock cookie of a
+     password-protected artifact, which is scoped to /a/{id}. */
+  async function read(path) {
+    var resp = await fetch(PATH + path, { credentials: "same-origin" });
+    var text = await resp.text();
+    if (!resp.ok) {
+      var data = null;
+      try { data = JSON.parse(text); } catch (err) { data = null; }
+      throw new Error(apiMessage(resp.status, data, text));
+    }
+    return text;
+  }
+
+  /* ------------------------------------------------------------- document */
+
+  /* The artifact is loaded into a srcdoc iframe sandboxed WITHOUT
+     allow-same-origin, so its scripts run in an opaque origin and can reach
+     neither this document nor the token in sessionStorage. */
+  function inject(htmlText) {
+    var source = $("rv-anno").textContent;
+    var snippet = "<scr" + "ipt>" + source + "</scr" + "ipt>";
+    var lower = String(htmlText).toLowerCase();
+    var at = lower.lastIndexOf("</body>");
+    if (at < 0) { return htmlText + snippet; }
+    return htmlText.slice(0, at) + snippet + htmlText.slice(at);
+  }
+
+  async function loadDocument() {
+    var text = await read("/raw");
+    $("rv-frame").srcdoc = inject(text);
+  }
+
+  async function loadVersions() {
+    var data = JSON.parse(await read("/versions"));
+    headVersion = data.head_version;
+    $("rv-head").textContent = headVersion
+      ? "commenting on v" + headVersion
+      : "no live version";
+  }
+
+  async function loadThreads() {
+    var data = JSON.parse(await read("/comments"));
+    threads = data.threads || [];
+    commentsMode = data.comments_mode || "anyone";
+    artifactStatus = data.status || "draft";
+    renderThreads();
+    sendAnchors();
+  }
+
+  function sendAnchors() {
+    var frame = $("rv-frame");
+    if (!frame || !frame.contentWindow) { return; }
+    var list = threads.map(function (thread) {
+      var selector = thread.selector || {};
+      return {
+        tid: thread.id,
+        exact: selector.exact || "",
+        prefix: selector.prefix || "",
+        suffix: selector.suffix || ""
+      };
+    });
+    frame.contentWindow.postMessage({ type: "ah-anchors", anchors: list }, "*");
+  }
+
+  /* --------------------------------------------------------------- threads */
+
+  function renderThreads() {
+    var list = $("rv-threads");
+    list.textContent = "";
+    $("rv-count").textContent = threads.length +
+      (threads.length === 1 ? " thread" : " threads");
+    show($("rv-empty"), threads.length === 0);
+    threads.forEach(function (thread) {
+      list.appendChild(threadCard(thread));
+    });
+    var frozen = artifactStatus === "final";
+    show($("rv-frozen"), frozen);
+    show($("rv-closed"), !frozen && commentsMode === "off");
+  }
+
+  function threadCard(thread) {
+    var item = el("li", "rv-thread");
+    item.id = "rv-thread-" + thread.id;
+    if (thread.resolved) { item.classList.add("is-resolved"); }
+    if (activeId === thread.id) { item.classList.add("is-active"); }
+
+    var top = el("div", "rv-thread-top");
+    top.appendChild(el("span", "rv-who", who(thread.author)));
+    top.appendChild(el("span", "rv-when", when(thread.created_at)));
+    if (thread.version !== headVersion) {
+      top.appendChild(badge("v" + thread.version));
+    }
+    if (thread.resolved) { top.appendChild(badge("resolved", "live")); }
+    item.appendChild(top);
+
+    var selector = thread.selector || {};
+    item.appendChild(el("div", "rv-quote", selector.exact || ""));
+    if (!anchoredIds[thread.id]) {
+      item.appendChild(
+        el("div", "rv-orphan", "quote not found on this version")
+      );
+    }
+    item.appendChild(el("p", "rv-text", thread.body || ""));
+
+    var replies = thread.replies || [];
+    if (replies.length) {
+      var replyList = el("ul", "rv-replies");
+      replies.forEach(function (reply) {
+        var row = document.createElement("li");
+        var head = el("div", "rv-thread-top");
+        head.appendChild(el("span", "rv-who", who(reply.author)));
+        head.appendChild(el("span", "rv-when", when(reply.created_at)));
+        row.appendChild(head);
+        row.appendChild(el("p", "rv-text", reply.body || ""));
+        replyList.appendChild(row);
+      });
+      item.appendChild(replyList);
+    }
+
+    if (auth) { item.appendChild(threadActions(thread)); }
+    item.addEventListener("click", function () {
+      activeId = thread.id;
+      renderThreads();
+    });
+    return item;
+  }
+
+  function threadActions(thread) {
+    var wrap = el("div", null);
+    var errBox = el("p", "err");
+    errBox.hidden = true;
+
+    var box = el("textarea", "rv-field");
+    box.hidden = true;
+    box.placeholder = "Reply\\u2026";
+
+    function run(button, handler) {
+      button.disabled = true;
+      setError(errBox, "");
+      handler().then(function () {
+        button.disabled = false;
+      }, function (err) {
+        setError(errBox, err.message);
+        button.disabled = false;
+      });
+    }
+
+    var actions = el("div", "rv-actions");
+    var path = "/api/artifacts/" + encodeURIComponent(ID) + "/comments/" +
+      encodeURIComponent(thread.id);
+
+    var replyBtn = el("button", "btn btn-sm", "Reply");
+    replyBtn.type = "button";
+    replyBtn.addEventListener("click", function (event) {
+      event.stopPropagation();
+      if (box.hidden) { box.hidden = false; box.focus(); return; }
+      var text = box.value.trim();
+      if (!text) { box.hidden = true; return; }
+      run(replyBtn, async function () {
+        await api(path + "/replies", { method: "POST", body: { body: text } });
+        box.value = "";
+        await loadThreads();
+      });
+    });
+    actions.appendChild(replyBtn);
+
+    var resolveBtn = el("button", "btn btn-sm",
+      thread.resolved ? "Reopen" : "Resolve");
+    resolveBtn.type = "button";
+    resolveBtn.addEventListener("click", function (event) {
+      event.stopPropagation();
+      run(resolveBtn, async function () {
+        await api(path + "/resolve", {
+          method: "POST",
+          body: { resolved: !thread.resolved }
+        });
+        await loadThreads();
+      });
+    });
+    actions.appendChild(resolveBtn);
+
+    var deleteBtn = el("button", "btn btn-sm btn-danger", "Delete");
+    deleteBtn.type = "button";
+    deleteBtn.addEventListener("click", function (event) {
+      event.stopPropagation();
+      if (!window.confirm("Delete this thread? This is permanent.")) { return; }
+      run(deleteBtn, async function () {
+        await api(path, { method: "DELETE" });
+        await loadThreads();
+      });
+    });
+    actions.appendChild(deleteBtn);
+
+    wrap.appendChild(box);
+    wrap.appendChild(actions);
+    wrap.appendChild(errBox);
+    return wrap;
+  }
+
+  function focusThread(tid) {
+    activeId = tid;
+    renderThreads();
+    var node = $("rv-thread-" + tid);
+    if (node && node.scrollIntoView) {
+      node.scrollIntoView({ block: "center" });
+    }
+    show($("rv-side"), true);
+  }
+
+  /* -------------------------------------------------------------- composer */
+
+  function openComposer(data) {
+    selection = { exact: data.exact, prefix: data.prefix, suffix: data.suffix };
+    $("rv-quote").textContent = data.exact;
+    setError($("rv-composer-error"), "");
+    show($("rv-composer"), true);
+    show($("rv-side"), true);
+    $("rv-comment").focus();
+  }
+
+  function closeComposer() {
+    selection = null;
+    $("rv-comment").value = "";
+    show($("rv-composer"), false);
+  }
+
+  async function submitComment() {
+    if (!selection) { return; }
+    if (!auth) {
+      setError($("rv-composer-error"), "Sign in first to leave a comment.");
+      return;
+    }
+    var text = $("rv-comment").value.trim();
+    if (!text) {
+      setError($("rv-composer-error"), "Write something first.");
+      return;
+    }
+    var button = $("rv-post");
+    button.disabled = true;
+    setError($("rv-composer-error"), "");
+    try {
+      await api("/api/artifacts/" + encodeURIComponent(ID) + "/comments", {
+        method: "POST",
+        body: {
+          version: headVersion,
+          exact: selection.exact,
+          prefix: selection.prefix,
+          suffix: selection.suffix,
+          body: text
+        }
+      });
+      closeComposer();
+      await loadThreads();
+    } catch (err) {
+      setError($("rv-composer-error"), err.message);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  /* --------------------------------------------------------------- signin */
+
+  function signedIn(projectId) {
+    show($("rv-signin"), false);
+    show($("rv-account"), true);
+    $("rv-project").textContent = "project " + (projectId || "?") +
+      " \\u00b7 " + auth.stack;
+  }
+
+  function signedOut() {
+    auth = null;
+    clearAuth();
+    show($("rv-account"), false);
+    show($("rv-signin"), true);
+    $("rv-token").value = "";
+    renderThreads();
+  }
+
+  async function signIn(token, stack) {
+    auth = { token: token, stack: stack };
+    try {
+      var data = await api("/api/artifacts");
+      storeAuth(auth);
+      $("rv-token").value = "";
+      signedIn(data.project_id);
+      renderThreads();
+    } catch (err) {
+      auth = null;
+      throw err;
+    }
+  }
+
+  /* ------------------------------------------------------------- messages */
+
+  window.addEventListener("message", function (event) {
+    var frame = $("rv-frame");
+    /* Only the artifact frame may talk to the shell. */
+    if (!frame || event.source !== frame.contentWindow) { return; }
+    var data = event.data;
+    if (!data || typeof data !== "object") { return; }
+    if (data.type === "ah-ready") { sendAnchors(); return; }
+    if (data.type === "ah-anchored") {
+      anchoredIds = {};
+      (data.tids || []).forEach(function (tid) {
+        anchoredIds[String(tid)] = true;
+      });
+      renderThreads();
+      return;
+    }
+    if (data.type === "ah-select") { openComposer(data); return; }
+    if (data.type === "ah-open") { focusThread(String(data.tid)); }
+  });
+
+  /* --------------------------------------------------------------- wiring */
+
+  $("rv-stack").addEventListener("change", function () {
+    show($("rv-custom-wrap"), $("rv-stack").value === "__custom__");
+  });
+
+  $("rv-signin-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    setError($("rv-signin-error"), "");
+    var token = $("rv-token").value.trim();
+    var choice = $("rv-stack").value;
+    var stack = choice === "__custom__" ? $("rv-custom").value.trim() : choice;
+    if (!token) {
+      setError($("rv-signin-error"), "Enter a Storage API token.");
+      return;
+    }
+    if (!stack) {
+      setError($("rv-signin-error"), "Enter the stack URL.");
+      return;
+    }
+    var button = $("rv-signin-btn");
+    button.disabled = true;
+    signIn(token, stack).catch(function (err) {
+      setError($("rv-signin-error"), err.message);
+    }).then(function () {
+      button.disabled = false;
+    });
+  });
+
+  $("rv-logout").addEventListener("click", signedOut);
+  $("rv-post").addEventListener("click", submitComment);
+  $("rv-cancel").addEventListener("click", closeComposer);
+  $("rv-toggle").addEventListener("click", function () {
+    var side = $("rv-side");
+    show(side, side.hidden);
+  });
+
+  /* ---------------------------------------------------------------- start */
+
+  auth = loadAuth();
+  if (auth) {
+    var stacks = Array.prototype.map.call($("rv-stack").options,
+      function (option) { return option.value; });
+    if (stacks.indexOf(auth.stack) === -1) {
+      $("rv-stack").value = "__custom__";
+      $("rv-custom").value = auth.stack;
+      show($("rv-custom-wrap"), true);
+    } else {
+      $("rv-stack").value = auth.stack;
+    }
+    api("/api/artifacts").then(function (data) {
+      signedIn(data.project_id);
+      renderThreads();
+    }, function (err) {
+      auth = null;
+      clearAuth();
+      setError($("rv-signin-error"),
+        "That session is no longer valid: " + err.message);
+    });
+  }
+
+  loadDocument().catch(function (err) {
+    setError($("rv-error"), err.message);
+  });
+  loadVersions().then(loadThreads).catch(function (err) {
+    setError($("rv-error"), err.message);
+  });
+})();
+"""
+
+
+def review_page(base_url: str, artifact_id: str, service_version: str) -> str:
+    """Render the two-pane review UI served at ``/a/{id}/review``.
+
+    The page ships no artifact content and no credential of its own. Its
+    JavaScript fetches ``/raw``, ``/versions`` and ``/comments`` for this
+    artifact, injects :data:`_ANNOTATION_JS` into the fetched HTML and loads
+    the result into a ``srcdoc`` iframe sandboxed *without*
+    ``allow-same-origin``. The artifact therefore runs in an opaque origin: its
+    scripts cannot read this document, its cookies or the Storage token the
+    visitor may keep in ``sessionStorage`` (the same ``hub_admin_auth`` entry
+    ``/admin`` uses, so one sign-in serves both pages). The two sides exchange
+    nothing but ``postMessage`` envelopes.
+    """
+    base = html.escape(base_url.rstrip("/"))
+    safe_id = html.escape(artifact_id)
+
+    options = "".join(
+        f'<option value="{html.escape(alias)}">{html.escape(alias)}</option>'
+        for alias in _ADMIN_STACKS
+    )
+    options += '<option value="__custom__">custom URL…</option>'
+
+    body = f"""<div class="rv">
+<header class="rv-top">
+<span class="rv-brand">Artifact Hub · Review</span>
+<span class="badge badge--version">v{html.escape(service_version)}</span>
+<span class="badge" id="rv-head">loading…</span>
+<span class="spacer"></span>
+<a class="btn btn-sm" href="{base}/a/{safe_id}">Open document</a>
+<a class="btn btn-sm" href="{base}/a/{safe_id}/versions?format=html">Versions</a>
+<a class="btn btn-sm" href="{base}/a/{safe_id}/export/vault">Export vault</a>
+<button type="button" class="btn btn-sm" id="rv-toggle">Comments</button>
+</header>
+<div class="rv-body">
+<div class="rv-doc">
+<iframe id="rv-frame" title="artifact under review"
+  sandbox="allow-scripts allow-popups"></iframe>
+</div>
+<aside class="rv-side" id="rv-side">
+<h2>sign in</h2>
+<div id="rv-signin">
+<form id="rv-signin-form" autocomplete="off">
+<label for="rv-token">Storage API token</label>
+<input class="rv-field" type="password" id="rv-token" autocomplete="off"
+  spellcheck="false" placeholder="your Keboola Storage API token">
+<label for="rv-stack">Stack</label>
+<select class="rv-field" id="rv-stack">{options}</select>
+<div id="rv-custom-wrap" hidden>
+<label for="rv-custom">Stack URL</label>
+<input class="rv-field" type="text" id="rv-custom" spellcheck="false"
+  placeholder="https://connection.keboola.com">
+</div>
+<button type="submit" class="btn btn-primary btn-wide" id="rv-signin-btn">Sign in to comment</button>
+<p class="err" id="rv-signin-error" hidden></p>
+</form>
+<p class="rv-hint">Reading is public; commenting needs any Keboola Storage
+API token. The token stays in this browser tab (<code>sessionStorage</code>,
+shared with <a href="{base}/admin">/admin</a>) and is never sent anywhere but
+this hub's own API.</p>
+</div>
+<div id="rv-account" hidden>
+<div class="rv-thread-top">
+<span class="badge badge--version" id="rv-project"></span>
+<button type="button" class="btn btn-sm" id="rv-logout">Log out</button>
+</div>
+</div>
+
+<h2>comment</h2>
+<div id="rv-composer" hidden>
+<div class="rv-quote" id="rv-quote"></div>
+<label for="rv-comment">Your comment</label>
+<textarea class="rv-field" id="rv-comment"
+  placeholder="What about this passage?"></textarea>
+<div class="rv-actions">
+<button type="button" class="btn btn-primary btn-sm" id="rv-post">Comment</button>
+<button type="button" class="btn btn-sm" id="rv-cancel">Cancel</button>
+</div>
+<p class="err" id="rv-composer-error" hidden></p>
+</div>
+<p class="rv-hint" id="rv-hint">Select any text in the document to start a
+thread. Threads stay attached to the version they were made on, so one made on
+an older version may no longer match this text.</p>
+
+<h2>threads</h2>
+<div class="rv-thread-top">
+<span class="rv-when" id="rv-count"></span>
+</div>
+<p class="rv-hint" id="rv-frozen" hidden>This document is final: no new
+versions and no new comments.</p>
+<p class="rv-hint" id="rv-closed" hidden>Commenting is closed on this
+document.</p>
+<p class="err" id="rv-error" hidden></p>
+<p class="empty" id="rv-empty" hidden>No comments yet.</p>
+<ul class="rv-threads" id="rv-threads"></ul>
+</aside>
+</div>
+</div>
+<script>window.HUB_BASE = "{base}"; window.HUB_ARTIFACT_ID = "{safe_id}";</script>
+<script type="text/plain" id="rv-anno">"""
+
+    return _page(
+        f"Review — {artifact_id}",
+        _CONTROLS_CSS + _REVIEW_CSS,
+        body + _ANNOTATION_JS + "</script>\n<script>" + _REVIEW_JS + "</script>",
     )

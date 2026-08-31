@@ -211,6 +211,37 @@ published the artifact. A `PUT` that carries content adds a **new version**;
 nothing is ever overwritten. A `title` lives on a version, so it can only be
 changed together with new content (422 otherwise).
 
+### Project-brain settings (`PUT /api/artifacts/{id}`)
+
+Four fields on the same `PUT` govern who may contribute and whether the
+document is still open at all:
+
+| Field | Values | Meaning |
+|---|---|---|
+| `accept_versions_mode` | `"off"` \| `"anyone"` \| `"allowlist"` | Who may submit a version. Supersedes the legacy `accept_versions` boolean (`false`→`off`, `true`→`anyone`); both are still accepted, but send one or the other, not contradictory values. |
+| `contributors` | list of `"projectId@stackhost"` | Owner keys allowed to submit versions/comments when the matching mode is `allowlist`. Ignored otherwise. |
+| `comments_mode` | `"anyone"` \| `"allowlist"` \| `"off"` | Who may open comment threads and reply. Default `"anyone"`. |
+| `status` | `"draft"` \| `"final"` | `"final"` freezes new versions **and** new comments for everyone, the owner included, and shows a banner on the page. Reopen by `PUT`-ing `{"status": "draft"}` (owner only). |
+
+```bash
+curl -s -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "accept_versions_mode": "allowlist",
+    "contributors": ["1234@connection.eu-central-1.keboola.com"],
+    "comments_mode": "allowlist",
+    "status": "draft"
+  }'
+```
+
+An `allowlist` mode shares the same `contributors` list for both versions and
+comments — there is no separate list per capability. Setting `status` to
+`"final"` is the signal an agent should treat as "stop proposing changes, the
+document is settled" — see *Collaborative review workflow* in the
+`artifact-hub` agent for the full loop.
+
 ## Versioning
 
 Every submission becomes its own version with a verified author. `GET /a/{id}`
@@ -366,6 +397,166 @@ hub's server outside the individual API calls it makes on the author's behalf.
 Point a human at this page instead of asking them to run the promote/reject
 curl commands above by hand.
 
+## Inline comments
+
+Any Keboola-token holder can leave inline, threaded comments anchored to a
+specific quote in a specific version — the mechanism that turns an artifact
+into a shared "project brain" that other agents and humans build on together,
+instead of a one-way publish.
+
+### Anchor model
+
+A comment is anchored the W3C `TextQuoteSelector` way: `exact` (the quoted
+text) plus a `prefix` and `suffix` of roughly 32 characters of surrounding
+context, all captured from the **rendered text** of one specific version. This
+lets a highlight be re-found even when the exact quote occurs more than once
+in the document. A thread stays bound to the version it was opened on — there
+is no cross-version re-anchoring in v1, so a thread opened on v2 keeps
+pointing at v2's text even after v3 is published.
+
+### Read all threads (public)
+
+```bash
+curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/comments"
+```
+
+Public JSON, password-gated exactly like the other read endpoints. Returns
+every thread — open and resolved — with its selector, body, author, and
+replies.
+
+### Open a thread
+
+```bash
+curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "version": 2,
+    "exact": "the Q3 revenue total",
+    "prefix": "...as shown in ",
+    "suffix": " on the summary page...",
+    "body": "This number looks off versus the source table — can you check?"
+  }'
+```
+
+`version` pins the thread to the version whose rendered text the quote came
+from. `exact`, `prefix`, and `suffix` should be captured from that version's
+actual rendered output, not retyped from memory. Response carries the new
+thread's `id`.
+
+### Reply to a thread
+
+```bash
+curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments/<tid>/replies" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{"body": "Fixed in v3 — see the diff for the corrected totals."}'
+```
+
+Anyone allowed to comment (see *Moderation* below) may reply to an existing
+thread, not only its original author.
+
+### Resolve or reopen a thread
+
+```bash
+# Mark resolved
+curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments/<tid>/resolve" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{"resolved": true}'
+
+# Reopen
+curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments/<tid>/resolve" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{"resolved": false}'
+```
+
+Only the artifact owner or the thread's own author may resolve or reopen it.
+
+### Delete a thread
+
+```bash
+curl -s -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments/<tid>" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu"
+```
+
+Only the artifact owner or the thread's own author may delete it. Deletion is
+irreversible and removes the whole thread, replies included.
+
+### Moderation semantics
+
+- `comments_mode` on the artifact (`"anyone"` | `"allowlist"` | `"off"`,
+  default `"anyone"`) governs who may open a thread or reply, mirroring how
+  `accept_versions_mode` governs who may submit a version. The owner may
+  always comment regardless of mode.
+- Opening or replying to a thread when comments are `"off"`, or when the
+  caller's project is not in `contributors` under `"allowlist"`, is a **403**.
+- Opening or replying on an artifact whose `status` is `"final"` is a
+  **409** — a final document is frozen for everyone, owner included.
+- Each contributing project is capped at `HUB_MAX_COMMENTS_PER_DAY` (default
+  100) new threads plus replies per artifact per UTC day; past that, **429**.
+
+### Review UI
+
+`GET /a/{id}/review` is a browser-based review page: select text in the
+rendered document to open a comment composer anchored to that selection; the
+sidebar lists every thread, and clicking one scrolls to and highlights its
+anchor. The artifact itself renders inside a **sandboxed** `srcdoc` iframe
+(`allow-scripts`, no `allow-same-origin`) so the artifact's own JavaScript runs
+cross-origin and can never see anything outside it. Sign-in works like
+`/admin`: the reviewer pastes their own Storage token, which stays in the
+browser's `sessionStorage` and is never sent to or stored by the hub's server
+outside the individual API calls it makes on the reviewer's behalf. Point a
+human reviewer at this page instead of asking them to run the comment curl
+commands above by hand.
+
+## Export
+
+Two read-only export endpoints turn an artifact's full history into files a
+human — or another AI agent — can work with outside the hub. Both are
+password-gated exactly like the other read endpoints.
+
+### Markdown source
+
+```bash
+curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/export/markdown"
+```
+
+Returns the head version's original Markdown source, or the built HTML
+document when the head version has no Markdown (e.g. it was published as raw
+HTML or from a non-Markdown git file).
+
+### Obsidian vault
+
+```bash
+curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/export/vault" -o vault.zip
+```
+
+Returns an in-memory ZIP that is a ready-to-open Obsidian vault:
+
+- `INDEX.md` — the hub note, wikilinked to every version and every comment
+  thread, plus artifact-level frontmatter (status, owner, version and comment
+  counts).
+- `document.md` — the served (head) version's content.
+- `versions/v{n}.md` — one note per version: author, date, status, and note in
+  the frontmatter, plus a unified diff against the previous version.
+- `comments/{tid}.md` — one note per thread: the quoted passage, the full
+  reply chain, and its resolution state.
+- `reasoning.md` — a deterministic, chronological timeline merging every
+  version and every comment event — the "how this document got here" trail.
+
+Obsidian's own graph view over these wikilinks **is** the knowledge graph;
+there is no separate graph engine to run. This is the artifact's endpoint for
+"archive everything that happened here" — pull it once a document is marked
+`final` to keep a permanent, browsable record of the discussion that produced
+it.
+
 ## Reading (public, no token required)
 
 | Endpoint | Returns |
@@ -376,7 +567,11 @@ curl commands above by hand.
 | `GET /a/{id}/diff/{a}..{b}` | Diff of two versions (`?format=html\|unified\|json`) |
 | `GET /a/{id}/raw` | Exact HTML that will be rendered — no chrome around it |
 | `GET /a/{id}/source` | Original source you submitted (markdown or html) |
-| `GET /a/{id}/meta` | JSON metadata (title, timestamps, head version, version counts, content type — no owner details) |
+| `GET /a/{id}/meta` | JSON metadata (title, timestamps, head version, version counts, content type, `accept_versions_mode`, `contributors`, `comments_mode`, `status` — no owner details) |
+| `GET /a/{id}/comments` | Every inline comment thread (open and resolved), as JSON |
+| `GET /a/{id}/review` | Browser review UI: select text to comment, sidebar of threads, sandboxed artifact iframe |
+| `GET /a/{id}/export/markdown` | Head version's Markdown source (or HTML when there is no Markdown) |
+| `GET /a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, and a chronological reasoning trail) |
 | `GET /admin` | Browser moderation studio for the artifact owner (token pasted client-side, never stored server-side) |
 | `GET /agent` | This hub's SKILL.md distilled into a ready-to-install Claude Code subagent |
 
@@ -415,12 +610,12 @@ mind:
 |---|---|
 | 400 | Unknown or disallowed `X-Storage-Stack` value, a malformed diff spec (use `{older}..{newer}`), or an unknown diff `format` |
 | 401 | Storage token rejected by the stack, or wrong artifact password |
-| 403 | Token is valid but not from the owning project (update, delete, promote, head); the artifact does not accept versions from other projects; or you asked for a proposal you did not author |
-| 404 | Unknown artifact id (identical response whether it never existed or was deleted), or no such version |
-| 409 | Promoting a version that is already live, or deleting the only live version of an artifact |
+| 403 | Token is valid but not from the owning project (update, delete, promote, head); the artifact does not accept versions from other projects; you asked for a proposal you did not author; or comments are closed (`comments_mode: "off"`) or you are not on the `contributors` allowlist |
+| 404 | Unknown artifact id (identical response whether it never existed or was deleted), or no such version or comment thread |
+| 409 | Promoting a version that is already live; deleting the only live version of an artifact; submitting a version or a comment on an artifact whose `status` is `"final"`; or resolving/reopening a thread already in that state |
 | 413 | Built HTML over the size limit, or a diff side over `HUB_DIFF_MAX_BYTES` |
 | 422 | Build failure — bad git repo, no entry file found, markdown render error, `git_token`/`git_username` sent without `git_url`, a `title` sent without content, or pinning the head to a version that does not exist or is not live |
-| 429 | Your project reached the daily version-submission cap for this artifact |
+| 429 | Your project reached the daily version-submission cap for this artifact, or the daily `HUB_MAX_COMMENTS_PER_DAY` comment cap |
 | 502 | The Keboola stack itself could not be reached to verify the token |
 
 ## Safety notes

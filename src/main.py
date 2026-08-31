@@ -50,7 +50,7 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel, Field
 
-from src import builder
+from src import builder, export
 from src.auth import (
     STACK_ALIASES,
     AuthError,
@@ -61,10 +61,17 @@ from src.auth import (
     verify_token,
 )
 from src.builder import BuildError, BuiltArtifact
+from src.comments import CommentStore, CommentThread, Reply, Selector
 from src.config import Settings, load_settings
 from src.diff import DiffError, compute_diff
 from src.kbc import BackendError, KbcFilesBackend
-from src.pages import admin_page, landing_page, unlock_page, versions_page
+from src.pages import (
+    admin_page,
+    landing_page,
+    review_page,
+    unlock_page,
+    versions_page,
+)
 from src.security import (
     CookieSigner,
     check_password,
@@ -72,6 +79,10 @@ from src.security import (
     new_artifact_id,
 )
 from src.store import (
+    ACCEPT_MODES,
+    ARTIFACT_DRAFT,
+    ARTIFACT_STATUSES,
+    COMMENTS_MODES,
     HEAD_LATEST,
     HEAD_PINNED,
     STATUS_LIVE,
@@ -107,6 +118,14 @@ _DIFF_SPEC = re.compile(r"^(\d+)\.\.(\d+)$")
 #: Longest contributor note accepted on a submitted version.
 MAX_NOTE_CHARS = 500
 
+#: Largest contributor allowlist an owner may set on one artifact.
+MAX_CONTRIBUTORS = 50
+
+#: Shape of an owner key: ``{project_id}@{stack hostname}`` (see
+#: :meth:`src.auth.Owner.key`). Used to validate the contributor allowlist so a
+#: typo becomes a 422 instead of an entry that can never match anybody.
+_CONTRIBUTOR_KEY = re.compile(r"^[0-9]+@[A-Za-z0-9._-]+$")
+
 # --------------------------------------------------------------------------
 # OpenAPI documentation constants
 #
@@ -124,6 +143,12 @@ ARTIFACT_ID_DESC = (
 VERSION_DESC = (
     "Version number as listed by GET /a/{id}/versions (1 for the first "
     "published version, counting up; numbers are never reused)."
+)
+
+#: Description attached to every ``thread_id`` path parameter.
+THREAD_ID_DESC = (
+    "Comment thread identifier, as returned by POST "
+    "/api/artifacts/{id}/comments and listed by GET /a/{id}/comments."
 )
 
 #: Description of the ``spec`` path parameter of the diff endpoint.
@@ -155,6 +180,16 @@ RESP_HUB_502 = {
     )
 }
 RESP_NOT_FOUND = {"description": "No artifact exists with this id."}
+RESP_THREAD_404 = {
+    "description": "No artifact with this id, or no such comment thread."
+}
+RESP_FINAL_409 = {
+    "description": (
+        "The artifact's status is 'final', which freezes new versions and new "
+        "comments for everyone. Its owner can reopen it with PUT "
+        "/api/artifacts/{id} and {\"status\": \"draft\"}."
+    )
+}
 
 #: ``content`` blocks for the non-JSON responses, so /docs stops implying JSON.
 CONTENT_HTML = {"text/html": {"schema": {"type": "string"}}}
@@ -222,6 +257,10 @@ _hydrate_lock = threading.Lock()
 _submission_counts: dict[tuple[str, str, str], int] = {}
 _submission_lock = threading.Lock()
 
+#: The same, for inline comments (threads and replies alike).
+_comment_counts: dict[tuple[str, str, str], int] = {}
+_comment_lock = threading.Lock()
+
 #: Above this many live buckets, stale days are swept on the next submission.
 _SUBMISSION_SWEEP_AT = 1000
 
@@ -236,43 +275,95 @@ def _utc_day() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def _claim_submission_slot(artifact_id: str, contributor_key: str) -> bool:
-    """Count one version submission; False when the daily cap is exhausted."""
-    limit = settings.max_versions_per_day
+def _claim_slot(
+    counts: dict[tuple[str, str, str], int],
+    lock: threading.Lock,
+    artifact_id: str,
+    contributor_key: str,
+    limit: int,
+) -> bool:
+    """Count one write against a per-(artifact, project, UTC day) bucket.
+
+    Returns False when the bucket is exhausted. The counters are in-memory and
+    therefore per-replica — a soft cap against accidental floods, not a
+    security control.
+    """
     day = _utc_day()
     bucket = (artifact_id, contributor_key, day)
-    with _submission_lock:
-        if len(_submission_counts) > _SUBMISSION_SWEEP_AT:
-            for stale in [key for key in _submission_counts if key[2] != day]:
-                del _submission_counts[stale]
-        count = _submission_counts.get(bucket, 0)
+    with lock:
+        if len(counts) > _SUBMISSION_SWEEP_AT:
+            for stale in [key for key in counts if key[2] != day]:
+                del counts[stale]
+        count = counts.get(bucket, 0)
         if count >= limit:
             return False
-        _submission_counts[bucket] = count + 1
+        counts[bucket] = count + 1
         return True
+
+
+def _claim_submission_slot(artifact_id: str, contributor_key: str) -> bool:
+    """Count one version submission; False when the daily cap is exhausted."""
+    return _claim_slot(
+        _submission_counts,
+        _submission_lock,
+        artifact_id,
+        contributor_key,
+        settings.max_versions_per_day,
+    )
+
+
+def _claim_comment_slot(artifact_id: str, contributor_key: str) -> bool:
+    """Count one comment or reply; False when the daily cap is exhausted."""
+    return _claim_slot(
+        _comment_counts,
+        _comment_lock,
+        artifact_id,
+        contributor_key,
+        settings.max_comments_per_day,
+    )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Build the store and try (but do not require) an initial hydration."""
+    """Build both stores and try (but do not require) an initial hydration."""
     app.state.settings = settings
+    # One backend instance serves both stores: they read the same host project
+    # and only differ in the tags they list (``artifact-hub`` vs.
+    # ``artifact-hub-cmt``), so neither ever sees the other's files.
+    backend = KbcFilesBackend(settings.hub_stack_url, settings.hub_storage_token)
     app.state.store = ArtifactStore(
-        KbcFilesBackend(settings.hub_stack_url, settings.hub_storage_token),
+        backend,
         settings.cache_dir,
         settings.cache_max_entries,
         settings.max_versions,
     )
+    app.state.comments = CommentStore(
+        backend,
+        settings.cache_dir,
+        settings.cache_max_entries,
+    )
     app.state.signer = CookieSigner(settings.secret_key)
     app.state.hydrated = False
     try:
-        count = app.state.store.hydrate()
+        artifacts, threads = _hydrate(app)
         app.state.hydrated = True
-        logger.info("Startup hydration complete: %d artifact(s)", count)
+        logger.info(
+            "Startup hydration complete: %d artifact(s), %d comment thread(s)",
+            artifacts,
+            threads,
+        )
     except BackendError as exc:
         logger.error(
             "Startup hydration failed, serving in degraded mode: %s", exc
         )
     yield
+
+
+def _hydrate(app_obj: FastAPI) -> tuple[int, int]:
+    """Rebuild both indexes from Storage; returns (artifacts, threads)."""
+    artifacts = app_obj.state.store.hydrate()
+    threads = app_obj.state.comments.hydrate()
+    return artifacts, threads
 
 
 #: Markdown shown at the top of the interactive docs (Swagger UI) and in the
@@ -344,6 +435,13 @@ app = FastAPI(
             "description": "Authenticated community versioning: submit, promote, withdraw, pin.",
         },
         {
+            "name": "comments",
+            "description": (
+                "Authenticated inline comment threads: create, reply, resolve "
+                "and delete."
+            ),
+        },
+        {
             "name": "service",
             "description": "Health, machine-readable manifest, and the agent-facing skill document.",
         },
@@ -408,10 +506,12 @@ app.openapi = custom_openapi
 
 
 def ensure_hydrated(app_obj: FastAPI) -> None:
-    """Retry index hydration once per call while the index is not hydrated.
+    """Retry index hydration once per call while the indexes are not hydrated.
 
-    A failure here is not fatal: the store falls back to a per-artifact Storage
-    lookup, so individual reads still work while the full index is missing.
+    Covers both the artifact index and the comment-thread index; the single
+    flag flips only when both rebuilt. A failure here is not fatal: both stores
+    fall back to a per-artifact Storage lookup, so individual reads still work
+    while the full index is missing.
     """
     if getattr(app_obj.state, "hydrated", False):
         return
@@ -419,12 +519,16 @@ def ensure_hydrated(app_obj: FastAPI) -> None:
         if getattr(app_obj.state, "hydrated", False):
             return
         try:
-            count = app_obj.state.store.hydrate()
+            artifacts, threads = _hydrate(app_obj)
         except BackendError as exc:
             logger.warning("Deferred hydration attempt failed: %s", exc)
             return
         app_obj.state.hydrated = True
-        logger.info("Deferred hydration complete: %d artifact(s)", count)
+        logger.info(
+            "Deferred hydration complete: %d artifact(s), %d comment thread(s)",
+            artifacts,
+            threads,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -722,6 +826,51 @@ def _proposal_hidden(artifact_id: str, version: int) -> JSONResponse:
     )
 
 
+def _thread_not_found(artifact_id: str, thread_id: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": "comment thread not found",
+            "id": artifact_id,
+            "thread_id": thread_id,
+        },
+    )
+
+
+def _document_is_final(artifact_id: str, what: str) -> JSONResponse:
+    """409 for any write frozen by ``status: final``."""
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": "document is final",
+            "detail": (
+                f"This artifact is marked final, so {what} are frozen. Its "
+                "owner can reopen it with PUT /api/artifacts/{id} and "
+                '{"status": "draft"}.'
+            ),
+            "id": artifact_id,
+        },
+    )
+
+
+def _comments_closed(meta: ArtifactMeta) -> JSONResponse:
+    """403 for a caller the comment policy does not admit."""
+    if meta.comments_mode == "off":
+        detail = (
+            "commenting is closed on this artifact; its owner can reopen it "
+            "with comments_mode 'anyone' or 'allowlist'"
+        )
+    else:
+        detail = (
+            "this artifact only accepts comments from projects on its "
+            "contributor allowlist; ask its owner to add your project"
+        )
+    return JSONResponse(
+        status_code=403,
+        content={"error": "comments not allowed", "detail": detail, "id": meta.id},
+    )
+
+
 def _meta_of(request: Request, artifact_id: str) -> ArtifactMeta | None:
     """Fetch an artifact's meta record, hydrating the index first when needed."""
     ensure_hydrated(request.app)
@@ -923,8 +1072,126 @@ class UpdateBody(BaseModel):
     accept_versions: bool | None = Field(
         None,
         description=(
-            "Open the artifact to versions submitted by other projects "
-            "(true), or close it again (false). Omit to leave unchanged."
+            "Legacy two-state switch for version contributions: true means "
+            "'anyone', false means 'off'. Prefer 'accept_versions_mode'; "
+            "sending both is a 422. Omit to leave unchanged."
+        ),
+    )
+    accept_versions_mode: str | None = Field(
+        None,
+        description=(
+            "Who may submit versions: 'off' (owner only), 'anyone' (any "
+            "verified Keboola project, moderated as proposals) or "
+            "'allowlist' (only the projects in 'contributors'). Omit to "
+            "leave unchanged."
+        ),
+    )
+    contributors: list[str] | None = Field(
+        None,
+        description=(
+            "Owner keys allowed by the 'allowlist' modes, each shaped "
+            "'{project_id}@{stack hostname}' (for example "
+            f"'123@connection.keboola.com'). At most {MAX_CONTRIBUTORS} "
+            "entries. Replaces the whole list; omit to leave unchanged."
+        ),
+    )
+    comments_mode: str | None = Field(
+        None,
+        description=(
+            "Who may open inline comment threads: 'anyone' (the default), "
+            "'allowlist' (only the projects in 'contributors') or 'off'. "
+            "The owner may always comment unless the artifact is final. "
+            "Omit to leave unchanged."
+        ),
+    )
+    status: str | None = Field(
+        None,
+        description=(
+            "'draft' (the default) or 'final'. Marking an artifact final "
+            "freezes it: new versions and new comments answer 409 for "
+            "everyone, the owner included. Set it back to 'draft' to reopen. "
+            "Omit to leave unchanged."
+        ),
+    )
+
+
+class CommentBody(BaseModel):
+    """Body of ``POST /api/artifacts/{id}/comments``.
+
+    The anchor is a W3C-style TextQuoteSelector captured from the *rendered*
+    text of one version: the quote itself plus a little surrounding context so
+    a repeated quote can still be told apart.
+    """
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "version": 2,
+                    "exact": "runs grew to 184",
+                    "prefix": "In Q3 the ",
+                    "suffix": " across every project.",
+                    "body": "Is this the deduplicated count?",
+                }
+            ]
+        }
+    }
+
+    version: int = Field(
+        ...,
+        description=(
+            "Version the quote was taken from. The thread stays bound to it — "
+            "there is no cross-version re-anchoring."
+        ),
+    )
+    exact: str = Field(
+        ...,
+        description=(
+            "The quoted text itself, exactly as rendered. Must not be blank."
+        ),
+    )
+    prefix: str = Field(
+        "",
+        description=(
+            "Rendered text immediately before the quote (about 32 "
+            "characters). Used to disambiguate a quote that occurs more than "
+            "once."
+        ),
+    )
+    suffix: str = Field(
+        "",
+        description="Rendered text immediately after the quote (about 32 characters).",
+    )
+    body: str = Field(
+        ..., description="The comment itself, as plain text. Must not be blank."
+    )
+
+
+class ReplyBody(BaseModel):
+    """Body of ``POST /api/artifacts/{id}/comments/{tid}/replies``."""
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"body": "Yes — deduplicated, same as Q2."}]
+        }
+    }
+
+    body: str = Field(
+        ..., description="The reply itself, as plain text. Must not be blank."
+    )
+
+
+class ResolveBody(BaseModel):
+    """Body of ``POST /api/artifacts/{id}/comments/{tid}/resolve``."""
+
+    model_config = {"json_schema_extra": {"examples": [{"resolved": True}]}}
+
+    resolved: bool = Field(
+        True,
+        description=(
+            "true (the default, and what an empty body means) resolves the "
+            "thread; false reopens a resolved one. Both are available to the "
+            "artifact owner and to the thread's author."
         ),
     )
 
@@ -1028,6 +1295,86 @@ def _check_git_credentials(body: PublishBody | UpdateBody | VersionBody) -> None
                 "'git_url'"
             ),
         )
+
+
+def _validate_contributors(keys: list[str]) -> list[str]:
+    """Clean and validate a contributor allowlist, or raise 422.
+
+    Entries are owner keys (``{project_id}@{stack hostname}``); a typo would
+    otherwise be stored as an entry that can never match anybody.
+    """
+    cleaned: list[str] = []
+    for raw in keys:
+        key = str(raw).strip()
+        if not key:
+            continue
+        if not _CONTRIBUTOR_KEY.match(key):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"contributor {key!r} is not a project key; use "
+                    "'{project_id}@{stack hostname}', for example "
+                    "'123@connection.keboola.com'"
+                ),
+            )
+        if key not in cleaned:
+            cleaned.append(key)
+    if len(cleaned) > MAX_CONTRIBUTORS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"too many contributors ({len(cleaned)}); the limit is "
+                f"{MAX_CONTRIBUTORS}"
+            ),
+        )
+    return cleaned
+
+
+def _apply_policy(meta: ArtifactMeta, body: UpdateBody) -> None:
+    """Apply the contribution/comment/status fields of a PUT onto ``meta``.
+
+    Every unknown value is a 422 rather than a silent fallback, so an owner is
+    never told "saved" about a policy the hub did not actually adopt.
+    """
+    if body.accept_versions is not None and body.accept_versions_mode is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "provide either 'accept_versions' (legacy boolean) or "
+                "'accept_versions_mode', not both"
+            ),
+        )
+    if body.accept_versions_mode is not None:
+        if body.accept_versions_mode not in ACCEPT_MODES:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "accept_versions_mode must be one of "
+                    f"{', '.join(ACCEPT_MODES)}"
+                ),
+            )
+        meta.accept_versions_mode = body.accept_versions_mode
+    elif body.accept_versions is not None:
+        meta.accept_versions = bool(body.accept_versions)
+
+    if body.contributors is not None:
+        meta.contributors = _validate_contributors(body.contributors)
+
+    if body.comments_mode is not None:
+        if body.comments_mode not in COMMENTS_MODES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"comments_mode must be one of {', '.join(COMMENTS_MODES)}",
+            )
+        meta.comments_mode = body.comments_mode
+
+    if body.status is not None:
+        if body.status not in ARTIFACT_STATUSES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"status must be one of {', '.join(ARTIFACT_STATUSES)}",
+            )
+        meta.status = body.status
 
 
 def _require_exactly_one_content(body: PublishBody | VersionBody) -> None:
@@ -1148,6 +1495,10 @@ def _artifact_response(
         "title": envelope.title,
         "protected": bool(meta.password),
         "accept_versions": meta.accept_versions,
+        "accept_versions_mode": meta.accept_versions_mode,
+        "contributors": list(meta.contributors),
+        "comments_mode": meta.comments_mode,
+        "artifact_status": meta.status,
         "version": envelope.version,
         "status": envelope.status,
         "head_version": _head_version_of(request, meta.id),
@@ -1415,6 +1766,45 @@ def context(request: Request) -> dict:
                 "purpose": "diff two versions (?format=html|unified|json)",
             },
             {
+                "method": "GET",
+                "path": "/a/{id}/comments",
+                "auth": "url capability",
+                "purpose": "every inline comment thread as JSON, oldest first",
+            },
+            {
+                "method": "GET",
+                "path": "/a/{id}/review",
+                "auth": (
+                    "url capability to read; the visitor's own storage token, "
+                    "entered in the browser, to comment"
+                ),
+                "purpose": (
+                    "two-pane review UI (HTML): the document in a sandboxed "
+                    "iframe beside its comment threads. Select text to open a "
+                    "thread, click a highlight to jump to one, reply and "
+                    "resolve in place."
+                ),
+            },
+            {
+                "method": "GET",
+                "path": "/a/{id}/export/markdown",
+                "auth": "url capability",
+                "purpose": (
+                    "head version's markdown source (or its HTML document) as "
+                    "a file attachment"
+                ),
+            },
+            {
+                "method": "GET",
+                "path": "/a/{id}/export/vault",
+                "auth": "url capability",
+                "purpose": (
+                    "the whole artifact as a ready-to-open Obsidian vault "
+                    "(application/zip): INDEX.md, document.md, versions/, "
+                    "comments/ and reasoning.md"
+                ),
+            },
+            {
                 "method": "POST",
                 "path": "/api/artifacts",
                 "auth": "storage token",
@@ -1462,6 +1852,35 @@ def context(request: Request) -> dict:
                 "auth": "storage token (owner project)",
                 "purpose": "serve the latest live version, or pin one",
             },
+            {
+                "method": "POST",
+                "path": "/api/artifacts/{id}/comments",
+                "auth": "storage token (subject to comments_mode)",
+                "purpose": (
+                    "open an inline comment thread on a quoted passage of one "
+                    "version"
+                ),
+            },
+            {
+                "method": "POST",
+                "path": "/api/artifacts/{id}/comments/{tid}/replies",
+                "auth": "storage token (subject to comments_mode)",
+                "purpose": "reply in an existing thread",
+            },
+            {
+                "method": "POST",
+                "path": "/api/artifacts/{id}/comments/{tid}/resolve",
+                "auth": "storage token (owner, or the thread's author)",
+                "purpose": (
+                    "resolve a thread, or reopen it with {'resolved': false}"
+                ),
+            },
+            {
+                "method": "DELETE",
+                "path": "/api/artifacts/{id}/comments/{tid}",
+                "auth": "storage token (owner, or the thread's author)",
+                "purpose": "delete a thread and its replies",
+            },
         ],
         "publish_body": {
             "html": "string, complete HTML document, served as-is",
@@ -1496,9 +1915,10 @@ def context(request: Request) -> dict:
                 "exactly one of html, markdown, git_url",
                 "git_token and git_username are only valid together with git_url "
                 "(422 otherwise)",
-                "PUT accepts the same fields, all optional, plus clear_password "
-                "and accept_versions; a title is only valid together with new "
-                "content, because a title lives on a version",
+                "PUT accepts the same fields, all optional, plus clear_password, "
+                "accept_versions/accept_versions_mode, contributors, "
+                "comments_mode and status; a title is only valid together "
+                "with new content, because a title lives on a version",
                 "POST /api/artifacts/{id}/versions accepts the same content "
                 f"fields plus an optional note (max {MAX_NOTE_CHARS} chars)",
             ],
@@ -1547,6 +1967,50 @@ def context(request: Request) -> dict:
                 "(409); a contributor may withdraw their own proposal."
             ),
         },
+        "collaboration": {
+            "accept_versions_mode": (
+                "'off' (owner only, the default), 'anyone' (any verified "
+                "project, moderated as proposals) or 'allowlist' (only the "
+                "projects listed in contributors). The legacy boolean "
+                "accept_versions still works: false maps to 'off', true to "
+                "'anyone'."
+            ),
+            "comments_mode": (
+                "'anyone' (the default), 'allowlist' or 'off'. The owner may "
+                "always comment unless the artifact is final."
+            ),
+            "contributors": (
+                "list of owner keys shaped '{project_id}@{stack hostname}', "
+                f"at most {MAX_CONTRIBUTORS}; used by both allowlist modes"
+            ),
+            "status": (
+                "'draft' or 'final'. 'final' freezes the artifact: new "
+                "versions, new comments and content updates all answer 409 "
+                "for everyone, the owner included. The owner reopens it with "
+                "PUT /api/artifacts/{id} and {'status': 'draft'}."
+            ),
+            "comment_anchoring": (
+                "A thread carries a W3C-style TextQuoteSelector (exact + "
+                "prefix + suffix) captured from the rendered text of one "
+                "version, and stays bound to that version: there is no "
+                "cross-version re-anchoring, so a thread made on an older "
+                "version may not highlight anything on the current one."
+            ),
+            "comment_visibility": (
+                "Threads are readable by anyone holding the capability URL "
+                "(GET /a/{id}/comments); identities are reduced to project "
+                "id, project name and stack hostname."
+            ),
+            "comment_rate_limit": (
+                f"{settings.max_comments_per_day} comments and replies per "
+                "project per artifact per UTC day (429 afterwards)"
+            ),
+            "export": (
+                "GET /a/{id}/export/markdown downloads the served version's "
+                "source; GET /a/{id}/export/vault downloads a deterministic "
+                "Obsidian vault ZIP of the whole history and discussion."
+            ),
+        },
         "limits": {
             "max_html_bytes": settings.max_html_bytes,
             "max_inline_image_bytes": settings.max_inline_image_bytes,
@@ -1558,6 +2022,8 @@ def context(request: Request) -> dict:
             "max_versions_per_day": settings.max_versions_per_day,
             "diff_max_bytes": settings.diff_max_bytes,
             "max_note_chars": MAX_NOTE_CHARS,
+            "max_comments_per_day": settings.max_comments_per_day,
+            "max_contributors": MAX_CONTRIBUTORS,
         },
         "notes": [
             "Artifact URLs are capabilities: the unguessable id is the only "
@@ -2209,6 +2675,220 @@ def read_diff(
     return Response(content=body, media_type=content_type)
 
 
+@app.get(
+    "/a/{artifact_id}/comments",
+    tags=["public"],
+    summary="Inline comment threads",
+    description=(
+        "Every inline comment thread of this artifact, oldest first, together "
+        "with the artifact's current 'comments_mode' and draft/final "
+        "'status'. Each thread carries its TextQuoteSelector (the quote plus "
+        "a little surrounding context), the comment body, its replies, the "
+        "resolved flag and the *project identity* of everyone who spoke — "
+        "project id, project name and stack hostname only, never a full stack "
+        "URL and never an internal owner key.\n\n"
+        "Threads are public to capability-URL holders; writing one needs a "
+        "Storage token (POST /api/artifacts/{id}/comments).\n\n"
+        + PASSWORD_GATE_NOTE
+    ),
+    responses={
+        200: {
+            "description": (
+                "JSON with 'id', 'comments_mode', 'status' and the 'threads' "
+                "array (possibly empty)."
+            )
+        },
+        401: {
+            "description": (
+                "Password required or wrong (see the X-Artifact-Password "
+                "header)."
+            )
+        },
+        404: RESP_NOT_FOUND,
+        502: RESP_HUB_502,
+    },
+)
+def read_comments(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+) -> Response:
+    """List every comment thread of one artifact, oldest first."""
+    meta = _meta_of(request, artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    if not reader_allowed(meta, request):
+        return _password_required()
+    threads = request.app.state.comments.list_for(artifact_id)
+    return JSONResponse(
+        {
+            "id": artifact_id,
+            "comments_mode": meta.comments_mode,
+            "status": meta.status,
+            "threads": [thread.public_dict() for thread in threads],
+        }
+    )
+
+
+@app.get(
+    "/a/{artifact_id}/export/markdown",
+    tags=["public"],
+    response_class=MarkdownResponse,
+    summary="Download the head version's source",
+    description=(
+        "Downloads the served version as a single file: the original Markdown "
+        "for markdown-authored artifacts (text/markdown), or the built HTML "
+        "document otherwise (text/html). The response carries a "
+        "Content-Disposition attachment filename derived from the version's "
+        "title, so a browser 'Save as' lands on something readable.\n\n"
+        + PASSWORD_GATE_NOTE
+    ),
+    responses={
+        200: {
+            "description": "The head version's source, as a file attachment.",
+            "content": {**CONTENT_MARKDOWN, **CONTENT_HTML},
+        },
+        401: {
+            "description": (
+                "Password required or wrong (see the X-Artifact-Password "
+                "header)."
+            )
+        },
+        404: {
+            "description": (
+                "No artifact exists with this id, or it has no live version."
+            )
+        },
+        502: RESP_HUB_502,
+    },
+)
+def export_markdown(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+) -> Response:
+    """The head version's source as a downloadable file."""
+    meta = _meta_of(request, artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    if not reader_allowed(meta, request):
+        return _password_required()
+    head = request.app.state.store.get_head(artifact_id)
+    if head is None:
+        return _not_found(artifact_id)
+
+    filename, content_type, body = export.head_source(head)
+    return Response(
+        content=body,
+        media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get(
+    "/a/{artifact_id}/export/vault",
+    tags=["public"],
+    summary="Download an Obsidian vault of the whole artifact",
+    description=(
+        "Builds an in-memory ZIP holding a ready-to-open Obsidian vault: "
+        "INDEX.md (a wikilink hub), document.md (the served version), "
+        "versions/v{n}.md (one note per version — proposals included — with "
+        "author, date, status, note and a diff against its predecessor), "
+        "comments/{tid}.md (one note per thread: the quote, the discussion "
+        "and the resolution) and reasoning.md, a chronological trail of how "
+        "the document ended up this way.\n\n"
+        "The archive is deterministic: the same artifact state always "
+        "produces byte-identical bytes.\n\n" + PASSWORD_GATE_NOTE
+    ),
+    responses={
+        200: {
+            "description": "The vault, as a ZIP file attachment.",
+            "content": {"application/zip": {"schema": {"type": "string", "format": "binary"}}},
+        },
+        401: {
+            "description": (
+                "Password required or wrong (see the X-Artifact-Password "
+                "header)."
+            )
+        },
+        404: RESP_NOT_FOUND,
+        502: RESP_HUB_502,
+    },
+)
+def export_vault(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+) -> Response:
+    """The whole artifact — versions, comments and timeline — as a vault ZIP."""
+    meta = _meta_of(request, artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    if not reader_allowed(meta, request):
+        return _password_required()
+
+    store = request.app.state.store
+    envelopes: list[Envelope] = []
+    for row in store.list_versions(artifact_id):
+        envelope = store.get_version(artifact_id, row["version"])
+        if envelope is not None:
+            envelopes.append(envelope)
+    threads = request.app.state.comments.list_for(artifact_id)
+
+    filename, payload = export.build_vault(meta, envelopes, threads)
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get(
+    "/a/{artifact_id}/review",
+    tags=["public"],
+    response_class=HTMLResponse,
+    summary="Review UI (document plus inline comments)",
+    description=(
+        "A two-pane review page: the artifact on the left, its comment "
+        "threads on the right. Select any text to open a thread on that "
+        "quote, click a highlight to jump to its thread, and reply or resolve "
+        "in place.\n\n"
+        "The page itself is public and carries no credential. Its JavaScript "
+        "fetches this artifact's /raw, /versions and /comments, injects a "
+        "small annotation script into the fetched HTML and renders it in a "
+        "srcdoc iframe sandboxed *without* allow-same-origin — so the "
+        "artifact's own scripts run in an opaque origin and can reach neither "
+        "the page nor the Storage token a visitor may sign in with. "
+        "Commenting requires signing in inside the page; the token lives in "
+        "sessionStorage (shared with /admin) and is only ever sent to this "
+        "hub's own API.\n\n" + PASSWORD_GATE_NOTE
+    ),
+    responses={
+        200: {"description": "The review page.", "content": CONTENT_HTML},
+        401: {
+            "description": (
+                "Password-protected artifact; the HTML unlock form is returned."
+            ),
+            "content": CONTENT_HTML,
+        },
+        404: RESP_NOT_FOUND,
+        502: RESP_HUB_502,
+    },
+)
+def read_review(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+) -> Response:
+    """Serve the review shell; all of its data is fetched client-side."""
+    meta = _meta_of(request, artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    if not reader_allowed(meta, request):
+        # Unlocking here sets the same path-scoped cookie the page's own
+        # same-origin fetches then ride on.
+        return HTMLResponse(unlock_page(artifact_id, None), status_code=401)
+    return HTMLResponse(
+        review_page(base_url(request), artifact_id, SERVICE_VERSION)
+    )
+
+
 # --------------------------------------------------------------------------
 # Management API
 # --------------------------------------------------------------------------
@@ -2305,7 +2985,19 @@ def publish_artifact(
     "/api/artifacts/{artifact_id}",
     tags=["artifacts"],
     summary="Update an artifact",
-    description="Owner-only. A content field ('html', 'markdown', 'git_url') adds a new live version; 'password', 'clear_password' and 'accept_versions' change artifact-level settings. A title is only valid together with new content, because a title lives on a version.",
+    description=(
+        "Owner-only. A content field ('html', 'markdown', 'git_url') adds a "
+        "new live version; everything else changes artifact-level settings: "
+        "'password' / 'clear_password', who may contribute versions "
+        "('accept_versions_mode' or the legacy 'accept_versions', plus "
+        "'contributors'), who may comment ('comments_mode'), and the "
+        "draft/final 'status'. A title is only valid together with new "
+        "content, because a title lives on a version.\n\n"
+        "Marking the artifact 'final' freezes it: new versions and new "
+        "comments answer 409 for everyone, the owner included, and so does a "
+        "content update. Setting 'status' back to 'draft' reopens it — "
+        "including in the same call that carries the new content."
+    ),
     responses={
         200: {
             "description": (
@@ -2322,11 +3014,15 @@ def publish_artifact(
             )
         },
         404: RESP_NOT_FOUND,
+        409: RESP_FINAL_409,
         413: {"description": "Built HTML exceeds the configured size limit."},
         422: {
             "description": (
                 "Invalid body: more than one content field, git credentials "
-                "without git_url, a title without content, or a build failure."
+                "without git_url, a title without content, both "
+                "'accept_versions' and 'accept_versions_mode', an unknown "
+                "mode or status, a malformed contributor key, or a build "
+                "failure."
             )
         },
         502: {
@@ -2373,13 +3069,17 @@ def update_artifact(
             ),
         )
 
+    # A final artifact is frozen for content. The owner may reopen it in this
+    # very call by sending status="draft" alongside the new content.
+    if present and meta.is_final() and body.status != ARTIFACT_DRAFT:
+        return _document_is_final(artifact_id, "new versions")
+
     now = _now()
     if body.clear_password:
         meta.password = None
     elif body.password:
         meta.password = hash_password(body.password)
-    if body.accept_versions is not None:
-        meta.accept_versions = bool(body.accept_versions)
+    _apply_policy(meta, body)
     meta.updated_at = now
     store.save_meta(meta)
 
@@ -2406,14 +3106,16 @@ def update_artifact(
 
     logger.info(
         "Updated artifact %s (owner project %s, version %d, source %s, "
-        "%d bytes, protected=%s, accept_versions=%s)",
+        "%d bytes, protected=%s, versions=%s, comments=%s, status=%s)",
         artifact_id,
         owner.project_id,
         envelope.version,
         envelope.source_type,
         len(envelope.html.encode("utf-8")),
         bool(meta.password),
-        meta.accept_versions,
+        meta.accept_versions_mode,
+        meta.comments_mode,
+        meta.status,
     )
     return _artifact_response(request, meta, envelope, 200)
 
@@ -2467,16 +3169,17 @@ def list_artifacts(
     tags=["artifacts"],
     summary="Delete an artifact",
     description=(
-        "Deletes every version and the meta record from the hub's project, so "
-        "the artifact and all its URLs stop resolving. Irreversible. The "
-        "canonical copies in the authors' own Keboola projects are left "
-        "untouched. Requires a Storage token from the owning project; another "
-        "project's valid token is a 403."
+        "Deletes every version, every comment thread and the meta record from "
+        "the hub's project, so the artifact and all its URLs stop resolving. "
+        "Irreversible. The canonical copies in the authors' own Keboola "
+        "projects are left untouched. Requires a Storage token from the "
+        "owning project; another project's valid token is a 403."
     ),
     responses={
         200: {
             "description": (
-                "Deleted; JSON confirming the canonical copies were kept."
+                "Deleted; JSON reporting how many comment threads went with "
+                "it and confirming the canonical copies were kept."
             )
         },
         400: RESP_STACK_400,
@@ -2512,10 +3215,19 @@ def delete_artifact(
     _owner_only(meta, owner)
 
     store.delete(artifact_id)
-    logger.info("Deleted artifact %s (owner project %s)", artifact_id, owner.project_id)
+    # Comment threads live in their own files; without this they would outlive
+    # the artifact as orphaned Storage files nothing can ever reach again.
+    threads = request.app.state.comments.delete_all_for(artifact_id)
+    logger.info(
+        "Deleted artifact %s and %d comment thread(s) (owner project %s)",
+        artifact_id,
+        threads,
+        owner.project_id,
+    )
     return JSONResponse(
         {
             "deleted": True,
+            "comment_threads_deleted": threads,
             "note": "canonical copies in the authors' projects were not touched",
         }
     )
@@ -2531,7 +3243,16 @@ def delete_artifact(
     status_code=201,
     tags=["versions"],
     summary="Submit a new version",
-    description="Adds a version to an existing artifact. The owning project's submissions go live immediately; another project may submit only when the owner set 'accept_versions', and its submission lands as a moderated proposal that stays private until the owner promotes it. The canonical copy is stored in the *caller's* own project with the caller's token.",
+    description=(
+        "Adds a version to an existing artifact. The owning project's "
+        "submissions go live immediately; another project may submit only "
+        "when the owner opened the artifact (accept_versions_mode 'anyone', "
+        "or 'allowlist' with that project on the contributor list), and its "
+        "submission lands as a moderated proposal that stays private until "
+        "the owner promotes it. A 'final' artifact accepts nothing from "
+        "anybody (409). The canonical copy is stored in the *caller's* own "
+        "project with the caller's token."
+    ),
     responses={
         201: {
             "description": (
@@ -2543,11 +3264,13 @@ def delete_artifact(
         401: RESP_TOKEN_401,
         403: {
             "description": (
-                "This artifact does not accept versions from other projects "
-                "(its owner has not set accept_versions)."
+                "This artifact does not accept versions from the caller's "
+                "project (accept_versions is off, or the project is not on "
+                "the contributor allowlist)."
             )
         },
         404: RESP_NOT_FOUND,
+        409: RESP_FINAL_409,
         413: {"description": "Built HTML exceeds the configured size limit."},
         422: {
             "description": (
@@ -2585,13 +3308,20 @@ def submit_version(
     if meta is None:
         return _not_found(artifact_id)
 
+    # "final" freezes the artifact for everyone, so it gets its own, clearer
+    # answer instead of the generic "you may not contribute" 403.
+    if meta.is_final():
+        return _document_is_final(artifact_id, "new versions")
+
     is_owner = meta.owner_key == caller.key
-    if not is_owner and not meta.accept_versions:
+    if not meta.allows_versions_from(caller.key):
         raise HTTPException(
             status_code=403,
             detail=(
-                "this artifact does not accept versions from other projects; "
-                "its owner can enable that with accept_versions"
+                "this artifact does not accept versions from your project; "
+                "its owner can open it with accept_versions (or "
+                "accept_versions_mode 'anyone'), or add your project to the "
+                "contributor allowlist"
             ),
         )
 
@@ -2911,4 +3641,398 @@ def set_head(
             "head_mode": meta.head_mode,
             "head_version_served": head_version,
         }
+    )
+
+
+# --------------------------------------------------------------------------
+# Inline comments
+#
+# Reading threads is public (GET /a/{id}/comments); writing one needs any
+# verified Storage token, which is what ``require_owner`` returns — despite the
+# name it authenticates *a* caller, and each handler below decides for itself
+# whether that caller is the artifact owner, a thread author, or neither.
+# --------------------------------------------------------------------------
+
+
+def _thread_response(thread: CommentThread, status_code: int) -> JSONResponse:
+    """One thread as the public projection, plus its id under 'thread_id'."""
+    return JSONResponse(
+        status_code=status_code,
+        content={**thread.public_dict(), "thread_id": thread.id},
+    )
+
+
+def _comment_rate_limited() -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "too many comments today",
+            "detail": (
+                f"Your project may write {settings.max_comments_per_day} "
+                "comments and replies on one artifact per UTC day."
+            ),
+            "limit": settings.max_comments_per_day,
+        },
+    )
+
+
+@app.post(
+    "/api/artifacts/{artifact_id}/comments",
+    status_code=201,
+    tags=["comments"],
+    summary="Open an inline comment thread",
+    description=(
+        "Anchors a new thread to a quoted passage of one version, W3C "
+        "annotation style: 'exact' is the quote as rendered, 'prefix' and "
+        "'suffix' are about 32 characters of surrounding text so a repeated "
+        "quote can still be told apart. The thread stays bound to the version "
+        "it was made on — there is no cross-version re-anchoring — so a "
+        "thread opened on an older version may no longer highlight anything "
+        "on the current one.\n\n"
+        "Any verified Keboola project may comment while 'comments_mode' is "
+        "'anyone' (the default); 'allowlist' restricts it to the artifact's "
+        "contributors and 'off' closes it. The owner may always comment "
+        "unless the artifact is final."
+    ),
+    responses={
+        201: {
+            "description": (
+                "Thread created; returns the whole thread (selector, body, "
+                "author project, timestamps) plus 'thread_id'."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: {
+            "description": (
+                "Commenting is closed on this artifact, or the caller's "
+                "project is not on its contributor allowlist."
+            )
+        },
+        404: RESP_NOT_FOUND,
+        409: RESP_FINAL_409,
+        422: {
+            "description": (
+                "The referenced version does not exist, the quote is empty or "
+                "too long, or the comment body is empty or too long."
+            )
+        },
+        429: {
+            "description": (
+                "This project reached HUB_MAX_COMMENTS_PER_DAY comments and "
+                "replies on this artifact today."
+            )
+        },
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable."
+            )
+        },
+    },
+)
+def create_comment(
+    body: CommentBody,
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Open a thread anchored to a quoted passage of one version."""
+    caller, _token = auth
+    ensure_hydrated(request.app)
+    store = request.app.state.store
+
+    meta = store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    if meta.is_final():
+        return _document_is_final(artifact_id, "new comments")
+    if not meta.allows_comments_from(caller.key):
+        return _comments_closed(meta)
+
+    if store.get_version(artifact_id, body.version) is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"artifact {artifact_id} has no version {body.version}",
+        )
+
+    if not _claim_comment_slot(artifact_id, caller.key):
+        return _comment_rate_limited()
+
+    thread = CommentThread(
+        id=new_artifact_id(),
+        artifact_id=artifact_id,
+        version=body.version,
+        selector=Selector(
+            exact=body.exact, prefix=body.prefix, suffix=body.suffix
+        ),
+        body=body.body,
+        author=_identity(caller),
+        created_at=_now(),
+    )
+    try:
+        request.app.state.comments.create(thread)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    logger.info(
+        "Artifact %s got comment thread %s on v%d from project %s",
+        artifact_id,
+        thread.id,
+        thread.version,
+        caller.project_id,
+    )
+    return _thread_response(thread, 201)
+
+
+@app.post(
+    "/api/artifacts/{artifact_id}/comments/{thread_id}/replies",
+    status_code=201,
+    tags=["comments"],
+    summary="Reply in a comment thread",
+    description=(
+        "Appends a reply to an existing thread. The same policy as opening a "
+        "thread applies: 'comments_mode' decides who may write, the owner may "
+        "always reply unless the artifact is final, and replies count against "
+        "the same per-project daily cap."
+    ),
+    responses={
+        201: {
+            "description": (
+                "Reply appended; returns the whole updated thread plus "
+                "'thread_id'."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: {
+            "description": (
+                "Commenting is closed on this artifact, or the caller's "
+                "project is not on its contributor allowlist."
+            )
+        },
+        404: RESP_THREAD_404,
+        409: RESP_FINAL_409,
+        422: {"description": "The reply body is empty or too long."},
+        429: {
+            "description": (
+                "This project reached HUB_MAX_COMMENTS_PER_DAY comments and "
+                "replies on this artifact today."
+            )
+        },
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable."
+            )
+        },
+    },
+)
+def reply_to_comment(
+    body: ReplyBody,
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    thread_id: str = PathParam(..., description=THREAD_ID_DESC),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Append one reply to an existing thread."""
+    caller, _token = auth
+    ensure_hydrated(request.app)
+
+    meta = request.app.state.store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    if meta.is_final():
+        return _document_is_final(artifact_id, "new comments")
+    if not meta.allows_comments_from(caller.key):
+        return _comments_closed(meta)
+
+    comments = request.app.state.comments
+    thread = comments.get(artifact_id, thread_id)
+    if thread is None:
+        return _thread_not_found(artifact_id, thread_id)
+
+    if not _claim_comment_slot(artifact_id, caller.key):
+        return _comment_rate_limited()
+
+    thread.replies.append(
+        Reply(author=_identity(caller), body=body.body, created_at=_now())
+    )
+    try:
+        comments.update(thread)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    logger.info(
+        "Comment thread %s of artifact %s got a reply from project %s",
+        thread_id,
+        artifact_id,
+        caller.project_id,
+    )
+    return _thread_response(thread, 201)
+
+
+@app.post(
+    "/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+    tags=["comments"],
+    summary="Resolve or reopen a comment thread",
+    description=(
+        "Marks a thread resolved and records who resolved it. Available to "
+        "the artifact owner and to the thread's own author; anyone else gets "
+        "a 403.\n\n"
+        "The body is optional: sending nothing (or {\"resolved\": true}) "
+        "resolves the thread, and {\"resolved\": false} reopens a resolved "
+        "one — the same two principals may do either. Asking for the state "
+        "the thread is already in is a 409."
+    ),
+    responses={
+        200: {
+            "description": (
+                "Thread resolved or reopened; returns the whole updated "
+                "thread plus 'thread_id'."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: {
+            "description": (
+                "Only the artifact owner and the thread's author may resolve "
+                "or reopen it."
+            )
+        },
+        404: RESP_THREAD_404,
+        409: {
+            "description": (
+                "The thread is already resolved (or already open, when "
+                "reopening)."
+            )
+        },
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable."
+            )
+        },
+    },
+)
+def resolve_comment(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    thread_id: str = PathParam(..., description=THREAD_ID_DESC),
+    body: ResolveBody | None = None,
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Owner or thread author closes a thread — or reopens it."""
+    caller, _token = auth
+    ensure_hydrated(request.app)
+
+    meta = request.app.state.store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+
+    comments = request.app.state.comments
+    thread = comments.get(artifact_id, thread_id)
+    if thread is None:
+        return _thread_not_found(artifact_id, thread_id)
+
+    if caller.key not in (meta.owner_key, thread.author_key):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "only the artifact owner or the thread's author can resolve "
+                "or reopen it"
+            ),
+        )
+
+    wanted = True if body is None else bool(body.resolved)
+    if thread.resolved == wanted:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": (
+                    "thread is already resolved" if wanted else "thread is already open"
+                ),
+                "id": artifact_id,
+                "thread_id": thread_id,
+            },
+        )
+
+    thread.resolved = wanted
+    thread.resolved_by = _identity(caller) if wanted else None
+    comments.update(thread)
+
+    logger.info(
+        "Comment thread %s of artifact %s %s by project %s",
+        thread_id,
+        artifact_id,
+        "resolved" if wanted else "reopened",
+        caller.project_id,
+    )
+    return _thread_response(thread, 200)
+
+
+@app.delete(
+    "/api/artifacts/{artifact_id}/comments/{thread_id}",
+    tags=["comments"],
+    summary="Delete a comment thread",
+    description=(
+        "Removes a thread and all its replies from Storage. Available to the "
+        "artifact owner (moderation) and to the thread's own author "
+        "(withdrawing a comment); anyone else gets a 403. Irreversible."
+    ),
+    responses={
+        200: {"description": "Thread deleted."},
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: {
+            "description": (
+                "Only the artifact owner or the thread's author may delete it."
+            )
+        },
+        404: RESP_THREAD_404,
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable."
+            )
+        },
+    },
+)
+def delete_comment(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    thread_id: str = PathParam(..., description=THREAD_ID_DESC),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Owner moderates, or an author withdraws their own thread."""
+    caller, _token = auth
+    ensure_hydrated(request.app)
+
+    meta = request.app.state.store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+
+    comments = request.app.state.comments
+    thread = comments.get(artifact_id, thread_id)
+    if thread is None:
+        return _thread_not_found(artifact_id, thread_id)
+
+    if caller.key not in (meta.owner_key, thread.author_key):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "only the artifact owner or the thread's author can delete "
+                "this comment"
+            ),
+        )
+
+    comments.delete(artifact_id, thread_id)
+    logger.info(
+        "Deleted comment thread %s of artifact %s (by project %s)",
+        thread_id,
+        artifact_id,
+        caller.project_id,
+    )
+    return JSONResponse(
+        {"deleted": True, "id": artifact_id, "thread_id": thread_id}
     )

@@ -41,6 +41,21 @@ content, source, or metadata over a small JSON API.
 - **Installable agent** (`/agent`): serves a ready-to-use Claude Code subagent
   definition, distilled from `/skill`, that a user can drop straight into
   `~/.claude/agents/`
+- **Inline comments and a review UI**: anyone with a Keboola token can leave
+  threaded comments anchored to a quoted passage of a specific version
+  (`GET/POST /a/{id}/comments`), and `GET /a/{id}/review` is a browser page
+  where selecting text opens a comment composer — the artifact renders in a
+  sandboxed iframe so its own scripts never see the reviewer's token
+- **Obsidian vault export** (`GET /a/{id}/export/vault`): a ZIP containing a
+  ready-to-open vault — an `INDEX.md` hub, one note per version with its diff,
+  one note per comment thread, and a chronological `reasoning.md` timeline —
+  so Obsidian's own graph view becomes the artifact's knowledge graph
+- **Contributor allowlist**: `accept_versions_mode` and `comments_mode` can
+  each be `off` / `anyone` / `allowlist`, restricting who may submit versions
+  or comment to a `contributors` list of Keboola projects
+- **Final status**: an owner can mark an artifact `final`, freezing new
+  versions and comments for everyone (including the owner) until it is
+  reopened
 - Markdown rendering with GFM tables, task lists, mermaid diagrams, and
   syntax-highlighted code
 - Survives restarts: the only durable state is Keboola Storage Files; local
@@ -88,6 +103,22 @@ tagged `artifact-hub` in the host project — the Storage Files of the host
 project are the single source of truth, and local disk holds only a cache of
 recently-served envelopes.
 
+## Project brain workflow
+
+A published artifact is not just a document to link — it is one URL a whole
+team of humans and AI agents can collaborate around. An agent publishes a
+first draft; teammates and other agents open it, leave inline comments on the
+specific passages they have questions about, or submit whole proposed
+versions with a note explaining the change; anyone can fetch `/meta`,
+`/versions`, and `/comments` to catch up on what has already been said before
+adding their own point, so the discussion converges instead of repeating
+itself. The owner reviews diffs and threads at `/admin` and `/review`,
+promotes or rejects proposals, and — once the document is settled — marks it
+`final`, freezing further changes for everyone. At that point `/export/vault`
+turns the whole history (every version, every thread, every decision) into a
+ready-to-open Obsidian vault: a permanent, browsable record of how the
+document got to where it is, with nothing to reconstruct from memory.
+
 ## API reference
 
 Public (no auth):
@@ -110,6 +141,10 @@ Public (no auth):
 | GET | `/a/{id}/raw` | Raw built HTML (password via `X-Artifact-Password` if protected) |
 | GET | `/a/{id}/source` | Original submitted source (markdown or html) |
 | GET | `/a/{id}/meta` | Public metadata JSON (no owner details) |
+| GET | `/a/{id}/comments` | Every inline comment thread (open and resolved) as JSON |
+| GET | `/a/{id}/review` | Browser review UI: select text to comment, sandboxed artifact iframe |
+| GET | `/a/{id}/export/markdown` | Head version's Markdown source (or HTML when it has none) |
+| GET | `/a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, reasoning timeline) |
 | GET | `/health` | Liveness check + service version + index stats |
 
 Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
@@ -117,13 +152,17 @@ Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 | Method | Path | Description |
 |---|---|---|
 | POST | `/api/artifacts` | Publish `{html \| markdown \| git_url[, git_ref, git_path, git_token, git_username], title?, password?, accept_versions?}` → `{id, version, head_version, url, raw_url, meta_url, versions_url, ...}` |
-| PUT | `/api/artifacts/{id}` | Add a live version and/or change `password` / `clear_password` / `accept_versions` (owner project only) |
+| PUT | `/api/artifacts/{id}` | Add a live version and/or change `password` / `clear_password` / `accept_versions_mode` / `contributors` / `comments_mode` / `status` (owner project only) |
 | GET | `/api/artifacts` | List the caller's project's own artifacts |
 | DELETE | `/api/artifacts/{id}` | Delete every version and the meta record (owner project only) |
-| POST | `/api/artifacts/{id}/versions` | Submit a version `{html \| markdown \| git_url, title?, note?}` — live for the owner, proposed for any other project |
+| POST | `/api/artifacts/{id}/versions` | Submit a version `{html \| markdown \| git_url, title?, note?}` — live for the owner, proposed for any other project (409 when `status` is `final`) |
 | POST | `/api/artifacts/{id}/versions/{n}/promote` | Promote a proposal to live (owner project only) |
 | DELETE | `/api/artifacts/{id}/versions/{n}` | Delete a version (owner), or withdraw your own proposal (contributor) |
 | PUT | `/api/artifacts/{id}/head` | `{"mode": "latest"}` or `{"mode": "pinned", "version": n}` (owner project only) |
+| POST | `/api/artifacts/{id}/comments` | Open a comment thread `{version, exact, prefix, suffix, body}` (403 if closed/allowlisted, 409 if `final`, 429 past the daily cap) |
+| POST | `/api/artifacts/{id}/comments/{tid}/replies` | Reply to a thread `{body}` |
+| POST | `/api/artifacts/{id}/comments/{tid}/resolve` | Resolve or reopen a thread `{"resolved": true \| false}` (owner or thread author) |
+| DELETE | `/api/artifacts/{id}/comments/{tid}` | Delete a thread (owner or thread author) |
 
 ## Quick start (curl)
 
@@ -291,6 +330,7 @@ are missing. Everything else has a documented default, overridable via env.
 | `HUB_TOKEN_VERIFY_TIMEOUT_S` | `15` | Timeout for the `token verify` call to a caller's stack |
 | `HUB_MAX_VERSIONS` | `50` | Live versions kept per artifact; older non-head, non-pinned ones are pruned (proposals are never pruned) |
 | `HUB_MAX_VERSIONS_PER_DAY` | `20` | Versions one project may submit for one artifact per UTC day (in-memory, per replica) |
+| `HUB_MAX_COMMENTS_PER_DAY` | `100` | Comment threads plus replies one project may submit for one artifact per UTC day (in-memory, per replica) |
 | `HUB_DIFF_MAX_BYTES` | `2097152` (2 MB) | Largest per-side payload the diff renderer will process (413 above it) |
 | `HUB_EXTRA_STACKS` | empty | Comma-separated extra stack URLs allowed beyond the `*.keboola.com` rule |
 

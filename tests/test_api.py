@@ -26,6 +26,9 @@ log.
 from __future__ import annotations
 
 import dataclasses
+import io
+import re
+import zipfile
 from typing import Any, NamedTuple
 
 import pytest
@@ -34,6 +37,7 @@ from fastapi.testclient import TestClient
 import src.main as main
 from src.auth import STACK_ALIASES, AuthError, Owner
 from src.builder import BuiltArtifact
+from src.comments import CommentStore
 from src.kbc import InMemoryFilesBackend
 from src.store import ArtifactStore
 
@@ -106,9 +110,10 @@ def api(tmp_path, settings, monkeypatch):
 
     monkeypatch.setattr(main, "KbcFilesBackend", fake_kbc_files_backend)
     monkeypatch.setattr(main, "verify_token", fake_verify_token)
-    # The per-contributor submission counter is module-level state; a test must
-    # never inherit another test's tally.
+    # The per-contributor counters are module-level state; a test must never
+    # inherit another test's tally.
     main._submission_counts.clear()
+    main._comment_counts.clear()
 
     with TestClient(main.app, base_url="https://testserver") as client:
         yield Api(
@@ -220,6 +225,10 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("GET", "/a/{id}/v/{n}"),
         ("GET", "/a/{id}/versions"),
         ("GET", "/a/{id}/diff/{a}..{b}"),
+        ("GET", "/a/{id}/comments"),
+        ("GET", "/a/{id}/review"),
+        ("GET", "/a/{id}/export/markdown"),
+        ("GET", "/a/{id}/export/vault"),
         ("POST", "/api/artifacts"),
         ("PUT", "/api/artifacts/{id}"),
         ("GET", "/api/artifacts"),
@@ -228,6 +237,10 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("POST", "/api/artifacts/{id}/versions/{n}/promote"),
         ("DELETE", "/api/artifacts/{id}/versions/{n}"),
         ("PUT", "/api/artifacts/{id}/head"),
+        ("POST", "/api/artifacts/{id}/comments"),
+        ("POST", "/api/artifacts/{id}/comments/{tid}/replies"),
+        ("POST", "/api/artifacts/{id}/comments/{tid}/resolve"),
+        ("DELETE", "/api/artifacts/{id}/comments/{tid}"),
     }
     assert paths == expected
     assert len(body["endpoints"]) == len(expected)
@@ -313,8 +326,8 @@ def test_openapi_json_never_leaks_the_hub_storage_token(api: Api) -> None:
 # new parameter that skips its documentation fails the suite.
 # --------------------------------------------------------------------------
 
-#: The three tags declared on the app; every operation must carry exactly one.
-_TAGS = {"public", "artifacts", "versions", "service"}
+#: The tags declared on the app; every operation must carry exactly one.
+_TAGS = {"public", "artifacts", "versions", "comments", "service"}
 
 
 def _operations(schema: dict) -> list[tuple[str, str, dict]]:
@@ -457,7 +470,15 @@ def test_openapi_request_bodies_carry_examples_and_field_descriptions(
 ) -> None:
     schema = api.client.get("/openapi.json").json()
     schemas = schema["components"]["schemas"]
-    for name in ("PublishBody", "UpdateBody", "VersionBody", "HeadBody"):
+    for name in (
+        "PublishBody",
+        "UpdateBody",
+        "VersionBody",
+        "HeadBody",
+        "CommentBody",
+        "ReplyBody",
+        "ResolveBody",
+    ):
         model = schemas[name]
         assert model.get("examples"), f"{name}: no request-body example"
         for field, definition in model["properties"].items():
@@ -1500,3 +1521,637 @@ def test_meta_reports_version_counts(api: Api) -> None:
     assert body["proposed_count"] == 1
     assert body["accept_versions"] is True
     assert body["versions_url"] == f"https://testserver/a/{artifact_id}/versions"
+
+
+# --------------------------------------------------------------------------
+# Inline comments
+# --------------------------------------------------------------------------
+
+#: Owner keys of the two fake tokens, as src.auth.Owner.key builds them from
+#: the "us" alias (https://connection.keboola.com).
+OWNER_KEY = "123@connection.keboola.com"
+OTHER_KEY = "999@connection.keboola.com"
+
+
+def _comment(
+    api: Api,
+    artifact_id: str,
+    *,
+    version: int = 1,
+    exact: str = "Body text",
+    prefix: str = "",
+    suffix: str = "",
+    body: str = "Is this still true?",
+    headers: dict[str, str] = AUTH_HEADERS,
+):
+    """POST one comment thread; returns the raw response."""
+    return api.client.post(
+        f"/api/artifacts/{artifact_id}/comments",
+        json={
+            "version": version,
+            "exact": exact,
+            "prefix": prefix,
+            "suffix": suffix,
+            "body": body,
+        },
+        headers=headers,
+    )
+
+
+def _policy(
+    api: Api, artifact_id: str, headers: dict[str, str] = AUTH_HEADERS, **fields: Any
+):
+    """PUT artifact-level policy fields (comments_mode, status, ...)."""
+    return api.client.put(
+        f"/api/artifacts/{artifact_id}", json=fields, headers=headers
+    )
+
+
+def _assert_no_credentials(obj: Any) -> None:
+    """Recursively assert no internal identity field is exposed publicly.
+
+    ``stack_url`` would hand a reader the address of the author's stack and
+    ``key`` the exact string an allowlist is matched against; the public
+    projection reduces both to a bare stack hostname.
+    """
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            assert key not in ("stack_url", "key"), f"found internal key {key!r}"
+            _assert_no_credentials(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            _assert_no_credentials(item)
+
+
+def test_comment_create_and_list_round_trips_the_selector(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+
+    created = _comment(
+        api,
+        artifact_id,
+        exact="Body text",
+        prefix="Title\n\n",
+        suffix=" here.",
+        body="Which body?",
+    )
+    assert created.status_code == 201, created.text
+    thread = created.json()
+    assert thread["thread_id"] == thread["id"]
+    assert thread["artifact_id"] == artifact_id
+    assert thread["version"] == 1
+    assert thread["selector"] == {
+        "exact": "Body text",
+        "prefix": "Title\n\n",
+        "suffix": " here.",
+    }
+    assert thread["body"] == "Which body?"
+    assert thread["resolved"] is False
+    assert thread["replies"] == []
+    assert thread["author"] == {
+        "project_id": 123,
+        "project_name": "Test",
+        "stack_host": "connection.keboola.com",
+    }
+    _assert_no_credentials(thread)
+
+    listing = api.client.get(f"/a/{artifact_id}/comments")
+    assert listing.status_code == 200
+    body = listing.json()
+    assert body["id"] == artifact_id
+    assert body["comments_mode"] == "anyone"
+    assert body["status"] == "draft"
+    assert [t["id"] for t in body["threads"]] == [thread["id"]]
+    assert body["threads"][0]["selector"]["exact"] == "Body text"
+    _assert_no_credentials(body)
+
+
+def test_comments_are_listed_oldest_first(api: Api, monkeypatch) -> None:
+    artifact_id = _publish_markdown(api, "# One\n\nTwo three")
+    # Thread ids are random and the real clock has second precision, so the
+    # ordering is only observable with distinct, controlled timestamps.
+    stamps = iter(["2026-01-02T09:00:00+00:00", "2026-01-01T09:00:00+00:00"])
+    monkeypatch.setattr(main, "_now", lambda: next(stamps))
+
+    newer = _comment(api, artifact_id, exact="One").json()["id"]
+    older = _comment(api, artifact_id, exact="Two").json()["id"]
+
+    ids = [t["id"] for t in api.client.get(f"/a/{artifact_id}/comments").json()["threads"]]
+    assert ids == [older, newer]
+
+
+def test_comments_of_unknown_artifact_is_404(api: Api) -> None:
+    assert api.client.get("/a/nope/comments").status_code == 404
+    assert _comment(api, "nope").status_code == 404
+
+
+def test_comments_mode_off_closes_the_artifact_to_other_projects(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Closed")
+    assert _policy(api, artifact_id, comments_mode="off").status_code == 200
+
+    stranger = _comment(api, artifact_id, headers=OTHER_AUTH_HEADERS)
+    assert stranger.status_code == 403
+    assert "closed" in stranger.json()["detail"]
+
+    # Only "final" locks the owner out of their own artifact; "off" does not.
+    assert _comment(api, artifact_id).status_code == 201
+
+
+def test_comments_allowlist_admits_only_listed_projects(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Allowlisted")
+    assert (
+        _policy(
+            api,
+            artifact_id,
+            comments_mode="allowlist",
+            contributors=[OTHER_KEY],
+        ).status_code
+        == 200
+    )
+
+    contributor = _comment(api, artifact_id, headers=OTHER_AUTH_HEADERS)
+    assert contributor.status_code == 201, contributor.text
+    # The owner is never locked out of their own artifact.
+    assert _comment(api, artifact_id).status_code == 201
+
+    assert _policy(api, artifact_id, contributors=[]).status_code == 200
+    stranger = _comment(api, artifact_id, headers=OTHER_AUTH_HEADERS)
+    assert stranger.status_code == 403
+    assert "allowlist" in stranger.json()["detail"]
+
+
+def test_contributor_keys_are_validated(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Allowlisted")
+    bad = _policy(api, artifact_id, contributors=["not-a-key"])
+    assert bad.status_code == 422
+    assert "project key" in bad.json()["detail"]
+
+    too_many = _policy(
+        api, artifact_id, contributors=[f"{n}@connection.keboola.com" for n in range(51)]
+    )
+    assert too_many.status_code == 422
+    assert "too many contributors" in too_many.json()["detail"]
+
+
+def test_accept_versions_and_mode_together_is_422(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    resp = _policy(api, artifact_id, accept_versions=True, accept_versions_mode="anyone")
+    assert resp.status_code == 422
+    assert "accept_versions_mode" in resp.json()["detail"]
+
+
+def test_versions_allowlist_admits_only_listed_projects(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    assert (
+        _policy(
+            api,
+            artifact_id,
+            accept_versions_mode="allowlist",
+            contributors=[OTHER_KEY],
+        ).status_code
+        == 200
+    )
+    allowed = _submit_version(api, artifact_id, "# Two", headers=OTHER_AUTH_HEADERS)
+    assert allowed.status_code == 201, allowed.text
+    assert allowed.json()["status"] == "proposed"
+
+    assert _policy(api, artifact_id, contributors=[]).status_code == 200
+    denied = _submit_version(api, artifact_id, "# Three", headers=OTHER_AUTH_HEADERS)
+    assert denied.status_code == 403
+
+
+def test_comment_on_unknown_version_is_422(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    resp = _comment(api, artifact_id, version=42)
+    assert resp.status_code == 422
+    assert "version 42" in resp.json()["detail"]
+
+
+def test_comment_body_and_quote_validation_is_422(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+
+    empty_body = _comment(api, artifact_id, body="   ")
+    assert empty_body.status_code == 422
+    assert "body" in empty_body.json()["detail"].lower()
+
+    empty_quote = _comment(api, artifact_id, exact="   ")
+    assert empty_quote.status_code == 422
+    assert "selection" in empty_quote.json()["detail"].lower()
+
+    long_quote = _comment(api, artifact_id, exact="x" * 2001)
+    assert long_quote.status_code == 422
+    assert "too long" in long_quote.json()["detail"]
+
+
+def test_comments_are_rate_limited_per_day(api: Api, monkeypatch) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    monkeypatch.setattr(
+        main, "settings", dataclasses.replace(api.settings, max_comments_per_day=2)
+    )
+
+    assert _comment(api, artifact_id, exact="One").status_code == 201
+    thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+
+    limited = _comment(api, artifact_id, exact="One")
+    assert limited.status_code == 429
+    assert limited.json()["limit"] == 2
+
+    # Replies share the same bucket.
+    reply = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}/replies",
+        json={"body": "also blocked"},
+        headers=AUTH_HEADERS,
+    )
+    assert reply.status_code == 429
+
+
+def test_reply_appends_to_the_thread(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+    thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+
+    replied = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}/replies",
+        json={"body": "Answering."},
+        headers=OTHER_AUTH_HEADERS,
+    )
+    assert replied.status_code == 201, replied.text
+    thread = replied.json()
+    assert len(thread["replies"]) == 1
+    assert thread["replies"][0]["body"] == "Answering."
+    assert thread["replies"][0]["author"]["project_id"] == 999
+    _assert_no_credentials(thread)
+
+    listed = api.client.get(f"/a/{artifact_id}/comments").json()["threads"][0]
+    assert len(listed["replies"]) == 1
+
+
+def test_reply_to_unknown_thread_is_404(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    resp = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/nope/replies",
+        json={"body": "hello"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 404
+
+
+def test_empty_reply_body_is_422(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+    resp = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}/replies",
+        json={"body": " "},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 422
+
+
+def test_resolve_then_conflict_then_reopen(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+    thread_id = _comment(
+        api, artifact_id, exact="One", headers=OTHER_AUTH_HEADERS
+    ).json()["id"]
+    path = f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve"
+
+    # The artifact owner may resolve a thread they did not write.
+    resolved = api.client.post(path, headers=AUTH_HEADERS)
+    assert resolved.status_code == 200, resolved.text
+    thread = resolved.json()
+    assert thread["resolved"] is True
+    assert thread["resolved_by"]["project_id"] == 123
+    _assert_no_credentials(thread)
+
+    again = api.client.post(path, headers=AUTH_HEADERS)
+    assert again.status_code == 409
+    assert "already resolved" in again.json()["error"]
+
+    # The thread's own author may reopen it.
+    reopened = api.client.post(
+        path, json={"resolved": False}, headers=OTHER_AUTH_HEADERS
+    )
+    assert reopened.status_code == 200, reopened.text
+    assert reopened.json()["resolved"] is False
+    assert reopened.json()["resolved_by"] is None
+
+    already_open = api.client.post(
+        path, json={"resolved": False}, headers=AUTH_HEADERS
+    )
+    assert already_open.status_code == 409
+    assert "already open" in already_open.json()["error"]
+
+
+def test_resolve_by_an_unrelated_project_is_403(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+    resp = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+        headers=OTHER_AUTH_HEADERS,
+    )
+    assert resp.status_code == 403
+
+
+def test_delete_thread_by_author_by_owner_and_by_a_stranger(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One\n\nTwo")
+
+    # The author withdraws their own thread.
+    own = _comment(
+        api, artifact_id, exact="One", headers=OTHER_AUTH_HEADERS
+    ).json()["id"]
+    withdrawn = api.client.delete(
+        f"/api/artifacts/{artifact_id}/comments/{own}", headers=OTHER_AUTH_HEADERS
+    )
+    assert withdrawn.status_code == 200, withdrawn.text
+    assert withdrawn.json()["deleted"] is True
+
+    # The artifact owner moderates someone else's thread.
+    foreign = _comment(
+        api, artifact_id, exact="Two", headers=OTHER_AUTH_HEADERS
+    ).json()["id"]
+    moderated = api.client.delete(
+        f"/api/artifacts/{artifact_id}/comments/{foreign}", headers=AUTH_HEADERS
+    )
+    assert moderated.status_code == 200
+
+    # A project that is neither may not.
+    owners_own = _comment(api, artifact_id, exact="One").json()["id"]
+    stranger = api.client.delete(
+        f"/api/artifacts/{artifact_id}/comments/{owners_own}",
+        headers=OTHER_AUTH_HEADERS,
+    )
+    assert stranger.status_code == 403
+
+    remaining = api.client.get(f"/a/{artifact_id}/comments").json()["threads"]
+    assert [t["id"] for t in remaining] == [owners_own]
+
+
+def test_delete_unknown_thread_is_404(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    resp = api.client.delete(
+        f"/api/artifacts/{artifact_id}/comments/nope", headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 404
+
+
+def test_deleting_an_artifact_removes_its_comment_threads(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    _comment(api, artifact_id, exact="One")
+    _comment(api, artifact_id, exact="One")
+
+    deleted = api.client.delete(f"/api/artifacts/{artifact_id}", headers=AUTH_HEADERS)
+    assert deleted.status_code == 200
+    assert deleted.json()["comment_threads_deleted"] == 2
+
+    assert api.client.get(f"/a/{artifact_id}/comments").status_code == 404
+    # Nothing is left behind in Storage either.
+    assert main.app.state.comments.list_for(artifact_id) == []
+
+
+# --------------------------------------------------------------------------
+# Final status
+# --------------------------------------------------------------------------
+
+
+def test_final_status_freezes_versions_comments_and_content(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Draft", accept_versions=True)
+
+    final = _policy(api, artifact_id, status="final")
+    assert final.status_code == 200, final.text
+    assert final.json()["artifact_status"] == "final"
+    assert api.client.get(f"/a/{artifact_id}/comments").json()["status"] == "final"
+
+    version = _submit_version(api, artifact_id, "# Frozen")
+    assert version.status_code == 409
+    assert version.json()["error"] == "document is final"
+
+    foreign_version = _submit_version(
+        api, artifact_id, "# Frozen", headers=OTHER_AUTH_HEADERS
+    )
+    assert foreign_version.status_code == 409
+
+    comment = _comment(api, artifact_id, exact="Draft")
+    assert comment.status_code == 409
+    assert comment.json()["error"] == "document is final"
+
+    content = _policy(api, artifact_id, markdown="# Frozen")
+    assert content.status_code == 409
+
+    # Artifact-level settings still work — that is how the owner reopens it.
+    reopened = _policy(api, artifact_id, status="draft")
+    assert reopened.status_code == 200
+    assert reopened.json()["artifact_status"] == "draft"
+    assert _submit_version(api, artifact_id, "# Thawed").status_code == 201
+    assert _comment(api, artifact_id, exact="Thawed").status_code == 201
+
+
+def test_final_artifact_can_be_reopened_in_the_same_call_as_new_content(
+    api: Api,
+) -> None:
+    artifact_id = _publish_markdown(api, "# Draft")
+    assert _policy(api, artifact_id, status="final").status_code == 200
+
+    resp = _policy(api, artifact_id, status="draft", markdown="# Reopened")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["version"] == 2
+    assert resp.json()["artifact_status"] == "draft"
+
+
+def test_unknown_policy_values_are_422(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    assert _policy(api, artifact_id, status="archived").status_code == 422
+    assert _policy(api, artifact_id, comments_mode="sometimes").status_code == 422
+    assert _policy(api, artifact_id, accept_versions_mode="maybe").status_code == 422
+
+
+# --------------------------------------------------------------------------
+# Exports
+# --------------------------------------------------------------------------
+
+
+def test_export_markdown_returns_the_source_as_an_attachment(api: Api) -> None:
+    markdown = "# Q3 review\n\nShipped the new ingest path.\n"
+    artifact_id = _publish_markdown(api, markdown, title="Q3 review")
+
+    resp = api.client.get(f"/a/{artifact_id}/export/markdown")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/markdown")
+    assert resp.headers["content-disposition"] == (
+        'attachment; filename="q3-review.md"'
+    )
+    assert resp.text == markdown
+
+
+def test_export_markdown_of_an_html_artifact_returns_html(api: Api) -> None:
+    document = "<html><head><title>Notes</title></head><body><p>Hi</p></body></html>"
+    published = api.client.post(
+        "/api/artifacts", json={"html": document, "title": "Notes"}, headers=AUTH_HEADERS
+    )
+    assert published.status_code == 201
+    artifact_id = published.json()["id"]
+
+    resp = api.client.get(f"/a/{artifact_id}/export/markdown")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert resp.headers["content-disposition"] == 'attachment; filename="notes.html"'
+    assert resp.text == document
+
+
+def test_export_markdown_of_unknown_artifact_is_404(api: Api) -> None:
+    assert api.client.get("/a/nope/export/markdown").status_code == 404
+    assert api.client.get("/a/nope/export/vault").status_code == 404
+
+
+def test_export_vault_is_a_zip_holding_the_whole_story(api: Api) -> None:
+    artifact_id = _publish_markdown(
+        api, "# Q3 review\n\nOld line\n", title="Q3 review", accept_versions=True
+    )
+    assert _submit_version(api, artifact_id, "# Q3 review\n\nNew line\n").status_code == 201
+    assert (
+        _submit_version(
+            api, artifact_id, "# Proposal\n", headers=OTHER_AUTH_HEADERS
+        ).status_code
+        == 201
+    )
+    assert _comment(api, artifact_id, exact="Old line").status_code == 201
+
+    resp = api.client.get(f"/a/{artifact_id}/export/vault")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/zip"
+    assert resp.headers["content-disposition"] == (
+        'attachment; filename="q3-review-vault.zip"'
+    )
+
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as archive:
+        names = archive.namelist()
+        assert "q3-review/INDEX.md" in names
+        assert "q3-review/document.md" in names
+        assert "q3-review/reasoning.md" in names
+        # Every version, the pending proposal included.
+        assert "q3-review/versions/v1.md" in names
+        assert "q3-review/versions/v2.md" in names
+        assert "q3-review/versions/v3.md" in names
+        assert any(name.startswith("q3-review/comments/") for name in names)
+        assert "New line" in archive.read("q3-review/document.md").decode("utf-8")
+
+
+def test_exports_honour_the_password_gate(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Secret\n\nBody", password="hunter2")
+
+    assert api.client.get(f"/a/{artifact_id}/export/markdown").status_code == 401
+    assert api.client.get(f"/a/{artifact_id}/export/vault").status_code == 401
+
+    unlocked = {"X-Artifact-Password": "hunter2"}
+    assert (
+        api.client.get(
+            f"/a/{artifact_id}/export/markdown", headers=unlocked
+        ).status_code
+        == 200
+    )
+    vault = api.client.get(f"/a/{artifact_id}/export/vault", headers=unlocked)
+    assert vault.status_code == 200
+    assert zipfile.ZipFile(io.BytesIO(vault.content)).namelist()
+
+
+def test_comments_honour_the_password_gate(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Secret\n\nBody", password="hunter2")
+    assert api.client.get(f"/a/{artifact_id}/comments").status_code == 401
+    assert (
+        api.client.get(
+            f"/a/{artifact_id}/comments", headers={"X-Artifact-Password": "hunter2"}
+        ).status_code
+        == 200
+    )
+
+
+# --------------------------------------------------------------------------
+# Review UI
+# --------------------------------------------------------------------------
+
+
+def test_review_page_sandboxes_the_artifact_and_keeps_the_token_in_the_tab(
+    api: Api,
+) -> None:
+    """The security story of the review UI, asserted mechanically.
+
+    The artifact renders in a srcdoc iframe *without* allow-same-origin, so its
+    scripts run in an opaque origin; and the visitor's token lives in
+    sessionStorage (shared with /admin), never in anything durable.
+    """
+    artifact_id = _publish_markdown(api, "# Reviewed\n\nBody text")
+    resp = api.client.get(f"/a/{artifact_id}/review")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert resp.headers["x-robots-tag"] == "noindex, nofollow"
+
+    text = resp.text
+    assert 'sandbox="allow-scripts allow-popups"' in text
+    sandboxes = re.findall(r'sandbox="([^"]*)"', text)
+    assert sandboxes, "the page must render the artifact in a sandboxed iframe"
+    for value in sandboxes:
+        assert "allow-same-origin" not in value, value
+    assert "localStorage" not in text
+    assert "sessionStorage" in text
+    assert "hub_admin_auth" in text
+    assert api.settings.hub_storage_token not in text
+    assert "good-token" not in text
+    # The annotation script and the postMessage protocol it speaks.
+    assert "ah-select" in text
+    assert "ah-anchors" in text
+    assert "ah-anchored" in text
+
+
+def test_review_page_of_unknown_artifact_is_404(api: Api) -> None:
+    assert api.client.get("/a/nope/review").status_code == 404
+
+
+def test_review_page_of_a_protected_artifact_shows_the_unlock_form(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
+    locked = api.client.get(f"/a/{artifact_id}/review")
+    assert locked.status_code == 401
+    assert "Password required" in locked.text
+
+    unlocked = api.client.post(
+        f"/a/{artifact_id}/unlock", data={"password": "hunter2"}, follow_redirects=False
+    )
+    assert unlocked.status_code == 303
+    assert api.client.get(f"/a/{artifact_id}/review").status_code == 200
+
+
+def test_versions_page_and_context_link_the_review_ui(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    page = api.client.get(f"/a/{artifact_id}/versions?format=html")
+    assert f"/a/{artifact_id}/review" in page.text
+
+    paths = {e["path"] for e in api.client.get("/context").json()["endpoints"]}
+    assert "/a/{id}/review" in paths
+    assert "/a/{id}/comments" in paths
+    assert "/a/{id}/export/vault" in paths
+
+
+def test_admin_studio_offers_a_review_link(api: Api) -> None:
+    assert '"/review"' in api.client.get("/admin").text
+
+
+def test_landing_page_lists_the_phase_three_read_endpoints(api: Api) -> None:
+    text = api.client.get("/").text
+    for path in ("/review", "/comments", "/export/markdown", "/export/vault"):
+        assert path in text
+
+
+# --------------------------------------------------------------------------
+# Restart survival: comments
+# --------------------------------------------------------------------------
+
+
+def test_comment_threads_survive_a_restart(api: Api, tmp_path) -> None:
+    """A fresh CommentStore over the same backend must find every thread."""
+    artifact_id = _publish_markdown(api, "# One\n\nBody text")
+    thread_id = _comment(api, artifact_id, exact="Body text").json()["id"]
+
+    second = CommentStore(
+        backend=api.backend,
+        cache_dir=tmp_path / "restart-comments",
+        cache_max_entries=api.settings.cache_max_entries,
+    )
+    assert second.hydrate() == 1
+    threads = second.list_for(artifact_id)
+    assert [t.id for t in threads] == [thread_id]
+    assert threads[0].selector.exact == "Body text"

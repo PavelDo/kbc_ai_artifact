@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: kbc-artifact-hub
-Version: 0.2.1
+Version: 0.3.0
 Summary: Keboola App that hosts HTML+JS artifacts under public URLs, backed by Keboola Storage Files
 Requires-Python: >=3.11
 Requires-Dist: fastapi>=0.115.0
