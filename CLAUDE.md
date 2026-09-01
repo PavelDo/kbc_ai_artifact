@@ -51,8 +51,22 @@ consequences baked into `src/main.py`:
    correct **only** under it. Do not add HA, replicas or `--workers`; if that
    ever changes, the state layer needs shared compare-and-swap, which Storage
    Files cannot provide (immutable, no create-if-absent) — that is a redesign,
-   not a flag. `StateDB._retire_older_snapshots` detects a second writer and
-   logs an ERROR naming this rule.
+   not a flag.
+
+   The invariant is **enforced**, not merely documented (ARCH-100-001), and
+   both halves must keep working:
+   - `main.acquire_instance_lock` takes an exclusive non-blocking `flock` on
+     `HUB_CACHE_DIR/instance.lock` in the lifespan and holds it for the life
+     of the process. A second process on the same cache directory raises
+     `SingleInstanceError` and fails to start. Do not move this after the
+     stores are built, and do not make it best-effort.
+   - `StateDB._retire_older_snapshots` catches the case the lock cannot see
+     (two processes, two disks, one Storage project): it latches the
+     process-wide flag in `src/statedb.py`, every `StateDB` write and snapshot
+     then raises `ForeignWriterError` / no-ops, the foreign snapshot is left
+     in place rather than deleted, and `GET /health` answers 503. `POST /`
+     stays 200 (rule 3 above) — flipping it would only make the platform
+     restart the container into the same conflict.
 
 ## Storage model
 
@@ -74,6 +88,39 @@ no other source of truth. **If you add a field or a relationship the index
 needs, it must be reconstructible from these tags/file contents alone; if it
 isn't, that's a bug**, not a case to special-case around with local state.
 
+**Deleting an artifact deletes children first, the meta file strictly last**
+(`ArtifactStore.delete`). The meta file is what authorizes the purge, so
+removing it while any version/legacy file survives makes the leftover
+unreachable *and* undeletable — the retry can no longer prove ownership. If
+you add a new kind of per-artifact file, classify it as a child in
+`ArtifactStore._classify_for_delete`. The other side of that ordering is that
+a crash in the final gap leaves a meta record with no versions: that is a
+legitimate, temporary state (inert publicly, still purgeable by the owner) and
+`ArtifactStore._reap_aborted_publishes` clears it once it is too old to be an
+operation still in flight.
+
+## Known residual risks
+
+Accepted, understood and deliberately not fixed. Add to this list rather than
+rediscovering an item as a bug; each entry says why the fix is worse than the
+risk and what an operator can do about it.
+
+- **`REL-075-009` — a process death can orphan a canonical copy in the
+  author's project.** Publishing writes a canonical HTML copy into the
+  *caller's* own Keboola project (`_store_canonical` in `src/main.py`) before
+  the hub's version file exists. Every caught failure afterwards deletes that
+  copy while the caller's token is still in hand (`_discard_canonical`); the
+  container *dying* in between cannot, because client tokens are request-scope
+  only and the hub keeps no handle to another project's Storage. The window is
+  process death alone — not anything an API caller can trigger. Reordering so
+  the external copy is written last would close it, but `canonical_file_id`
+  lives in the version envelope and version files are immutable (above), so
+  that would mean rewriting a version file — a worse trade than the orphan,
+  which is informational only: the id is echoed in the publish response and
+  never resolved back to a file. **Operator remedy:** in the *author's* own
+  project, list Storage files tagged `kbc-artifact` plus `artifact-id-{id}`
+  and delete any whose artifact the hub does not serve.
+
 ## Secrets discipline
 
 - Client Storage tokens and `git_token` are **transient, request-scope only**.
@@ -84,6 +131,49 @@ isn't, that's a bug**, not a case to special-case around with local state.
   reaches a log line, an exception message, or an API response.
 - No tokens or secrets in git, ever — not in code, tests, fixtures, or commit
   messages.
+
+## Known residual risks
+
+These are documented, accepted design decisions from the v0.10.0 security
+review — not bugs to silently "fix" by tightening code without a design
+discussion. If you touch the areas below, preserve the documented behavior
+and keep the README/comment cross-references intact.
+
+- **`SEC-075-005` / `SEC-075-006` — resolver-to-connect DNS TOCTOU for
+  outbound git and webhook traffic.** `_check_git_host` (`src/builder.py`)
+  and the webhook URL validation (`src/webhooks.py`) resolve a hostname and
+  reject private/loopback/link-local/reserved/metadata addresses, but git
+  (via libcurl) and `httpx` each resolve the hostname again, independently,
+  at connect time. Neither client supports pinning the connection to an
+  already-validated IP, so this cannot be closed in application code with
+  the current clients — it needs an egress policy/proxy in front of the
+  container (see the "Network egress" part of README.md's *Security model*).
+  Do not attempt to "fix" this with more application-side re-checks; another
+  re-check only narrows the window, it does not close it.
+- **`SEC-075-011` — project-wide destructive authority is the *default*, not
+  the only option.** `require_owner`/`_owner_only` (`src/auth.py`,
+  `src/main.py`) resolve ownership as a `(stack, project)` pair and
+  deliberately still do: identity is the project. What used to follow from
+  that — every token of the project, read-only ones included, could purge —
+  is now an opt-in policy, `HUB_DESTRUCTIVE_TOKEN_POLICY`
+  (`project` | `admin` | `allowlist`, **default `project`**, i.e. the
+  historical behaviour), enforced by `_destructive_authority` in
+  `src/main.py` on the destructive routes only: soft delete, purge, owner
+  version delete, rotate-link and webhook key rotation. `Owner` carries the
+  non-secret token claims the policy reads (`token_id`, `is_master_token`,
+  `admin_role`, `can_purge_trash`, `can_manage_tokens`), parsed defensively —
+  a missing or odd-shaped claim degrades to least privilege and never raises,
+  and none of them is ever persisted or logged. **Do not extend the gate to
+  non-destructive owner routes** (update, head pin, promote, settings,
+  invitations, stats, trash restore) or to a contributor withdrawing their
+  own proposal; that split is the design, documented in README.md's *Security
+  model*, and `tests/test_review100_destructive_policy.py` pins it.
+- **`SEC-100-005` — git redirects are disabled, not eliminated as an SSRF
+  vector.** `_clone` (`src/builder.py`) runs with
+  `-c http.followRedirects=false`, so a redirect to an unvalidated host now
+  fails the clone instead of being silently followed. This closes the
+  redirect-specific gap; the underlying resolver TOCTOU above it is not
+  closed by this and is tracked separately as `SEC-075-006`.
 
 ## Architecture map
 

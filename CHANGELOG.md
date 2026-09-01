@@ -4,6 +4,123 @@ KBC Artifact Hub is one web address where you publish a document and
 collaborate on it with your team, secured by the Keboola account you already
 have.
 
+## 0.11.0 — Second security review follow-up (2026-09-02)
+
+**Two items need a change on your side: `HUB_TRUSTED_PROXY_CIDRS` (second
+item) and, if you delete versions by script, the new 409 on the pinned
+version (ninth item).**
+
+- **Updates that change content and settings at once are now fail-closed.**
+  A single `PUT /api/artifacts/{id}` can both narrow access (a reader
+  password, closing submissions or comments, marking the document final) and
+  widen it (clearing the password, reopening submissions, un-finalizing). The
+  hub now commits the narrowing half *before* the new version and the
+  widening half *after* it, so a Storage failure anywhere in the middle can
+  never leave an artifact more open than it was. Previously a failed
+  settings write could leave brand-new content publicly readable without the
+  password the same request asked for. When such an update fails, the 502
+  says exactly what is in force: nothing applied, the narrowing settings
+  applied without the new version, or the new version live under the
+  previous narrower settings with the widening changes still to resend.
+  Successful updates are unchanged, including the response body.
+- **A wrong password can no longer be retried without limit by pretending to
+  come from somewhere else.** The hourly budget on failed password and
+  invitation attempts was counted per client address, and the address was
+  taken from a header the caller writes, so changing one line of the request
+  bought a fresh budget. Forwarded addresses now count only when the
+  connection came from a proxy network you named (`HUB_TRUSTED_PROXY_CIDRS`),
+  the `X-Forwarded-For` chain is read from the right, skipping every trusted
+  hop, every value has to parse as an IP address and is stored in canonical
+  form, and at most `HUB_MAX_FORWARDED_CHAIN_ENTRIES` (16) entries are
+  examined. Otherwise the real connection address is used, which nobody can
+  choose. A second budget per document across all addresses
+  (`HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR`) backs it up. **If you run
+  behind the Keboola proxy, set `HUB_TRUSTED_PROXY_CIDRS` to the network of
+  every proxy hop in front of the hub.** Without it every reader shares one
+  budget per document, which is safe but means one person guessing can push
+  other readers into "too many attempts" for the rest of the hour.
+- **An oversized request is now refused before it is read.** A large body
+  sent to a comment, invitation or unlock endpoint used to be received and
+  parsed in full before anyone checked whether the document even existed.
+  The service now answers 413 up front, on both what the request claims to
+  be sending and what it actually sends. Documents are unaffected: publishing
+  and updating keep a ceiling derived from the existing size limits, and
+  everything else accepts 256 KB by default (`HUB_MAX_SMALL_REQUEST_BYTES`).
+  Comment and reply text also carry explicit length limits, reported by
+  `GET /context`.
+- **Made-up document links no longer leave anything behind.** Commenting on
+  an address that names nothing used to reserve a small piece of memory that
+  was never released, so repeated requests to invented links grew the
+  service's footprint indefinitely. Addresses are now checked for shape and
+  looked up before anything is reserved, and what is reserved is released
+  and capped (`HUB_LOCK_REGISTRY_MAX_ENTRIES`).
+- **Permanently erasing an artifact now removes its content files before the
+  record that proves you own it, never the other way round.** Previously a
+  Storage failure part-way through a purge could delete the ownership record
+  first, and the retry the error asked for would answer "no such artifact",
+  leaving a version file behind that nothing could reach or erase again. The
+  retry now always works, including after a container restart, and finishes
+  what the failed call started.
+- **Git clones no longer follow HTTP redirects.** An allowed public git host
+  could redirect the clone to an address the hostname check never saw; a
+  redirect now fails the clone with a clear, credential-free error. The
+  remaining resolver-to-connect DNS race for outbound git and webhook traffic
+  is documented as an accepted residual risk with its operational
+  mitigation, an egress policy in front of the container; see the README's
+  "Network egress" section.
+- **The hub now refuses to run twice.** Starting a second copy against the
+  same cache directory fails immediately with an explanation instead of
+  quietly losing the first copy's work. If two copies do end up running
+  against the same Keboola project from different disks, whichever one
+  notices stops writing counters and analytics, leaves the other's data
+  untouched, and reports itself as not ready on `/health` so an operator can
+  see it; the platform's own startup check keeps answering. This service has
+  always been documented as exactly one process per organisation; now it
+  enforces it.
+- **Vault exports are bounded and streamed.** Building the Obsidian vault is
+  the most expensive thing the service does for an unauthenticated caller,
+  and it used to assemble the whole archive in memory. An artifact whose
+  visible history and comments exceed `HUB_EXPORT_MAX_BYTES` (64 MB by
+  default) is refused with 413 before anything is rendered, one client
+  address may build `HUB_MAX_EXPORTS_PER_HOUR` vaults of one artifact per
+  hour (20 by default) before the answer is 429, and the archive is written
+  entry by entry into an owner-only temporary file that is removed as soon
+  as the download finishes. The ZIP a caller receives is unchanged, byte for
+  byte.
+- **Deleting the version the head is pinned to is refused with 409** instead
+  of silently succeeding. It used to leave the artifact pointing at a
+  version that no longer existed while quietly serving a different one. Pin
+  the head to another live version, or switch it back to `latest`, then
+  delete.
+- **Polling an unchanged artifact is now free.** `GET /a/{id}/live` answered
+  304 for a matching `ETag`, but only after listing every version and every
+  comment thread to work out what the tag should be. Each artifact now
+  carries a revision number that every change bumps, the tag is derived from
+  it, and an unchanged poll is answered from memory. The tag is
+  process-local: after a restart an unchanged artifact hands out a new one
+  and clients refresh once.
+- **Webhook receiver keys can be rotated without changing the URL.**
+  `POST /api/artifacts/{id}/webhooks/{receiver_id}/rotate-key` mints a fresh
+  key; for `HUB_WEBHOOK_KEY_OVERLAP_S` (10 minutes by default) deliveries
+  carry both the new and the previous signature so an unmigrated receiver
+  keeps verifying. Responses that return keys are now served
+  `Cache-Control: no-store`.
+- **Destructive authority can be narrowed below "any token of the project".**
+  `HUB_DESTRUCTIVE_TOKEN_POLICY` chooses who may trash, purge, rotate the
+  link, delete versions or rotate webhook keys: `project` (the default and
+  the previous behaviour), `admin` (a master token or a project admin's own
+  token) or `allowlist` (`HUB_DESTRUCTIVE_TOKEN_IDS`). Publishing and every
+  other owner action are unaffected. Shared projects should set `admin`.
+- **The release pipeline no longer trusts anything it did not check itself.**
+  Every third-party build step is pinned to an exact reviewed commit, a
+  release refuses to publish from a commit that never reached `main`, and
+  the tests, the compile check and the dependency audit all run again inside
+  the job that signs the release. The production deployment example in the
+  README pinned the previous release's tag; it is current again, and a test
+  fails the build whenever the tag in that example, the package version and
+  the changelog stop agreeing. Private-git publishing examples no longer
+  place the git token in any process's command line.
+
 ## 0.10.0 — Security review follow-up (2026-09-01)
 
 **If you run a webhook receiver, read the first item — it needs a change on

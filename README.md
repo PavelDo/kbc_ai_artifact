@@ -55,7 +55,12 @@ content, source, or metadata over a small JSON API.
 - **Obsidian vault export** (`GET /a/{id}/export/vault`): a ZIP containing a
   ready-to-open vault — an `INDEX.md` hub, one note per version with its diff,
   one note per comment thread, and a chronological `reasoning.md` timeline —
-  so Obsidian's own graph view becomes the artifact's knowledge graph
+  so Obsidian's own graph view becomes the artifact's knowledge graph. It is
+  the most expensive request this service serves, so it is budgeted: an
+  artifact whose visible history exceeds `HUB_EXPORT_MAX_BYTES` is refused
+  with 413, one client may build `HUB_MAX_EXPORTS_PER_HOUR` vaults of one
+  artifact per hour, and the archive is streamed through an owner-only
+  temporary file rather than assembled in memory
 - **Contributor allowlist**: `accept_versions_mode` and `comments_mode` can
   each be `off` / `anyone` / `allowlist`, restricting who may submit versions
   or comment to a `contributors` list of Keboola projects
@@ -76,7 +81,10 @@ content, source, or metadata over a small JSON API.
 - **Outbound webhooks**: register up to `HUB_MAX_WEBHOOKS_PER_ARTIFACT` https
   URLs per artifact and get a signed (`X-Hub-Signature-256`) JSON POST — or a
   formatted Slack message for a `hooks.slack.com` URL — on every version,
-  comment, finalize, trash/restore and link-rotation event
+  comment, finalize, trash/restore and link-rotation event. Each receiver's
+  key can be rotated independently of its URL (`POST .../webhooks/{receiver_id}
+  /rotate-key`), with a short signed-overlap grace period so an in-flight
+  delivery still verifies
 - **Guest invitations**: `POST /api/artifacts/{id}/invitations` mints a named,
   revocable capability that lets one person with no Keboola account comment
   through the review UI, secret carried in the URL fragment and never logged
@@ -192,7 +200,7 @@ Public (no auth):
 | GET | `/a/{id}/guest` | Resolve an `X-Artifact-Guest` credential to its display name |
 | GET | `/a/{id}/review` | Browser review UI: select text to comment, sandboxed artifact iframe; also the guest entry point via a `#invite=` fragment |
 | GET | `/a/{id}/export/markdown` | Head version as Markdown: the author's own source when there is one, otherwise converted from the HTML document (lossy for charts and images). `X-Artifact-Markdown-Source: original\|converted` reports which |
-| GET | `/a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, reasoning timeline) |
+| GET | `/a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, reasoning timeline), streamed rather than held in memory; 413 above `HUB_EXPORT_MAX_BYTES`, 429 above `HUB_MAX_EXPORTS_PER_HOUR` |
 | GET | `/changelog` / `/changelog.md` | Rendered changelog (hub's own design) / raw source |
 | GET | `/health` | Liveness check + service version + index stats |
 
@@ -214,6 +222,8 @@ Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 | DELETE | `/api/artifacts/{id}` | **Soft delete**: move to the trash — public link dies, everything is kept and restorable (owner project only) |
 | POST | `/api/artifacts/{id}/restore` | Undo the soft delete: back on the same share id, same status as before (owner project only) |
 | DELETE | `/api/artifacts/{id}/purge` | **Permanent** delete: erase every version, comment thread and the meta record — no undo (owner project only) |
+| GET | `/api/artifacts/{id}/webhooks` | List each registered receiver with the key its deliveries are signed with (owner project only) |
+| POST | `/api/artifacts/{id}/webhooks/{receiver_id}/rotate-key` | Mint a fresh signing key for one receiver without touching its URL; the previous key still verifies for `webhook_key_overlap_s` seconds (owner project only) |
 | POST | `/api/artifacts/{id}/rotate-link` | Mint a fresh share id; the old link (and the bare internal id) stop resolving immediately (owner project only) |
 | GET | `/api/artifacts/{id}/stats` | View counts: `total`, `by_day` (last 30 UTC days), `by_kind` (owner project only) |
 | POST | `/api/artifacts/{id}/invitations` | Invite a guest to comment `{name}` → one-time `review_url` with the secret in the URL fragment (owner project only) |
@@ -221,7 +231,7 @@ Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 | DELETE | `/api/artifacts/{id}/invitations/{iid}` | Revoke one invitation; everyone else's keeps working (owner project only) |
 | POST | `/api/artifacts/{id}/versions` | Submit a version `{html[, markdown_source] \| markdown \| git_url, title?, note?, base_version?}` — live for the owner, proposed for any other project (409 when `status` is `final` or trashed) |
 | POST | `/api/artifacts/{id}/versions/{n}/promote` | Promote a proposal to live (owner project only) |
-| DELETE | `/api/artifacts/{id}/versions/{n}` | Delete a version (owner), or withdraw your own proposal (contributor) |
+| DELETE | `/api/artifacts/{id}/versions/{n}` | Delete a version (owner), or withdraw your own proposal (contributor). 409 for the last live version, and for the version the head is pinned to — re-pin or switch the head to `latest` first |
 | PUT | `/api/artifacts/{id}/head` | `{"mode": "latest"}` or `{"mode": "pinned", "version": n}` (owner project only) |
 | POST | `/api/artifacts/{id}/comments` | Open a comment thread `{version, exact, prefix, suffix, body}` (403 if closed/allowlisted, 409 if frozen, 429 past the daily cap); also accepts an `X-Artifact-Guest` credential in place of a Storage token |
 | POST | `/api/artifacts/{id}/comments/{tid}/replies` | Reply to a thread `{body}` (guest credential accepted here too) |
@@ -268,11 +278,6 @@ hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{"git_url": "https://github.com/org/repo", "git_ref": "main", "git_path": "docs/report.md"}'
 
-# Publish from a private git repo (git_token is transient — see below)
-hub -X POST "$HUB/api/artifacts" \
-  -H "Content-Type: application/json" \
-  -d '{"git_url": "https://github.com/org/private-repo", "git_path": "docs/report.md", "git_token": "your-github-pat"}'
-
 # Read (public, no token)
 hub "$HUB/a/<id>/raw"
 
@@ -288,6 +293,24 @@ hub -X DELETE "$HUB/api/artifacts/<id>"
 Add `"password": "secret"` to any publish/update body to protect the
 artifact; readers then need `X-Artifact-Password: secret` (machines) or the
 web unlock form (browsers).
+
+Publishing from a private git repo needs a `git_token` (a PAT for the git
+host), which is transient — see *Security model* below. Never splice it into
+a literal `-d` string; that puts the value in `curl`'s own argv for the
+process's lifetime, the same problem `hub` above avoids for the Storage
+token. Build the body with `jq` instead, reading the token from its own
+environment via `env.GIT_TOKEN` — only the variable *name* appears in the
+program text — and pipe the JSON to curl on stdin:
+
+```bash
+export GIT_TOKEN="…"   # a PAT for the git host, read-only / single-repo scope
+jq -n --arg url "https://github.com/org/private-repo" \
+      --arg path "docs/report.md" \
+      '{git_url: $url, git_path: $path, git_token: env.GIT_TOKEN}' \
+  | hub -X POST "$HUB/api/artifacts" \
+      -H "Content-Type: application/json" \
+      --data-binary @-
+```
 
 ### Versioning (curl)
 
@@ -314,6 +337,9 @@ hub -X POST "$HUB/api/artifacts/<id>/versions/2/promote"
 hub -X PUT "$HUB/api/artifacts/<id>/head" \
   -H "Content-Type: application/json" \
   -d '{"mode": "pinned", "version": 1}'
+
+# A pinned version cannot be deleted (409) — the head would be left naming a
+# version that no longer exists. Re-pin, or go back to "latest", then delete.
 
 # Withdraw your own proposal (contributor project)
 KBC_TOKEN="$CONTRIBUTOR_TOKEN" hub -X DELETE "$HUB/api/artifacts/<id>/versions/2"
@@ -418,6 +444,8 @@ are missing. Everything else has a documented default, overridable via env.
 | `HUB_CACHE_MAX_ENTRIES` | `200` | Max number of envelopes kept in the disk LRU cache |
 | `HUB_UNLOCK_COOKIE_MAX_AGE_S` | `43200` (12 h) | Lifetime of a signed password-unlock cookie |
 | `HUB_TOKEN_VERIFY_TIMEOUT_S` | `15` | Timeout for the `token verify` call to a caller's stack |
+| `HUB_DESTRUCTIVE_TOKEN_POLICY` | `project` | Which tokens of the owning project may run a *destructive* route (soft delete, purge, owner version delete, rotate-link, webhook key rotation). `project` = any token of that project (the historical behaviour); `admin` = a master token or a project user with the `admin` role; `allowlist` = only ids in `HUB_DESTRUCTIVE_TOKEN_IDS`. Any other value fails at startup. Non-destructive owner routes are never affected. See *Security model* |
+| `HUB_DESTRUCTIVE_TOKEN_IDS` | empty | Comma-separated Storage token **ids** (not tokens — an id is an identifier, not a secret) allowed to run destructive routes under `HUB_DESTRUCTIVE_TOKEN_POLICY=allowlist`. Required non-empty in that mode (an empty allowlist would refuse the operator their own routes, so it fails at startup); ignored in the other modes. Read a token's id from `GET {stack}/v2/storage/tokens/verify` |
 | `HUB_MAX_VERSIONS` | `50` | Live versions kept per artifact; older non-head, non-pinned ones are pruned (this rule never counts or removes a proposal — proposals have their own cap, `HUB_MAX_PROPOSED_VERSIONS`) |
 | `HUB_MAX_VERSIONS_PER_DAY` | `20` | Versions one project may submit for one artifact per UTC day |
 | `HUB_MAX_COMMENTS_PER_DAY` | `100` | Comment threads plus replies one project (or one guest invitation) may submit for one artifact per UTC day |
@@ -427,15 +455,25 @@ are missing. Everything else has a documented default, overridable via env.
 | `HUB_REAP_ABORTED_PUBLISH_AFTER_S` | `3600` | A meta record with no version is a publish that died between its two writes; startup deletes such records once older than this, so they cannot be a publish still in flight (`0` disables) |
 | `HUB_MAX_PROPOSED_VERSIONS` | `50` | Per-artifact cap on retained proposed versions; the oldest proposals above this are pruned (proposals are never served as head, so this is always safe) |
 | `HUB_TRUST_FORWARDED_HEADERS` | `false` | Trust `X-Forwarded-Host`/`X-Forwarded-Proto` to name the public origin when `HUB_PUBLIC_BASE_URL` is unset — only for local development behind a proxy; a direct client can forge these headers |
-| `HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR` | `30` | Failed password-unlock attempts allowed per (artifact, client IP) per UTC hour before the gate answers 429 (each attempt costs a full PBKDF2 verification) |
+| `HUB_TRUSTED_PROXY_CIDRS` | empty | Comma-separated CIDR networks of **every** proxy hop in front of the hub, whose members may name the real client in `X-Real-IP` / `X-Forwarded-For`. Honoured only together with `HUB_TRUST_FORWARDED_HEADERS`, and only when the direct peer is inside one of them; empty means a forwarded client address is never believed and every caller buckets by the peer address. A malformed entry fails at startup. See *Deployment to Keboola* |
+| `HUB_MAX_FORWARDED_CHAIN_ENTRIES` | `16` | How many `X-Forwarded-For` entries the client-address walk examines, counted from the right. The header is caller-supplied and arbitrarily long; this bounds the parsing one request can buy. Real paths are three hops, so raising it is rarely useful |
+| `HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR` | `30` | Failed password-unlock (and guest-invitation) attempts allowed per (artifact, client address) per UTC hour before the gate answers 429 (each attempt costs a full PBKDF2 verification) |
+| `HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR` | `500` | The same budget again, per artifact across *all* addresses together — a backstop nobody can rotate away by changing address. Set well above any real audience of one document; it stops industrial guessing, not individual readers |
+| `HUB_MAX_SMALL_REQUEST_BYTES` | `262144` (256 KB) | Largest inbound request body accepted by every route that does not carry a document — comments, replies, invitations, the unlock form, webhook management, policy-only updates. Enforced from the ASGI layer, before authentication, locking, JSON parsing or PBKDF2 (413 above it). The document routes (publish, update, submit a version) instead get `max(HUB_MAX_HTML_BYTES, HUB_MAX_ENVELOPE_BYTES)` plus 1 MB of JSON-envelope head-room, so raising either content limit raises what they accept |
+| `HUB_LOCK_REGISTRY_MAX_ENTRIES` | `1024` | Idle per-artifact mutation locks kept before the least recently used are dropped. A lock somebody holds or waits on is never dropped, so this bounds memory without weakening serialization |
+| `HUB_NEGATIVE_LOOKUP_CACHE_ENTRIES` | `4096` | Artifact ids Storage has confirmed do not exist, remembered so a repeated lookup of a made-up id costs a dict hit instead of a Storage tag search. Bounded least-recently-used; every write that can make an id appear drops its entry. `0` disables it |
 | `HUB_STATE_SNAPSHOT_INTERVAL_S` | `300` | Seconds between snapshots of the rate-limit/analytics sidecar into Storage Files; `0` disables the background thread (snapshots then need an explicit call, as the tests do) |
 | `HUB_STATE_MAX_SNAPSHOT_BYTES` | `52428800` (50 MB) | Largest state snapshot the hub will upload or restore; an oversized one is skipped with a warning rather than restored (`0` disables the bound) |
 | `HUB_STATE_DB_FILENAME` | `state.sqlite3` | File name of the SQLite sidecar holding rate-limit counters and view analytics, under `HUB_CACHE_DIR` |
+| `HUB_INSTANCE_LOCK_FILENAME` | `instance.lock` | File name, under `HUB_CACHE_DIR`, of the exclusive lock the process takes at startup and holds until it exits. A second process on the same cache directory fails to start (see *Deployment*, "One hub is one process") |
 | `HUB_WEBHOOK_TIMEOUT_S` | `10` | Per-request HTTP timeout for one webhook delivery attempt |
 | `HUB_WEBHOOK_MAX_ATTEMPTS` | `3` | Total POST attempts per (URL, event) before giving up; retries back off `2**n` seconds, capped at 60 |
 | `HUB_WEBHOOK_QUEUE_MAX` | `1000` | Queued-but-undelivered webhook deliveries kept at once; past this the newest is dropped with a log line rather than blocking the request that produced it |
 | `HUB_MAX_WEBHOOKS_PER_ARTIFACT` | `5` | How many webhook URLs one artifact may register |
+| `HUB_WEBHOOK_KEY_OVERLAP_S` | `600` | Seconds a receiver's previous signing key stays valid after `POST .../webhooks/{receiver_id}/rotate-key` (carried in `X-Hub-Signature-256-Previous` alongside the new key's `X-Hub-Signature-256`); `0` disables the grace period |
 | `HUB_MAX_INVITATIONS_PER_ARTIFACT` | `20` | How many live guest invitations one artifact may hold at once (revoked ones are reclaimed automatically to make room) |
+| `HUB_EXPORT_MAX_BYTES` | `67108864` (64 MB) | Ceiling on the source material one vault export may render, and on the archive it writes; a larger artifact answers 413 before anything is built (`0` disables the bound) |
+| `HUB_MAX_EXPORTS_PER_HOUR` | `20` | Vault exports of one artifact one client address may build per UTC hour before the export answers 429 |
 
 ## Deployment to Keboola
 
@@ -448,7 +486,7 @@ release tag explicitly — `--git-branch` defaults to
 kbagent data-app create \
   --project artifacts \
   --git-repo https://github.com/padak/kbc_ai_artifact \
-  --git-branch v0.9.0 \
+  --git-branch v0.11.0 \
   --git-public
 ```
 
@@ -469,14 +507,73 @@ service's own `git_ref` has. To pin a specific commit, tag it first.
 Omitting `--git-branch` (tracking `main`) is fine for a development or
 staging app where following the branch is the point.
 
-**One hub is one container.** A Data App runs as a single container that
-suspends when idle and restarts on demand — never two instances side by
-side — and one hub serves one organisation. The service relies on that: its
-artifact index, its locks and its state snapshots are designed for exactly
-one writer, and Storage Files cannot coordinate two (they are immutable, with
-no create-if-absent). Do not put replicas or extra worker processes in front
-of it; each organisation runs its own app instead. If a second writer ever
-does appear, the state sidecar logs an ERROR saying so.
+**One hub is one process.** A Data App runs as a single container that
+suspends when idle and restarts on demand — never two side by side — and one
+hub serves one organisation. The service relies on that: its artifact index,
+its locks and its state snapshots are designed for exactly one writer, and
+Storage Files cannot coordinate two (they are immutable, with no
+create-if-absent). Do not run it with `--workers`, behind a second copy of
+itself, or with two containers sharing a cache directory; each organisation
+runs its own app instead.
+
+That is now enforced rather than assumed, in two places:
+
+- **A startup lock.** The process takes an exclusive `flock` on
+  `instance.lock` inside `HUB_CACHE_DIR` and holds it until it exits. A second
+  worker or a second container on the same disk fails to start, with an error
+  naming this rule, instead of starting successfully and quietly losing the
+  first one's writes.
+- **Readiness fails on a detected second writer.** Two processes on *different*
+  disks cannot see each other's lock, but they do see each other's state
+  snapshots in Storage. When the state sidecar finds a snapshot it did not
+  write, the process stops writing operational state altogether (rate-limit
+  counters fall back to per-process tallies, nothing is deleted, and both
+  snapshots are left in Storage for you to compare) and `GET /health` starts
+  answering **503** with a `detail` naming the invariant. `POST /` — the
+  platform's own startup check — keeps answering 200, so the container is not
+  restarted into the same broken situation; the fix is to stop the extra
+  process and restart the remaining one.
+
+**Tell the hub which proxy to believe.** The brute-force budgets behind the
+artifact password gate and the guest-invitation gate are keyed on the client
+address, and behind the platform proxy the only address the app sees on the
+connection is the proxy's. The real one arrives in `X-Real-IP` /
+`X-Forwarded-For` — but those headers are equally easy for a direct caller to
+write, so the hub believes them only when the connection came from a network
+you named:
+
+```bash
+kbagent data-app secrets-set --secrets-file <file>   # HUB_TRUST_FORWARDED_HEADERS=1
+                                                     # HUB_TRUSTED_PROXY_CIDRS=10.0.0.0/8,198.51.100.0/24
+```
+
+Set `HUB_TRUSTED_PROXY_CIDRS` to the networks of your proxies (and
+`HUB_TRUST_FORWARDED_HEADERS=1`, which both this and the public-origin
+headers require). Multiple networks are comma-separated; a malformed entry
+fails at startup rather than being skipped.
+
+**List every hop, not just the nearest one.** Each proxy in the path
+*appends* the address it accepted the connection from — nginx does this with
+`$proxy_add_x_forwarded_for` — so `X-Forwarded-For` arrives oldest-first and
+its **leftmost** entry is whatever the original caller chose to send. The hub
+therefore reads the chain from the **right**, skipping entries that are
+themselves inside `HUB_TRUSTED_PROXY_CIDRS`, and takes the first entry left
+over as the client. If a hop's network is missing from the list, the walk
+stops at that hop and every reader behind it shares its bucket — safe, but no
+better than leaving the setting empty. Every candidate must also parse as an
+IP address (a `host:port` or `[v6]:port` form is accepted, an IPv4-mapped
+IPv6 address is folded back to its IPv4 form); anything else is ignored and
+the hub falls back to the connection's own address. Only the last
+`HUB_MAX_FORWARDED_CHAIN_ENTRIES` entries are looked at, so a very long
+header costs no more than a short one.
+
+**If you leave it unset, nothing breaks** — the hub falls back to the address
+the connection actually came from, which behind the proxy is the proxy
+itself. That is safe (no caller can choose their own bucket) but coarse:
+every reader of a password-protected document shares one hourly budget, so
+one person guessing passwords can push everyone else into 429 until the hour
+rolls over. The per-artifact backstop
+(`HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR`) applies either way.
 
 Secrets are set with `kbagent data-app secrets-set` and never committed to
 the repository:
@@ -505,22 +602,73 @@ to the current password's own hash, so a cookie signed under a since-changed
 password no longer verifies, and an unlock on one artifact does not unlock
 another.
 
-**Known boundary: ownership is the project, not the individual token.**
+**Ownership is the project; destructive authority is configurable.**
 Every owner-only route (update, trash, restore, purge, rotate-link,
 invitations, stats, promote, head) authorizes by verifying the caller's
 Storage token against the stack and checking that it resolves to the same
-`(stack, project)` pair that originally published the artifact — it does not
-inspect the token's scope, role, or whether it was meant to be read-only.
-Concretely: **any** valid Storage token belonging to the owning project
-carries full destructive owner authority over every artifact that project
-owns, regardless of what that particular token's permissions were intended
-to allow. This is a known, intentional boundary of the current design, not
-an oversight — pick a project for artifact administration whose *every*
-token holder you would trust with purge/rotate/promote power, rather than
-handing out a narrowly-scoped token expecting the hub to enforce that
-narrower scope on its own. A future release may add token-scope or
-SSO-based finer-grained control; today, the project boundary is the whole
-boundary.
+`(stack, project)` pair that originally published the artifact. That check
+is project-level by design and stays that way: it does not ask which token
+of the project you used.
+
+By itself that meant **any** valid Storage token of the owning project —
+including a read-only or single-purpose one — could purge an artifact,
+rotate its public link or delete a version (tracked as `SEC-075-011`).
+`HUB_DESTRUCTIVE_TOKEN_POLICY` now lets an operator narrow exactly that,
+using the token-level claims the same `tokens/verify` call already returns:
+
+| Policy | Who may run a destructive route |
+|---|---|
+| `project` *(default)* | Any token of the owning project — the historical behaviour, unchanged |
+| `admin` | A master token, or one belonging to a project user whose `admin.role` is `admin` |
+| `allowlist` | Only tokens whose id is listed in `HUB_DESTRUCTIVE_TOKEN_IDS` |
+
+The gate covers the irreversible and link-breaking routes only: `DELETE
+/api/artifacts/{id}` (soft delete), `DELETE /api/artifacts/{id}/purge`,
+`DELETE /api/artifacts/{id}/versions/{n}` when run as the owner, `POST
+/api/artifacts/{id}/rotate-link` and `POST
+/api/artifacts/{id}/webhooks/{receiver_id}/rotate-key`. **Non-destructive
+owner routes are deliberately untouched** by every policy — update, head
+pin, promote, settings, invitations, stats and trash restore stay
+project-authorized, and a contributor withdrawing their *own* proposal is
+never gated. A token that fails the policy gets `403` whose `detail` names
+the active policy and what the credential lacked; the detail never echoes
+the token and never reveals the allowlist's contents. The active policy
+*name* (not its contents) is reported in `GET /context` under `limits`.
+
+The default stays `project` so that upgrading cannot silently lock an
+operator out of artifacts they already own — but **for a shared project,
+set `HUB_DESTRUCTIVE_TOKEN_POLICY=admin`**. Use `allowlist` when even
+project administrators should not be able to purge, and destructive work is
+meant to run from one specific automation token.
+
+**Mitigation without the policy, or in addition to it:** use a dedicated
+Keboola project for artifact publishing (or a token issued only for that
+purpose, in a project that holds nothing else sensitive) rather than
+reusing a broadly-scoped production project's token — under the default
+policy any token of that project can purge every artifact it owns.
+
+**Network egress: git and webhook hostname checks are best-effort, not a
+guarantee (`SEC-075-005`, `SEC-075-006`).** Before cloning a `git_url` and
+before delivering a webhook, the hub resolves the target hostname and
+rejects it if any resolved address is loopback, private (RFC1918/ULA),
+link-local, reserved, or a known cloud-metadata address
+(`169.254.169.254`, `*.internal`) — see `HUB_GIT_ALLOW_PRIVATE_HOSTS` below.
+This check is re-run immediately before the git clone subprocess to narrow
+the window, and the git clone itself now runs with
+`-c http.followRedirects=false` (`SEC-100-005`) so a redirect to an
+unvalidated host is refused instead of silently followed. None of that
+closes the gap completely: both git (via libcurl) and the webhook HTTP
+client (`httpx`) resolve the hostname a second time, independently, at
+connect time — a DNS answer that changes between the hub's validation and
+that second resolution (DNS rebinding) is a resolver-to-connect
+time-of-check/time-of-use gap this application cannot close with its
+current clients, because neither client exposes a way to pin the connection
+to the IP address the hub already validated. **The reliable control is
+operational, not this application:** run the hub's container behind an
+egress policy or resolver-aware outbound proxy that denies connections to
+loopback, RFC1918/ULA, link-local, cluster/service, and cloud-metadata
+ranges regardless of what hostname validation concluded. Treat the
+in-application hostname check as defense in depth, not the boundary.
 
 **Capability revocation (0.7.0).** `POST /api/artifacts/{id}/rotate-link`
 mints a fresh public share id and the previous one — plus the bare internal
@@ -542,8 +690,11 @@ and `outdated` — is listed to anyone holding the capability URL, so treat
 notes as public. Submissions are capped per contributing project per artifact
 per day (`HUB_MAX_VERSIONS_PER_DAY`); since 0.7.0 that counter — and every
 other rate-limit and view-count counter — lives in a SQLite sidecar
-snapshotted into Storage Files rather than in process memory, so it survives a
-redeploy and is shared across replicas instead of resetting per instance.
+snapshotted into Storage Files rather than in process memory, so a budget
+survives a redeploy instead of resetting every time the container restarts.
+The sidecar is durable, not shared: this service runs as exactly one process
+(see *Deployment* above), and a second one writing the same snapshots is an
+error it detects and refuses to work through, not a supported topology.
 
 Since 0.6.0, `/a/{id}` and `/a/{id}/v/{n}` render an artifact inside a
 `srcdoc` iframe sandboxed without `allow-same-origin`, so a published
@@ -560,9 +711,29 @@ treated as equally sensitive: they are only ever echoed back in the `PUT`
 response that set them, never in `GET /api/artifacts` (which reports a count
 instead), and every delivery is HMAC-signed (`X-Hub-Signature-256`) so a
 receiver can reject a forged POST. Each receiver is signed with its **own**
-key, bound to the artifact and the receiver URL, so a receiver cannot forge a
-delivery for a different receiver or a different document; owners read those
-keys from `GET /api/artifacts/{id}/webhooks`.
+key, bound to the artifact, the receiver URL and a rotatable epoch, so a
+receiver cannot forge a delivery for a different receiver or a different
+document; owners read those keys from `GET /api/artifacts/{id}/webhooks`.
+Both that listing and `POST .../webhooks/{receiver_id}/rotate-key` carry
+`Cache-Control: no-store` and `Pragma: no-cache`, since the response body is
+a credential and must never be served from a shared or browser cache.
+
+**Rotating a receiver's key (SEC-100-006).** Before rotation, a receiver's
+key was derived purely from `(artifact_id, url)`: re-registering the same URL
+always reproduced the same key, so a leaked key could only be invalidated by
+changing the URL (revoking the receiver) or the hub's own master secret
+(rotating every receiver on every artifact at once). `POST
+/api/artifacts/{id}/webhooks/{receiver_id}/rotate-key` mints an independent,
+random key epoch for one receiver without touching its URL or any other
+receiver. For `HUB_WEBHOOK_KEY_OVERLAP_S` seconds afterwards (default 600),
+deliveries to that receiver carry both the new signature
+(`X-Hub-Signature-256`) and the previous one
+(`X-Hub-Signature-256-Previous`), so a receiver that has not yet picked up
+the new key from the rotate response keeps verifying deliveries; past the
+window only the new signature is sent and the old key verifies nothing. A
+meta record persisted before this field existed has no epoch on file at all,
+which is read exactly like a receiver that has simply never been rotated —
+no migration step, no re-registration.
 
 ## Contributing
 

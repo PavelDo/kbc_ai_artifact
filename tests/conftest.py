@@ -20,7 +20,23 @@ import pytest
 
 from src.config import Settings, load_settings
 from src.kbc import InMemoryFilesBackend
+from src.statedb import reset_foreign_writer
 from src.store import ArtifactStore
+
+
+@pytest.fixture(autouse=True)
+def _clean_foreign_writer_latch():
+    """Start and end every test with the ARCH-100-001 latch cleared.
+
+    The "another instance is writing our state" flag is deliberately
+    process-wide and one-way: a live hub never un-detects a second writer. That
+    makes it leak between tests in one pytest process, where the test that
+    trips it would otherwise leave every later test refusing state writes and
+    answering 503 on /health. Reset on both sides so neither ordering matters.
+    """
+    reset_foreign_writer()
+    yield
+    reset_foreign_writer()
 
 
 @pytest.fixture

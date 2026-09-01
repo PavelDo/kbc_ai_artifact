@@ -104,20 +104,27 @@ for one call, prefix the environment: `KBC_TOKEN="$CONTRIBUTOR_TOKEN" hub …`.
 **Never put the token in a URL, query string, or the request body.** It only
 ever belongs in the `X-StorageApi-Token` header.
 
-**Known boundary: ownership is the project, not the individual token.** The
-hub authorizes owner-only operations (update, trash, restore, purge,
-rotate-link, invitations, stats, promote, head) by checking only that a
-token verifies to the same `(stack, project)` pair that originally published
-the artifact — it does not inspect the token's scope or role. This means
-**any** valid Storage token belonging to the owning project — including a
-read-only, single-purpose, or otherwise restricted one — carries full
-destructive owner authority over every artifact that project owns. This is
-intentional in the current design, not an oversight: use a project for
-artifact administration whose *every* token holder you would trust with
-purge/rotate/promote power, not one where you hand out narrowly-scoped
-tokens expecting them to be denied these actions. A future release may add
-token-scope or SSO-based finer-grained control; today, the project boundary
-is the whole boundary.
+**Ownership is the project, not the individual token.** The hub authorizes
+owner-only operations (update, trash, restore, purge, rotate-link,
+invitations, stats, promote, head) by checking that a token verifies to the
+same `(stack, project)` pair that originally published the artifact. It does
+not ask *which* token of that project you used — so by default **any** valid
+Storage token belonging to the owning project, including a read-only or
+single-purpose one, carries full owner authority over every artifact that
+project owns.
+
+A hub operator can narrow this for the *destructive* operations alone (soft
+delete, purge, owner version delete, rotate-link, webhook key rotation) with
+`HUB_DESTRUCTIVE_TOKEN_POLICY`: `project` (the default, as described above),
+`admin` (a master token or a project user with the `admin` role), or
+`allowlist` (specific token ids). Check `GET /context` → `limits.
+destructive_token_policy` to see what the hub you are talking to runs; under
+a stricter policy a destructive call answers 403 with a `detail` saying so,
+and no amount of retrying will change it. Non-destructive owner operations
+are never affected, and withdrawing a proposal you yourself submitted is
+never gated. Regardless of policy, pick a project for artifact
+administration whose token holders you would trust with purge/rotate/promote
+power.
 
 ## Workflows
 
@@ -312,22 +319,28 @@ data URIs so the resulting artifact stays a single, self-contained document.
 ### Publish from a private git repository
 
 Add `git_token` — a personal access token for the git host (GitHub PAT, GitLab
-token, …) — to clone a repository that is not public:
+token, …) — to clone a repository that is not public. Treat `git_token`
+exactly like the Storage token above: never write its literal value into a
+`-d` string or any other command argument. Have `jq` read it from its own
+environment with `env.GIT_TOKEN` — only the variable *name* appears in the
+program text, never the value — and pipe the JSON to curl on stdin instead of
+building it inline:
 
 ```bash
-hub -X POST "$HUB/api/artifacts" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "git_url": "https://github.com/org/private-repo",
-    "git_ref": "main",
-    "git_path": "docs/report.md",
-    "git_token": "your-github-pat"
-  }'
+export GIT_TOKEN="…"   # your git host PAT
+jq -n --arg url "https://github.com/org/private-repo" \
+      --arg ref "main" \
+      --arg path "docs/report.md" \
+      '{git_url: $url, git_ref: $ref, git_path: $path, git_token: env.GIT_TOKEN}' \
+  | hub -X POST "$HUB/api/artifacts" \
+      -H "Content-Type: application/json" \
+      --data-binary @-
 ```
 
 `git_username` is optional and defaults to `x-access-token`, which is what
 GitHub PATs and GitLab deploy tokens expect. Set it only for hosts that
-require a real username.
+require a real username (add it the same way, with a plain `--arg` since a
+username is not a secret).
 
 **Transient credentials.** Exactly like your Storage token, `git_token` is
 used only for the clone inside that one request: it is never written to the
@@ -604,8 +617,11 @@ hub -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/versions/2"
 ```
 
 The owner may delete any version except the last live one (409 — an artifact
-must keep one). A contributor may delete only their own proposal, which is how
-you withdraw a submission.
+must keep one) and the version the head is currently pinned to (409 — the
+stored head would be left naming a version that no longer exists; pin the head
+to another live version or switch it back to `latest`, then delete). A
+contributor may delete only their own proposal, which is how you withdraw a
+submission.
 
 ### Pin the head
 
@@ -622,8 +638,9 @@ hub -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/head" \
 ```
 
 Owner only. The pinned version must exist and be live (422 otherwise), and it
-is protected from retention pruning. The response reports
-`head_version_served`.
+is protected from retention pruning *and* from deletion — `DELETE
+.../versions/{n}` on the pinned version answers 409 until the head moves. The
+response reports `head_version_served`.
 
 ### Limits
 
@@ -939,6 +956,33 @@ attacker can use to forge a valid signature byte by byte. Use the *raw request
 body bytes*, not a re-serialized JSON object: any change in key order or
 whitespace changes the HMAC.
 
+### Rotate a receiver's key
+
+A leaked key no longer means re-registering under a new URL. `POST
+/api/artifacts/{id}/webhooks/{receiver_id}/rotate-key` (owner-only) mints an
+independent key for one receiver, leaving its URL and every other receiver
+untouched. `receiver_id` is the `id` field `GET .../webhooks` reports for
+that URL (also given as `rotate_key_url`, ready to use as-is):
+
+```bash
+hub -X POST "$HUB/api/artifacts/$ID/webhooks/$RECEIVER_ID/rotate-key"
+```
+
+The response carries the new `signing_key`, `rotated_at`, and
+`overlap_seconds` — for that many seconds after `rotated_at` (default 600,
+config `HUB_WEBHOOK_KEY_OVERLAP_S`), deliveries to this receiver are signed
+*twice*: the new key as `X-Hub-Signature-256` and the previous key as
+`X-Hub-Signature-256-Previous`, so update the receiver's configured key
+whenever convenient inside that window without dropping any delivery in
+between. A verifier that only ever checks `X-Hub-Signature-256` needs no
+change at all — that header always carries the current key's signature.
+Past the window `X-Hub-Signature-256-Previous` stops being sent and the
+previous key verifies nothing.
+
+Both `GET .../webhooks` and the rotate response are `Cache-Control:
+no-store` — a signing key is a credential, never something to let a shared
+or browser cache hold onto.
+
 ### Delivery is best-effort
 
 The delivery queue is in-memory: a hub restart drops whatever was pending. The
@@ -986,7 +1030,7 @@ your `html`: it is the difference between `original` and `converted` here.
 hub "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/export/vault" -o vault.zip
 ```
 
-Returns an in-memory ZIP that is a ready-to-open Obsidian vault:
+Returns a ZIP that is a ready-to-open Obsidian vault:
 
 - `INDEX.md` — the hub note, wikilinked to every version and every comment
   thread, plus artifact-level frontmatter (status, owner, version and comment
@@ -1006,6 +1050,17 @@ there is no separate graph engine to run. This is the artifact's endpoint for
 "archive everything that happened here" — pull it once a document is marked
 `final` to keep a permanent, browsable record of the discussion that produced
 it.
+
+The archive is streamed rather than assembled in memory, and it is budgeted,
+because building one diffs every version and converts every HTML document —
+the heaviest thing this service does for an unauthenticated caller:
+
+- **413** when the artifact's visible history and comments exceed the hub's
+  `HUB_EXPORT_MAX_BYTES` (64 MB by default). Nothing is built. Fall back to
+  `GET /a/{id}/export/markdown` for the served version.
+- **429** when this client address has already built `HUB_MAX_EXPORTS_PER_HOUR`
+  vaults of this artifact in the current hour (20 by default). Pull the vault
+  once and keep it; do not poll or re-download this endpoint.
 
 ## Reading (public, no token required)
 
@@ -1038,7 +1093,7 @@ either against a frozen document answers 409.
 | `GET /a/{id}/guest` | Resolve an `X-Artifact-Guest` credential to its display name, without writing anything |
 | `GET /a/{id}/review` | Browser review UI: select text to comment, sidebar of threads, sandboxed artifact iframe; also the guest entry point via a `#invite=` link |
 | `GET /a/{id}/export/markdown` | Head version as Markdown: the author's own source, else converted from the HTML (lossy for charts and images); `X-Artifact-Markdown-Source: original\|converted` says which |
-| `GET /a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, and a chronological reasoning trail) |
+| `GET /a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, and a chronological reasoning trail); 413 over `HUB_EXPORT_MAX_BYTES` of history, 429 over `HUB_MAX_EXPORTS_PER_HOUR` builds per hour |
 | `GET /changelog` | Rendered changelog, in the hub's own visual design |
 | `GET /admin` | Browser moderation studio for the artifact owner (token pasted client-side, never stored server-side) |
 | `GET /agent` | This hub's SKILL.md distilled into a ready-to-install Claude Code subagent |
@@ -1089,13 +1144,23 @@ mind:
 |---|---|
 | 400 | Unknown or disallowed `X-Storage-Stack` value, a malformed diff spec (use `{older}..{newer}`), or an unknown diff `format` |
 | 401 | Storage token rejected by the stack, wrong artifact password, or an unknown/revoked/malformed `X-Artifact-Guest` credential (the three guest cases are deliberately indistinguishable) |
-| 403 | Token is valid but not from the owning project (update, trash, restore, purge, rotate-link, stats, invitations, promote, head); the artifact does not accept versions from other projects; you asked for a proposal you did not author; or comments are closed (`comments_mode: "off"`) or you are not on the `contributors` allowlist |
+| 403 | Token is valid but not from the owning project (update, trash, restore, purge, rotate-link, stats, invitations, promote, head); the artifact does not accept versions from other projects; you asked for a proposal you did not author; or comments are closed (`comments_mode: "off"`) or you are not on the `contributors` allowlist. **Also**: the *destructive* routes (soft delete, purge, owner version delete, rotate-link, webhook key rotation) can require more than a token of the owning project — this hub's `destructive_token_policy` (reported by `GET /context` under `limits`) may additionally demand a master/admin token or one whose id the operator allowlisted. The `detail` names the policy and what your token lacked. Non-destructive owner routes are never affected |
 | 404 | Unknown artifact id (identical response whether it never existed, was purged, or its share id was rotated away), or no such version, comment thread, or invitation |
-| 409 | Promoting a version that is already live; deleting the only live version of an artifact; submitting a version, a comment, or a new invitation on an artifact whose `status` is `"final"` or that is trashed (the detail names which, and the way out — reopen vs. restore); resolving/reopening a thread already in that state; or restoring an artifact that is not in the trash |
-| 413 | Built HTML over the size limit, a diff side over `HUB_DIFF_MAX_BYTES` (for `format=visual`, the rendered HTML of the larger side) |
+| 409 | Promoting a version that is already live; deleting the only live version of an artifact; deleting the version the head is pinned to (re-pin or switch the head to `latest` first); submitting a version, a comment, or a new invitation on an artifact whose `status` is `"final"` or that is trashed (the detail names which, and the way out — reopen vs. restore); resolving/reopening a thread already in that state; or restoring an artifact that is not in the trash |
+| 413 | The request body itself is over the inbound ceiling for that route — the document routes (publish, update, submit a version) accept a whole document, every other route (comments and replies included) accepts `HUB_MAX_SMALL_REQUEST_BYTES`, 256 KB by default — or the built HTML is over the size limit, or a diff side is over `HUB_DIFF_MAX_BYTES` (for `format=visual`, the rendered HTML of the larger side) |
 | 422 | Build failure — bad git repo, no entry file found, markdown render error, `git_token`/`git_username` sent without `git_url`, `markdown_source` sent without `html`, a `title` sent without content, pinning the head to a version that does not exist or is not live, a `base_version` naming a version that does not exist, an invalid/blocked webhook URL or too many of them, or an empty/over-long/over-quota invitation name |
-| 429 | Your project reached the daily version-submission cap for this artifact, the daily `HUB_MAX_COMMENTS_PER_DAY` comment/reply cap (per project or per guest invitation), or too many wrong unlock-password attempts from your address this hour |
-| 502 | The Keboola stack itself could not be reached to verify the token, or the hub's own Storage backend is unavailable |
+| 429 | Your project reached the daily version-submission cap for this artifact, the daily `HUB_MAX_COMMENTS_PER_DAY` comment/reply cap (per project or per guest invitation), or too many wrong unlock-password / invitation attempts this hour — budgeted both per client address and, as a backstop nobody can rotate away, per artifact across all addresses |
+| 502 | The Keboola stack itself could not be reached to verify the token, or the hub's own Storage backend is unavailable. On `PUT /api/artifacts/{id}` the `detail` also states what is in force — see below |
+
+A `PUT` that mixes new content with new settings is never left in a state
+looser than it started in: the settings that **narrow** access (`password`,
+closing `accept_versions_mode`/`comments_mode`, `"status": "final"`) are
+committed before the new version, and the ones that **widen** it
+(`clear_password`, reopening a mode, `"status": "draft"`) after it. A 502 from
+that call therefore reports one of three outcomes in its `detail` — nothing
+applied, the narrowing settings applied without the version, or the version
+live under the previous narrower settings — and what to resend. Read it rather
+than assuming the request changed nothing.
 
 ## Safety notes
 

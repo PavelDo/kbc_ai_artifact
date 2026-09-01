@@ -67,6 +67,17 @@ _OWNER_PROJECTS: dict[str, tuple[int, str]] = {
     "other-token": (999, "Other"),
 }
 
+#: token -> extra ``Owner`` claim keyword arguments, mirroring the token-level
+#: fields a real ``/v2/storage/tokens/verify`` body carries (SEC-075-011).
+#: A token absent from this mapping gets the least-privileged defaults, which
+#: is what every test written before the destructive-token policy expects. The
+#: two standard tokens are master tokens, so the whole existing suite keeps
+#: full authority under any HUB_DESTRUCTIVE_TOKEN_POLICY.
+_TOKEN_CLAIMS: dict[str, dict[str, Any]] = {
+    "good-token": {"token_id": "tok-good", "is_master_token": True},
+    "other-token": {"token_id": "tok-other", "is_master_token": True},
+}
+
 
 class Api(NamedTuple):
     client: TestClient
@@ -134,7 +145,10 @@ def api(tmp_path, settings, monkeypatch):
             raise AuthError("Storage token rejected by the stack")
         project_id, project_name = project
         return Owner(
-            stack_url=stack_url, project_id=project_id, project_name=project_name
+            stack_url=stack_url,
+            project_id=project_id,
+            project_name=project_name,
+            **_TOKEN_CLAIMS.get(token, {}),
         )
 
     monkeypatch.setattr(main, "KbcFilesBackend", fake_kbc_files_backend)
@@ -272,6 +286,7 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("POST", "/api/artifacts/{id}/restore"),
         ("DELETE", "/api/artifacts/{id}/purge"),
         ("GET", "/api/artifacts/{id}/webhooks"),
+        ("POST", "/api/artifacts/{id}/webhooks/{receiver_id}/rotate-key"),
         ("POST", "/api/artifacts/{id}/rotate-link"),
         ("GET", "/api/artifacts/{id}/stats"),
         ("POST", "/api/artifacts/{id}/invitations"),
@@ -2373,7 +2388,10 @@ def test_comment_body_and_quote_validation_is_422(api: Api) -> None:
 
     long_quote = _comment(api, artifact_id, exact="x" * 2001)
     assert long_quote.status_code == 422
-    assert "too long" in long_quote.json()["detail"]
+    # SEC-100-004 put the store's own ceiling on the field itself, so an
+    # oversized quote is refused by request validation before it reaches the
+    # comment store's "quoted selection is too long" check.
+    assert "at most 2000 characters" in long_quote.text
 
 
 def test_comments_are_rate_limited_per_day(api: Api, monkeypatch) -> None:
@@ -3645,8 +3663,17 @@ def test_password_header_path_is_throttled_too(api: Api, monkeypatch) -> None:
     assert "too many wrong passwords" in blocked.json()["detail"]
 
 
-def test_unlock_throttle_buckets_per_client_address(api: Api, monkeypatch) -> None:
-    """A different client address gets its own budget (X-Real-IP from nginx)."""
+def test_unlock_throttle_ignores_an_untrusted_forwarded_address(
+    api: Api, monkeypatch
+) -> None:
+    """SEC-100-003: changing X-Real-IP no longer buys a fresh budget.
+
+    The header is honoured only from a peer inside HUB_TRUSTED_PROXY_CIDRS,
+    which is unset here (and in every default deployment), so all three
+    attempts share the peer's bucket. The trusted-proxy case — where a
+    forwarded address *does* get its own budget — lives in
+    tests/test_review100_request_hygiene.py.
+    """
     artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
     _low_unlock_limit(api, monkeypatch, limit=1)
 
@@ -3664,13 +3691,13 @@ def test_unlock_throttle_buckets_per_client_address(api: Api, monkeypatch) -> No
         ).status_code
         == 429
     )
-    # A second address is unaffected.
+    # A second address does not reset it: the caller chose that header.
     assert (
         api.client.get(
             f"/a/{artifact_id}/raw",
             headers={"X-Artifact-Password": "wrong", "X-Real-IP": "10.0.0.2"},
         ).status_code
-        == 401
+        == 429
     )
 
 
@@ -5513,7 +5540,16 @@ def test_guest_cannot_use_the_management_api(api: Api) -> None:
     assert row["status"] == "draft"
 
 
-def test_guest_comments_emit_a_webhook_naming_the_guest(api: Api) -> None:
+def test_guest_comments_emit_a_webhook_naming_the_guest(api: Api, monkeypatch) -> None:
+    # Registering "https://example.com/hook" goes through the real
+    # validate_webhook_url -> DNS resolution path (this test does not use the
+    # `hooked` fixture, which stubs that out for its own "hooks.test" host).
+    # Injecting a public answer here keeps the whole suite runnable with no
+    # network/public DNS available -- see the review's "tests must not depend
+    # on public DNS" finding.
+    monkeypatch.setattr(
+        "src.webhooks._resolve_host_ips", lambda _hostname: ["93.184.216.34"]
+    )
     artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
     assert _policy(
         api, artifact_id, webhooks=["https://example.com/hook"]
@@ -5764,10 +5800,12 @@ def test_guest_credential_checks_are_throttled(api: Api, monkeypatch) -> None:
     # One budget covers every route that verifies a guest credential.
     assert _guest_comment(api, artifact_id, wrong).status_code == 429
 
-    # Another client address has its own budget (X-Real-IP, as nginx sets it).
+    # SEC-100-003: a self-chosen X-Real-IP does not buy a fresh budget. The
+    # header counts only from a peer inside HUB_TRUSTED_PROXY_CIDRS, which no
+    # default deployment configures.
     assert api.client.get(
         f"/a/{artifact_id}/guest", headers={**wrong, "X-Real-IP": "10.0.0.9"}
-    ).status_code == 401
+    ).status_code == 429
 
 
 # --------------------------------------------------------------------------

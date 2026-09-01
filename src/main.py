@@ -25,15 +25,19 @@ transient Storage outage cannot put the app into a crash loop.
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import functools
 import hashlib
+import ipaddress
 import json
 import logging
+import os
 import re
 import sys
 import threading
 import tomllib
-from contextlib import asynccontextmanager
+from collections import OrderedDict
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError
@@ -46,6 +50,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import (
+    FileResponse,
     HTMLResponse,
     JSONResponse,
     PlainTextResponse,
@@ -53,6 +58,7 @@ from fastapi.responses import (
     Response,
 )
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from src import builder, export
 from src.auth import (
@@ -66,6 +72,8 @@ from src.auth import (
 )
 from src.builder import BuildError, BuiltArtifact
 from src.comments import (
+    MAX_BODY_CHARS,
+    MAX_QUOTE_CHARS,
     MAX_REPLIES_PER_THREAD,
     MAX_THREAD_BYTES,
     CommentStore,
@@ -97,14 +105,20 @@ from src.security import (
     hash_password,
     new_artifact_id,
 )
-from src.statedb import StateDB
+from src.statedb import StateDB, foreign_writer_detected
 from src.store import (
+    ACCEPT_ALLOWLIST,
+    ACCEPT_ANYONE,
     ACCEPT_MODES,
+    ACCEPT_OFF,
     ARTIFACT_DRAFT,
     ARTIFACT_FINAL,
     ARTIFACT_SETTABLE_STATUSES,
     ARTIFACT_TRASHED,
+    COMMENTS_ALLOWLIST,
+    COMMENTS_ANYONE,
     COMMENTS_MODES,
+    COMMENTS_OFF,
     HEAD_LATEST,
     HEAD_PINNED,
     STATUS_LIVE,
@@ -114,7 +128,13 @@ from src.store import (
     Envelope,
     tag_for_id,
 )
-from src.webhooks import WebhookDispatcher, WebhookEvent, validate_webhook_url
+from src.webhooks import (
+    WebhookDispatcher,
+    WebhookEvent,
+    mint_key_epoch,
+    receiver_id_for,
+    validate_webhook_url,
+)
 
 SERVICE_NAME = "kbc-artifact-hub"
 
@@ -365,17 +385,33 @@ RESP_HUB_502 = {
 RESP_NOT_FOUND = {"description": "No artifact exists with this id."}
 RESP_UNLOCK_429 = {
     "description": (
-        "Too many failed password attempts for this artifact from this "
-        "client address in the current hour (HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR)."
+        "Too many failed password attempts for this artifact — either from "
+        "this client address in the current hour "
+        "(HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR) or, as a backstop no change of "
+        "address gets around, from every address together "
+        "(HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR)."
     )
 }
 RESP_GUEST_429 = {
     "description": (
         "Too many failed password *or* invitation attempts for this artifact "
-        "from this client address in the current hour "
-        "(HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR, counted separately for each). "
-        "Verifying an invitation secret is as expensive as verifying a "
-        "password, so rejected credentials are budgeted the same way."
+        "in the current hour, counted separately for each and budgeted both "
+        "per client address (HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR) and per "
+        "artifact across all addresses "
+        "(HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR). Verifying an "
+        "invitation secret is as expensive as verifying a password, so "
+        "rejected credentials are budgeted the same way."
+    )
+}
+#: SEC-100-004. Answered from the ASGI layer before routing, authentication,
+#: lock allocation, body parsing or PBKDF2, so it is the one error that can
+#: arrive without the route having run at all.
+RESP_BODY_413 = {
+    "description": (
+        "The request body is larger than this route accepts. Routes that "
+        "carry a document (publish, update, submit a version) allow a whole "
+        "document; every other route allows HUB_MAX_SMALL_REQUEST_BYTES "
+        "(256 KB by default). Both ceilings are reported by GET /context."
     )
 }
 RESP_VERSIONS_429 = {
@@ -399,6 +435,18 @@ RESP_FINAL_409 = {
 RESP_OWNER_403 = {
     "description": (
         "Token is valid but not from the project that owns this artifact."
+    )
+}
+
+#: SEC-075-011. The destructive routes answer 403 for a second reason the
+#: non-destructive owner routes never do: the token belongs to the owning
+#: project but does not satisfy this hub's HUB_DESTRUCTIVE_TOKEN_POLICY.
+RESP_DESTRUCTIVE_403 = {
+    "description": (
+        "Token is valid but not from the project that owns this artifact; or "
+        "it is, but this hub's destructive_token_policy (see GET /context, "
+        "'limits') requires an admin or allowlisted token for destructive "
+        "operations and this token is neither. The response detail says which."
     )
 }
 
@@ -481,29 +529,116 @@ settings: Settings = load_settings()
 #: Storage at once after a failed startup hydration.
 _hydrate_lock = threading.Lock()
 
-#: One lock per artifact, created on first use and kept for the life of the
-#: process. Every mutating ``/api/artifacts/{id}...`` route reads the artifact,
-#: decides, then writes -- through *separate* store locks -- so two requests
-#: on one artifact could interleave between the decision and the write and
-#: both act on a state that was no longer true: two promotions of one
-#: proposal both firing, two deletes jointly removing the last live version,
-#: a submission landing on a document finalized a moment earlier. This
-#: serializes whole routes per artifact instead. Sound because this process
-#: is the only writer (see CLAUDE.md, "Exactly one instance"); with a second
-#: instance it would be no protection at all. The registry never shrinks --
-#: it is bounded by the artifacts this process ever mutates, a few dozen
-#: bytes each.
-_artifact_locks: dict[str, threading.Lock] = {}
-_artifact_locks_guard = threading.Lock()
+#: Shape an artifact or share identifier taken from a URL path must have
+#: before anything at all is allocated for it. Ids are minted by
+#: ``secrets.token_urlsafe`` — 24 characters of the URL-safe alphabet — so
+#: this is a deliberate superset: the same character set the stores accept for
+#: cache file names (``_SAFE_ID_CHARS`` in src/store.py), with a length bound
+#: on top. Rejecting rather than trimming *is* the normalization: an
+#: identifier carrying whitespace, a slash, a dot or a hundred kilobytes of
+#: padding is not a mangled real id, it is somebody probing (SEC-100-002).
+_PATH_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
-def _artifact_lock(artifact_id: str) -> threading.Lock:
-    """The lock serializing mutations of one artifact."""
-    with _artifact_locks_guard:
-        lock = _artifact_locks.get(artifact_id)
-        if lock is None:
-            lock = _artifact_locks[artifact_id] = threading.Lock()
-        return lock
+class _ArtifactLockRegistry:
+    """Bounded, reference-counted registry of per-artifact mutation locks.
+
+    Every mutating ``/api/artifacts/{id}...`` route reads the artifact,
+    decides, then writes -- through *separate* store locks -- so two requests
+    on one artifact could interleave between the decision and the write and
+    both act on a state that was no longer true: two promotions of one
+    proposal both firing, two deletes jointly removing the last live version,
+    a submission landing on a document finalized a moment earlier. Holding one
+    lock per artifact for the whole handler serializes that. Sound because
+    this process is the only writer (see CLAUDE.md, "Exactly one instance");
+    with a second instance it would be no protection at all.
+
+    SEC-100-002 replaced the plain dictionary this used to be. That one kept
+    an entry for every key it was ever handed, and the comment routes handed
+    it keys straight out of the URL: 250 anonymous requests naming made-up
+    artifacts grew it by 250 entries that nothing would ever remove. Two
+    things changed. Keys now have to survive :data:`_PATH_ID` and name an
+    artifact that exists before a lock is taken at all (see
+    :func:`_serialized_per_comment_target`), and the registry itself is
+    reference-counted: an entry lives while somebody holds or waits for it,
+    and once the last holder leaves it becomes idle. Idle entries are kept in
+    a least-recently-used queue of at most ``HUB_LOCK_REGISTRY_MAX_ENTRIES``,
+    so a hot artifact keeps its lock object across requests while a long tail
+    of one-off artifacts is reclaimed.
+
+    Dropping an *idle* entry is safe precisely because it is idle: a key with
+    no holders has no lock state to lose, and the next request for it simply
+    creates a fresh lock. The invariant that matters -- two concurrent
+    requests for one key get the *same* lock object -- holds because the
+    refcount is taken under the registry guard before the lock is acquired,
+    so an entry cannot be reclaimed out from under a waiter.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
+        #: key -> how many requests hold or are waiting for its lock.
+        self._holders: dict[str, int] = {}
+        #: Keys with no holders, oldest first; the eviction queue.
+        self._idle: "OrderedDict[str, threading.Lock]" = OrderedDict()
+
+    def __len__(self) -> int:
+        """How many locks the registry currently holds (idle plus in use)."""
+        with self._guard:
+            return len(self._locks)
+
+    def clear(self) -> None:
+        """Forget every lock. For tests; never called while requests run."""
+        with self._guard:
+            self._locks.clear()
+            self._holders.clear()
+            self._idle.clear()
+
+    @contextmanager
+    def hold(self, key: str):
+        """Hold ``key``'s lock for the duration of the block."""
+        lock = self._checkout(key)
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+            self._return(key)
+
+    def _checkout(self, key: str) -> threading.Lock:
+        """Claim a reference on ``key``'s lock, creating it if needed."""
+        with self._guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = self._locks[key] = threading.Lock()
+            # No longer idle: it must not be evicted while we wait for it.
+            self._idle.pop(key, None)
+            self._holders[key] = self._holders.get(key, 0) + 1
+            return lock
+
+    def _return(self, key: str) -> None:
+        """Drop a reference; the last one out makes the entry evictable."""
+        with self._guard:
+            remaining = self._holders.get(key, 1) - 1
+            if remaining > 0:
+                self._holders[key] = remaining
+                return
+            self._holders.pop(key, None)
+            lock = self._locks.get(key)
+            if lock is None:
+                return
+            self._idle[key] = lock
+            self._idle.move_to_end(key)
+            bound = max(0, settings.lock_registry_max_entries)
+            while len(self._idle) > bound:
+                stale, _ = self._idle.popitem(last=False)
+                self._locks.pop(stale, None)
+
+
+#: The process-wide registry. Named as it was before SEC-100-002 so the
+#: reasoning in the routes still reads the same; ``len()`` and ``clear()``
+#: keep working on it too.
+_artifact_locks = _ArtifactLockRegistry()
 
 
 def _serialized_per_artifact(route):
@@ -518,7 +653,7 @@ def _serialized_per_artifact(route):
     """
     @functools.wraps(route)
     def serialized(*args, **kwargs):
-        with _artifact_lock(kwargs["artifact_id"]):
+        with _artifact_locks.hold(kwargs["artifact_id"]):
             return route(*args, **kwargs)
     return serialized
 
@@ -531,20 +666,44 @@ def _serialized_per_comment_target(route):
     fallback (see :func:`_comment_target_of`). Keying the lock on the path
     parameter would therefore not serialize a comment with the owner routes,
     which always use the internal id, and a comment could land on a document
-    being finalized in the same instant. The key is resolved first, without
+    being finalized in the same instant. So the key is resolved first, without
     authentication: ``resolve_share`` maps a live share id to the internal id
     and answers None for anything else -- a rotated-away link, or the bare
-    internal id of a rotated artifact -- in which case the path id *is* the
-    internal id if it is anything at all, so it is used as the key as-is. A
-    made-up id locks a key nobody else holds and then 404s inside the route.
+    internal id of a rotated artifact, which is still a real artifact and
+    still has to serialize against its owner's routes.
+
+    SEC-100-002 put two gates in front of that. The path identifier has to
+    look like an identifier at all (:data:`_PATH_ID`), and it has to name an
+    artifact that exists, *before* a lock is allocated for it. A made-up id
+    used to mint a registry entry nobody would ever remove; now it takes no
+    lock and the route answers exactly what it always did -- a 404, or the
+    401/400 its authentication reaches first, since which of those a caller
+    sees is a property the comment routes deliberately own (see
+    :func:`_comment_writer`) and not something a lock decorator should
+    decide. Running that request unlocked is safe because there is nothing to
+    serialize it against: no artifact of that name exists to mutate.
+
+    Resolving before authentication does mean an anonymous caller decides how
+    often this lookup runs, so it is asked to be cheap: ``resolve_lock_target``
+    answers both halves of the identity pair in a single Storage tag search
+    instead of the two the first SEC-100-002 fix took, and the store remembers
+    ids Storage has confirmed absent, so a made-up id repeated a thousand times
+    reaches Storage once. See :meth:`src.store.ArtifactStore._resolve`.
     """
     @functools.wraps(route)
     def serialized(*args, **kwargs):
         request = kwargs["request"]
         path_id = kwargs["artifact_id"]
+        if not _PATH_ID.match(path_id):
+            # Nothing this shape was ever minted, so there is no artifact to
+            # look up and no lock to take: answer without touching either.
+            return _not_found(path_id)
         ensure_hydrated(request.app)
-        internal_id = request.app.state.store.resolve_share(path_id) or path_id
-        with _artifact_lock(internal_id):
+        store = request.app.state.store
+        internal_id = store.resolve_lock_target(path_id)
+        if internal_id is None:
+            return route(*args, **kwargs)
+        with _artifact_locks.hold(internal_id):
             return route(*args, **kwargs)
     return serialized
 
@@ -574,6 +733,16 @@ COUNTER_SUBMISSIONS = "submissions"
 COUNTER_COMMENTS = "comments"
 COUNTER_UNLOCK_FAILURES = "unlock_failures"
 COUNTER_GUEST_FAILURES = "guest_failures"
+
+#: The ``who`` half of a counter key standing for "every caller together".
+#: SEC-100-003 gives each brute-force scope a second, address-independent
+#: budget per artifact, and it shares the machinery of the per-address one by
+#: using this sentinel in place of a client address. Real ``who`` values are
+#: client addresses or ``"{project}@{stack}"`` contributor keys, neither of
+#: which can contain ``*``, so the two buckets can never collide. The key
+#: still starts with the internal artifact id, so purging an artifact takes it
+#: along with everything else.
+COUNTER_ANY_CLIENT = "*"
 
 _fallback_counts: dict[tuple[str, str, str], int] = {}
 _fallback_lock = threading.Lock()
@@ -689,68 +858,96 @@ def _claim_comment_slot(
     )
 
 
+def _brute_force_throttled(
+    app_obj: FastAPI | None, scope: str, artifact_id: str, client_ip: str
+) -> bool:
+    """True when either brute-force budget of one artifact is spent.
+
+    Two budgets, both hourly, both counting only *failures*:
+
+    * per ``(artifact, client address)``,
+      ``HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR`` — the ordinary limit, small enough
+      that a human who mistypes is never troubled by it;
+    * per artifact across *every* address,
+      ``HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR`` — defence in depth for
+      SEC-100-003. The per-address budget is only as strong as the address is
+      hard to change, and the address is not always expensive: a NAT, a
+      botnet, or (before this fix) a forged header all supply new ones for
+      free. This second budget cannot be rotated away, so it is set far above
+      any real audience of one document and stops industrial guessing rather
+      than individual readers.
+    """
+    per_client = _read_counter(
+        app_obj, scope, _counter_key(artifact_id, client_ip), _utc_hour()
+    )
+    if per_client >= settings.max_unlock_attempts_per_hour:
+        return True
+    per_artifact = _read_counter(
+        app_obj, scope, _counter_key(artifact_id, COUNTER_ANY_CLIENT), _utc_hour()
+    )
+    return per_artifact >= settings.max_unlock_attempts_per_artifact_per_hour
+
+
+def _record_brute_force_failure(
+    app_obj: FastAPI | None, scope: str, artifact_id: str, client_ip: str
+) -> None:
+    """Count one failure against both budgets of :func:`_brute_force_throttled`."""
+    _bump_counter(
+        app_obj, scope, _counter_key(artifact_id, client_ip), _utc_hour()
+    )
+    _bump_counter(
+        app_obj, scope, _counter_key(artifact_id, COUNTER_ANY_CLIENT), _utc_hour()
+    )
+
+
 def _unlock_throttled(
     app_obj: FastAPI | None, artifact_id: str, client_ip: str
 ) -> bool:
-    """True when this (artifact, client) burnt its failed-attempt budget.
+    """True when this artifact's failed-password budget is spent.
 
     Verifying an artifact password runs a full PBKDF2 (200k iterations), so an
     unthrottled gate is both a password oracle and a cheap way to burn the
     hub's CPU. Only failures are counted, so a legitimate reader who types the
     password correctly is never affected, and the hour in the bucket key makes
-    the window reset on its own.
+    the window reset on its own. See :func:`_brute_force_throttled` for the
+    two budgets this consults.
     """
-    count = _read_counter(
-        app_obj,
-        COUNTER_UNLOCK_FAILURES,
-        _counter_key(artifact_id, client_ip),
-        _utc_hour(),
+    return _brute_force_throttled(
+        app_obj, COUNTER_UNLOCK_FAILURES, artifact_id, client_ip
     )
-    return count >= settings.max_unlock_attempts_per_hour
 
 
 def _record_unlock_failure(
     app_obj: FastAPI | None, artifact_id: str, client_ip: str
 ) -> None:
-    """Count one *failed* password attempt against the hourly budget."""
-    _bump_counter(
-        app_obj,
-        COUNTER_UNLOCK_FAILURES,
-        _counter_key(artifact_id, client_ip),
-        _utc_hour(),
+    """Count one *failed* password attempt against the hourly budgets."""
+    _record_brute_force_failure(
+        app_obj, COUNTER_UNLOCK_FAILURES, artifact_id, client_ip
     )
 
 
 def _guest_throttled(
     app_obj: FastAPI | None, artifact_id: str, client_ip: str
 ) -> bool:
-    """True when this (artifact, client) burnt its failed-invitation budget.
+    """True when this artifact's failed-invitation budget is spent.
 
     Checking an invitation secret runs the same full PBKDF2 as a password, and
     ``GET /a/{id}/guest`` is public, so a known invitation id would otherwise
     be a free CPU-exhaustion primitive as well as an offline-free oracle. The
-    budget is the unlock budget (``HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR``) in its
-    own scope, so guest probing and password guessing cannot spend each
-    other's allowance.
+    budgets are the unlock budgets in their own scope, so guest probing and
+    password guessing cannot spend each other's allowance.
     """
-    count = _read_counter(
-        app_obj,
-        COUNTER_GUEST_FAILURES,
-        _counter_key(artifact_id, client_ip),
-        _utc_hour(),
+    return _brute_force_throttled(
+        app_obj, COUNTER_GUEST_FAILURES, artifact_id, client_ip
     )
-    return count >= settings.max_unlock_attempts_per_hour
 
 
 def _record_guest_failure(
     app_obj: FastAPI | None, artifact_id: str, client_ip: str
 ) -> None:
-    """Count one *failed* guest verification against the hourly budget."""
-    _bump_counter(
-        app_obj,
-        COUNTER_GUEST_FAILURES,
-        _counter_key(artifact_id, client_ip),
-        _utc_hour(),
+    """Count one *failed* guest verification against the hourly budgets."""
+    _record_brute_force_failure(
+        app_obj, COUNTER_GUEST_FAILURES, artifact_id, client_ip
     )
 
 
@@ -769,18 +966,187 @@ def _record_view(app_obj: FastAPI | None, artifact_id: str, kind: str) -> None:
         logger.warning("Could not record a %s view of %s: %s", kind, artifact_id, exc)
 
 
+#: Either address flavour, as :mod:`ipaddress` hands them back.
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+def _peer_ip(request: Request) -> str:
+    """The address the TCP connection actually came from, or ``"unknown"``."""
+    client = request.client
+    return client.host if client is not None else "unknown"
+
+
+def _unmapped(address: IPAddress) -> IPAddress:
+    """An IPv4-mapped IPv6 address as plain IPv4; anything else unchanged.
+
+    SEC-100-003. A dual-stack listener reports an IPv4 peer as
+    ``::ffff:10.0.0.5``, and that is *not* a member of ``10.0.0.0/8`` as far
+    as :mod:`ipaddress` is concerned. Without this an operator who configured
+    ``HUB_TRUSTED_PROXY_CIDRS`` perfectly correctly would still have every
+    forwarded address ignored, with nothing to distinguish that from the
+    headers simply not arriving. Normalizing in the bucket key too means the
+    two spellings of one address cannot become two brute-force budgets.
+    """
+    mapped = getattr(address, "ipv4_mapped", None)
+    return mapped if mapped is not None else address
+
+
+def _parse_client_address(raw: str | None) -> IPAddress | None:
+    """One forwarded chain entry as a canonical address, or None if it is junk.
+
+    SEC-100-003. Everything this returns ends up as the key of a persisted
+    ``counters`` row, so an entry that is not an address must be dropped
+    rather than passed through: before this the caller chose that key, its
+    contents and its length outright. Tolerates the three shapes real proxies
+    emit around an address — surrounding whitespace, an ``a.b.c.d:port``
+    suffix, and a bracketed ``[v6]`` or ``[v6]:port`` literal — and rejects
+    anything else.
+    """
+    if not raw:
+        return None
+    candidate = raw.strip()
+    if candidate.startswith("["):
+        closing = candidate.find("]")
+        if closing == -1:
+            return None
+        candidate = candidate[1:closing]
+    elif candidate.count(":") == 1:
+        # Exactly one colon means "IPv4 with a port": a bare IPv6 literal
+        # always carries at least two, so this cannot eat one of those.
+        candidate = candidate.split(":", 1)[0]
+    try:
+        return _unmapped(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def _is_trusted_proxy(address: IPAddress) -> bool:
+    """True when ``address`` sits in one of ``HUB_TRUSTED_PROXY_CIDRS``."""
+    return any(address in network for network in settings.trusted_proxy_cidrs)
+
+
+def _forwarded_client_trusted(request: Request) -> bool:
+    """True when this request's forwarded client address may be believed.
+
+    SEC-100-003. Two conditions, both required. The deployment has to have
+    opted into forwarded headers at all (``HUB_TRUST_FORWARDED_HEADERS``,
+    the same switch :func:`_forwarded_trusted` reads), *and* the direct peer —
+    the address the connection came from, which no client can forge — has to
+    fall inside one of ``HUB_TRUSTED_PROXY_CIDRS``. With no CIDRs configured
+    nothing is ever trusted, which is the safe default: every caller behind
+    the proxy then shares the proxy's bucket.
+
+    Deliberately *not* the same predicate as :func:`_forwarded_trusted`: that
+    one also insists no ``HUB_PUBLIC_BASE_URL`` is configured, because an
+    explicit public origin outranks a forwarded one when naming URLs. That has
+    nothing to do with who the client is, and production sets a base URL — so
+    reusing it here would have made the trusted-proxy setting dead code in the
+    one deployment that needs it.
+    """
+    if not settings.trust_forwarded_headers or not settings.trusted_proxy_cidrs:
+        return False
+    peer = _parse_client_address(_peer_ip(request))
+    if peer is None:
+        # Not an IP literal at all (a unix socket, a test transport): there is
+        # no way to place it in a network, so it is not a trusted proxy.
+        return False
+    return _is_trusted_proxy(peer)
+
+
+def _forwarded_chain_client(raw: str | None) -> IPAddress | None:
+    """The rightmost entry of an ``X-Forwarded-For`` chain we did not write.
+
+    SEC-100-003, second half. Every proxy in the path *appends* the peer it
+    accepted the connection from — our own nginx does exactly that with
+    ``$proxy_add_x_forwarded_for`` — so the chain reads oldest-first and the
+    leftmost entry is whatever the original caller chose to send. Reading it
+    was the bug: a guesser who prepended a different value each time got a
+    fresh brute-force budget every attempt, which is the finding restated.
+
+    So walk from the right instead, past the hops our own infrastructure
+    added (the entries inside ``HUB_TRUSTED_PROXY_CIDRS``), and stop at the
+    first entry neither we nor a trusted proxy vouched for: that is the
+    closest thing to a real client this request carries. Unparsable entries
+    are skipped rather than returned, and a chain that is nothing but trusted
+    proxies (or nothing but junk) yields None, leaving the caller on the peer
+    address.
+
+    Note the corollary for operators: *every* hop's network has to be in
+    ``HUB_TRUSTED_PROXY_CIDRS``, not just the one that opens the connection.
+    Name only nginx's network and the walk stops at the platform proxy, so
+    every reader shares that one bucket — safe, but no better than leaving
+    the setting empty.
+
+    Only the last ``HUB_MAX_FORWARDED_CHAIN_ENTRIES`` entries are examined, so
+    a caller cannot buy an unbounded number of address parses with one very
+    long header.
+    """
+    if not raw:
+        return None
+    # Clamped at zero because a negative maxsplit means "split everything" to
+    # str.rsplit — a typo in HUB_MAX_FORWARDED_CHAIN_ENTRIES must not quietly
+    # turn the cap off, which is the one thing it exists to prevent.
+    cap = max(settings.max_forwarded_chain_entries, 0)
+    # rsplit stops after `cap` splits, so the leftmost element is the whole
+    # unexamined remainder of the chain rather than a single entry; drop it.
+    entries = raw.rsplit(",", cap)
+    if len(entries) > cap:
+        entries = entries[1:]
+    for entry in reversed(entries):
+        address = _parse_client_address(entry)
+        if address is not None and not _is_trusted_proxy(address):
+            return address
+    return None
+
+
 def _client_ip(request: Request) -> str:
     """Best-effort client address, used only as a rate-limit bucket key.
 
-    ``X-Real-IP`` is what our own nginx sets. It is deliberately *not* trusted
-    for anything but bucketing: a forged value can only split an attacker's
-    own budget, never grant access or identify anybody.
+    Until SEC-100-003 this returned ``X-Real-IP`` whenever it was present. The
+    header is attacker-supplied, so a password guesser reset their own
+    brute-force budget simply by changing it — a budget of one still allowed
+    unlimited attempts. Forwarded addresses are now honoured only from a peer
+    inside a configured trusted-proxy network
+    (:func:`_forwarded_client_trusted`); otherwise the bucket key is the peer
+    address, which nobody can choose.
+
+    Order of preference, once the peer is trusted: ``X-Real-IP`` first,
+    because our own nginx sets it from the connection it accepted and it is a
+    single address needing no chain walk -- unless that address is itself a
+    trusted proxy, in which case it names a hop rather than a client and the
+    chain is consulted instead; then the rightmost entry of
+    ``X-Forwarded-For`` that is not itself a trusted proxy (see
+    :func:`_forwarded_chain_client` for why the *rightmost*). Either way the
+    value has to parse as an IP address, and what is returned is that address
+    canonicalized — a caller cannot make the key arbitrary text, nor make it
+    long enough to bloat the persisted ``counters`` table.
+
+    Even then this identity is only ever a bucket key: a forged value can
+    split an attacker's own budget, never grant access or identify anybody.
+    The address-independent per-artifact budget (see
+    :func:`_unlock_throttled`) is what bounds an attacker who *can* change
+    addresses cheaply.
     """
-    real_ip = _first_forwarded(request.headers.get("x-real-ip"))
-    if real_ip:
-        return real_ip
-    client = request.client
-    return client.host if client is not None else "unknown"
+    peer = _peer_ip(request)
+    if _forwarded_client_trusted(request):
+        forwarded = _parse_client_address(request.headers.get("x-real-ip"))
+        # In the real topology our nginx sets X-Real-IP from *its* peer,
+        # which is the platform proxy in front of it, not the browser. A
+        # value that names a trusted proxy therefore identifies a hop, not a
+        # client, and would make every reader share that hop's budget; the
+        # chain still carries the client, so walk it instead.
+        if forwarded is not None and _is_trusted_proxy(forwarded):
+            forwarded = None
+        if forwarded is None:
+            forwarded = _forwarded_chain_client(
+                request.headers.get("x-forwarded-for")
+            )
+        if forwarded is not None:
+            return str(forwarded)
+    parsed_peer = _parse_client_address(peer)
+    # A peer that is not an address literal (a unix socket, a test transport)
+    # is still a fine bucket key: it is short, fixed, and nobody can choose it.
+    return str(parsed_peer) if parsed_peer is not None else peer
 
 
 def _version_rate_limited() -> JSONResponse:
@@ -798,6 +1164,80 @@ def _version_rate_limited() -> JSONResponse:
     )
 
 
+class SingleInstanceError(RuntimeError):
+    """Startup refused because another process already holds the hub's lock."""
+
+
+def acquire_instance_lock(path: Path):
+    """Take the process-wide exclusive lock, or raise :class:`SingleInstanceError`.
+
+    ARCH-100-001. Everything in this service that is correct at all is correct
+    only under one writer: the in-memory artifact index, the per-process locks
+    that serialize check-then-act mutations, the version-number allocator and
+    the StateDB whole-snapshot cycle. CLAUDE.md states that as a deployment
+    invariant ("Exactly one instance, ever"), and for a long time that was all
+    it was -- a sentence. ``uvicorn --workers 2``, a second container mounted
+    on the same cache directory, or a rolling deploy that overlapped would each
+    have started happily and begun losing the other's writes.
+
+    ``flock`` turns the sentence into a startup condition. The lock belongs to
+    the open file description rather than to the process, so every way of
+    ending up with two writers on one disk fails the same way: a uvicorn worker
+    (each runs its own lifespan and so its own ``open()``), a second container,
+    or a stray second interpreter. ``LOCK_NB`` means the loser fails fast with
+    an explanation instead of hanging at boot with no output.
+
+    The handle is returned rather than kept in a module global so tests can own
+    one directly; the caller must hold it for the life of the process, because
+    closing the file releases the lock.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # "a+" never truncates, so losing the race cannot destroy the winner's
+    # record of which pid holds the lock.
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        try:
+            handle.seek(0)
+            holder = handle.read(200).strip() or "unknown"
+        except OSError:  # pragma: no cover - reading the holder is a courtesy
+            holder = "unknown"
+        handle.close()
+        raise SingleInstanceError(
+            f"Another process already holds the hub instance lock {path} "
+            f"(holder: {holder}). This deployment is exactly one instance, "
+            "ever: one Keboola App is one organisation's hub, one container, "
+            "one uvicorn process, no --workers (CLAUDE.md, \"Exactly one "
+            "instance, ever\"). Two writers corrupt the artifact index, the "
+            "version-number allocator and the state snapshots. Stop the other "
+            "process, or give this one its own HUB_CACHE_DIR."
+        ) from exc
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\n")
+        handle.flush()
+    except OSError as exc:  # pragma: no cover - the lock is what matters
+        logger.warning("Could not record the pid in the instance lock: %s", exc)
+    return handle
+
+
+def release_instance_lock(handle) -> None:
+    """Drop the exclusive lock and close its handle. Never raises."""
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError as exc:  # noqa: BLE001 - shutdown must not raise
+        logger.warning("Could not release the instance lock: %s", exc)
+    finally:
+        try:
+            handle.close()
+        except OSError as exc:  # noqa: BLE001 - shutdown must not raise
+            logger.warning("Could not close the instance lock: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Build the stores and sidecars, and try (not require) an initial hydration.
@@ -811,6 +1251,13 @@ async def lifespan(app: FastAPI):
     takes a final snapshot, so a clean shutdown loses nothing.
     """
     app.state.settings = settings
+    # ARCH-100-001: before anything touches Storage or the cache, prove this is
+    # the only process doing so. Failing here aborts startup, which is the
+    # point -- a second writer that starts successfully is far more expensive
+    # to notice than one that never starts.
+    app.state.instance_lock = acquire_instance_lock(
+        settings.cache_dir / settings.instance_lock_filename
+    )
     # One backend instance serves both stores: they read the same host project
     # and only differ in the tags they list (``artifact-hub`` vs.
     # ``artifact-hub-cmt``), so neither ever sees the other's files. The state
@@ -824,6 +1271,7 @@ async def lifespan(app: FastAPI):
         settings.max_envelope_bytes,
         settings.max_proposed_versions,
         reap_aborted_after_s=settings.reap_aborted_publish_after_s,
+        negative_lookup_cache_entries=settings.negative_lookup_cache_entries,
     )
     app.state.comments = CommentStore(
         backend,
@@ -853,6 +1301,14 @@ async def lifespan(app: FastAPI):
         derive_key(settings.secret_key, KEY_LABEL_WEBHOOK),
         queue_max=settings.webhook_queue_max,
     )
+    # SEC-100-006 follow-up: without this, the overlap window is synced into
+    # the dispatcher only when an owner calls GET .../webhooks or the
+    # rotate-key route for the first time in this process's life (see the
+    # comment on WebhookDispatcher._key_overlap_s). Setting it here too means
+    # a delivery that goes out before either of those has ever been called
+    # honours the configured grace period from the first request, instead of
+    # silently running on the class default until an owner happens to look.
+    webhooks.configure_key_overlap_s(settings.webhook_key_overlap_s)
     app.state.webhooks = webhooks
     try:
         artifacts, threads = _hydrate(app)
@@ -883,6 +1339,8 @@ async def lifespan(app: FastAPI):
     finally:
         webhooks.stop()
         statedb.stop()
+        release_instance_lock(getattr(app.state, "instance_lock", None))
+        app.state.instance_lock = None
 
 
 def _hydrate(app_obj: FastAPI) -> tuple[int, int]:
@@ -1176,6 +1634,155 @@ async def public_origin(request: Request, call_next):
     return await call_next(request)
 
 
+#: Methods whose requests carry no body this service ever reads. Budgeting
+#: them would only add work to the cheapest requests we serve.
+_BODILESS_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "DELETE", "TRACE"})
+
+#: The routes whose body legitimately carries a whole document, as
+#: ``(method, path pattern)``. Everything else — comments, replies, guest
+#: invitations, the unlock form, webhook management, policy-only calls, the
+#: platform's ``POST /`` probe — gets the much smaller
+#: ``HUB_MAX_SMALL_REQUEST_BYTES``. The list is deliberately an allowlist:
+#: a route added later is bounded tightly until somebody decides otherwise,
+#: which is the safe direction to be wrong in.
+_CONTENT_REQUEST_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("POST", re.compile(r"^/api/artifacts/?$")),
+    ("PUT", re.compile(r"^/api/artifacts/[^/]+/?$")),
+    ("POST", re.compile(r"^/api/artifacts/[^/]+/versions/?$")),
+)
+
+
+def _request_body_limit(method: str, path: str) -> int:
+    """Largest request body this method and path may send, in bytes."""
+    for route_method, pattern in _CONTENT_REQUEST_ROUTES:
+        if method == route_method and pattern.match(path):
+            return settings.max_content_request_bytes
+    return settings.max_small_request_bytes
+
+
+def _declared_content_length(scope: dict[str, Any]) -> int | None:
+    """The request's ``Content-Length``, or None when absent or unparseable."""
+    for name, value in scope.get("headers", ()):
+        if name == b"content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+async def _send_body_too_large(send: Any, limit: int) -> None:
+    """Answer 413 straight from the ASGI layer, without invoking the app."""
+    payload = json.dumps(
+        {
+            "error": "request body too large",
+            "detail": (
+                f"This endpoint accepts at most {limit} bytes of request "
+                "body. Send less, or use a route meant for documents."
+            ),
+            "limit": limit,
+        }
+    ).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(payload)).encode("ascii")),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": payload})
+
+
+class RequestBodyLimitMiddleware:
+    """Reject an oversized request body before anything expensive touches it.
+
+    SEC-100-004. Every budget this service had was applied *after* the body
+    had already been read and parsed: an anonymous caller could post three
+    megabytes at a comment route, have it streamed in, JSON-decoded and
+    validated into Pydantic models, and only then be told the artifact does
+    not exist. Authentication, the per-artifact lock and PBKDF2 all sit behind
+    that same parse, so the cheapest request an attacker can send was also one
+    of the most expensive to refuse.
+
+    This is raw ASGI rather than a ``BaseHTTPMiddleware`` on purpose: it has
+    to see the request *before* Starlette builds a ``Request`` object and
+    before FastAPI reads the body, and it has to be able to wrap ``receive``.
+    Two gates, because either alone is bypassable:
+
+    * a declared ``Content-Length`` above the ceiling is refused outright,
+      with the body never read at all;
+    * ``receive`` is wrapped and the bytes that actually arrive are counted,
+      so a chunked request (no ``Content-Length``) and a request that lies
+      about its length are both cut off the moment they cross the ceiling.
+      Nothing is buffered: the stream is closed by handing the application a
+      disconnect, which unwinds it, and whatever it answers is replaced by
+      the 413 on the way out.
+
+    ``POST /`` — the platform's startup probe — carries no body and passes
+    through untouched, as it must (see CLAUDE.md).
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        method = str(scope.get("method", "GET")).upper()
+        if method in _BODILESS_METHODS:
+            await self.app(scope, receive, send)
+            return
+
+        limit = _request_body_limit(method, str(scope.get("path", "")))
+        declared = _declared_content_length(scope)
+        if declared is not None and declared > limit:
+            await _send_body_too_large(send, limit)
+            return
+
+        seen = 0
+        over = False
+        replaced = False
+
+        async def counted_receive() -> dict[str, Any]:
+            nonlocal seen, over
+            message = await receive()
+            if message.get("type") == "http.request":
+                seen += len(message.get("body", b"") or b"")
+                if seen > limit:
+                    over = True
+                    # Close the body rather than buffer the rest of it. The
+                    # application sees a disconnected client, stops reading
+                    # and unwinds; ``guarded_send`` turns its answer into
+                    # the 413 this really is.
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def guarded_send(message: dict[str, Any]) -> None:
+            nonlocal replaced
+            if replaced:
+                # Our 413 is already on the wire; the application's own
+                # response body would only corrupt it.
+                return
+            if over and message.get("type") == "http.response.start":
+                replaced = True
+                await _send_body_too_large(send, limit)
+                return
+            await send(message)
+
+        await self.app(scope, counted_receive, guarded_send)
+
+
+# Registered here, between the two HTTP middlewares, so it runs before routing,
+# authentication, lock allocation, JSON/Pydantic parsing and PBKDF2 — while
+# still sitting inside ``artifact_headers``, which therefore decorates the 413
+# exactly like every other response.
+app.add_middleware(RequestBodyLimitMiddleware)
+
+
 @app.middleware("http")
 async def artifact_headers(request: Request, call_next):
     """Keep artifact responses out of search indexes, shared caches and referrers."""
@@ -1353,9 +1960,11 @@ def reader_allowed(meta: ArtifactMeta, request: Request) -> bool:
         raise HTTPException(
             status_code=429,
             detail=(
-                "too many wrong passwords for this artifact from your "
-                f"address; at most {settings.max_unlock_attempts_per_hour} "
-                "failed attempts are allowed per hour"
+                "too many wrong passwords for this artifact; at most "
+                f"{settings.max_unlock_attempts_per_hour} failed attempts per "
+                "hour are allowed from one address, and "
+                f"{settings.max_unlock_attempts_per_artifact_per_hour} from "
+                "all addresses together"
             ),
         )
     if check_password(supplied, meta.password):
@@ -1702,10 +2311,11 @@ def _verify_guest_checked(
         raise HTTPException(
             status_code=429,
             detail=(
-                "too many rejected invitation credentials for this artifact "
-                f"from your address; at most "
-                f"{settings.max_unlock_attempts_per_hour} failed attempts are "
-                "allowed per hour"
+                "too many rejected invitation credentials for this artifact; "
+                f"at most {settings.max_unlock_attempts_per_hour} failed "
+                "attempts per hour are allowed from one address, and "
+                f"{settings.max_unlock_attempts_per_artifact_per_hour} from "
+                "all addresses together"
             ),
         )
     try:
@@ -1779,6 +2389,73 @@ def _owner_only(meta: ArtifactMeta, caller: Owner) -> None:
         )
 
 
+def _destructive_authority(owner: Owner) -> None:
+    """Raise 403 unless this token may run a *destructive* route.
+
+    SEC-075-011. ``_owner_only`` above answers "is this the owning project?",
+    which is a project-level question: every Storage token of that project —
+    including a read-only or single-purpose one — passes it. That is fine for
+    a route that changes a setting and reversible for one that moves an
+    artifact to the trash, but it also meant any such token could purge an
+    artifact outright, rotate its public link, or delete a version, with no
+    way for an operator to narrow that.
+
+    ``HUB_DESTRUCTIVE_TOKEN_POLICY`` is that narrowing, and it is opt-in:
+
+    * ``project`` (default) — the historical behaviour, unchanged. Every token
+      of the owning project keeps full destructive authority.
+    * ``admin`` — the token must additionally be a master token or belong to a
+      project user whose ``admin.role`` is ``admin``.
+    * ``allowlist`` — the token's own id must appear in
+      ``HUB_DESTRUCTIVE_TOKEN_IDS``.
+
+    This gate applies to the irreversible or link-breaking routes only: soft
+    delete, purge, rotate-link, version delete, and webhook key rotation.
+    **Non-destructive owner routes are deliberately not affected** — update,
+    head pin, promote, settings, invitations, stats and trash restore stay
+    project-authorized under every policy, because narrowing them would turn a
+    security control into a workflow blocker without removing anything an
+    attacker could not simply do again.
+
+    The 403 detail names the active policy and what the credential lacked. It
+    never echoes the token, and never the allowlist either: an outsider must
+    not learn which token ids would work.
+    """
+    policy = settings.destructive_token_policy
+    if policy == "project":
+        return
+    if policy == "admin":
+        if owner.is_project_admin:
+            return
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "this hub runs destructive_token_policy=admin: a destructive "
+                "operation needs a master token, or a token belonging to a "
+                "project user with the admin role. This token is neither."
+            ),
+        )
+    if policy == "allowlist":
+        if owner.token_id and owner.token_id in settings.destructive_token_ids:
+            return
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "this hub runs destructive_token_policy=allowlist: a "
+                "destructive operation needs a token whose id the operator "
+                "listed in HUB_DESTRUCTIVE_TOKEN_IDS. This token's id is not "
+                "listed."
+            ),
+        )
+    # Unreachable: load_settings rejects any other value at startup. Refusing
+    # rather than falling through keeps a future third policy from defaulting
+    # to "allow everything" if somebody adds it here and forgets this branch.
+    raise HTTPException(
+        status_code=403,
+        detail="destructive operations are disabled by this hub's token policy",
+    )
+
+
 def _emit_webhook(
     request: Request,
     meta: ArtifactMeta,
@@ -1809,6 +2486,18 @@ def _emit_webhook(
     dispatcher = getattr(request.app.state, "webhooks", None)
     if dispatcher is None:
         return
+    # SEC-100-006 follow-up: the dispatcher's epoch cache starts empty on
+    # every process start (see WebhookDispatcher._epochs) and used to be
+    # seeded only when an owner called GET .../webhooks or the rotate-key
+    # route -- so after a restart, a receiver that had already been rotated
+    # was signed with the legacy, epoch-less key until its owner happened to
+    # look, and would reject the genuinely current delivery. The persisted
+    # record (ArtifactMeta.webhook_key_epochs) is the source of truth on
+    # every emit, not just on a read or a rotation; reseeding it here is one
+    # dict assignment per receiver and keeps the live cache always current.
+    epochs = meta.webhook_key_epochs or {}
+    for url in urls:
+        dispatcher.seed_epoch(meta.id, url, epochs.get(url))
     body: dict[str, Any] = {
         "artifact_id": meta.id,
         "url": f"{base_url(request).rstrip('/')}/a/{meta.share_id}",
@@ -2180,14 +2869,23 @@ class CommentBody(BaseModel):
             "there is no cross-version re-anchoring."
         ),
     )
+    # SEC-100-004: every string here carries a length ceiling on the *field*,
+    # so an oversized value is refused by request validation instead of
+    # travelling all the way to the comment store. The values are the store's
+    # own limits (src/comments.py), so nothing that used to be accepted is
+    # rejected now; the anchor context shares the quote's ceiling because it
+    # is the same rendered text, captured a few characters to either side.
     exact: str = Field(
         ...,
+        max_length=MAX_QUOTE_CHARS,
         description=(
-            "The quoted text itself, exactly as rendered. Must not be blank."
+            "The quoted text itself, exactly as rendered. Must not be blank, "
+            f"and at most {MAX_QUOTE_CHARS} characters."
         ),
     )
     prefix: str = Field(
         "",
+        max_length=MAX_QUOTE_CHARS,
         description=(
             "Rendered text immediately before the quote (about 32 "
             "characters). Used to disambiguate a quote that occurs more than "
@@ -2196,10 +2894,16 @@ class CommentBody(BaseModel):
     )
     suffix: str = Field(
         "",
+        max_length=MAX_QUOTE_CHARS,
         description="Rendered text immediately after the quote (about 32 characters).",
     )
     body: str = Field(
-        ..., description="The comment itself, as plain text. Must not be blank."
+        ...,
+        max_length=MAX_BODY_CHARS,
+        description=(
+            "The comment itself, as plain text. Must not be blank, and at "
+            f"most {MAX_BODY_CHARS} characters."
+        ),
     )
 
 
@@ -2212,8 +2916,15 @@ class ReplyBody(BaseModel):
         }
     }
 
+    # Same field-level ceiling as a thread body, for the same reason
+    # (SEC-100-004).
     body: str = Field(
-        ..., description="The reply itself, as plain text. Must not be blank."
+        ...,
+        max_length=MAX_BODY_CHARS,
+        description=(
+            "The reply itself, as plain text. Must not be blank, and at most "
+            f"{MAX_BODY_CHARS} characters."
+        ),
     )
 
 
@@ -2527,6 +3238,134 @@ def _apply_policy(meta: ArtifactMeta, body: UpdateBody) -> None:
         meta.status = body.status
 
 
+# --------------------------------------------------------------------------
+# Settings direction: tightening vs loosening (SEC-100-001 / REL-075-004)
+# --------------------------------------------------------------------------
+
+#: Every field on :class:`~src.store.ArtifactMeta` that ``PUT /api/artifacts/
+#: {id}`` can change and that decides *who may read or write* the artifact.
+#: Deliberately explicit rather than derived: a new access-relevant setting has
+#: to be classified here on purpose, and the test suite pins the list, so
+#: forgetting one is a failing test rather than a silent fail-open.
+#:
+#: ``updated_at`` is intentionally absent — it changes on every update and
+#: grants nobody anything, so counting it would make every request look like a
+#: settings change and force a redundant Storage write.
+_ACCESS_SETTINGS: tuple[str, ...] = (
+    "password",
+    "accept_versions_mode",
+    "contributors",
+    "comments_mode",
+    "status",
+    "webhooks",
+)
+
+#: How *wide* each mode is: a higher number lets more people in. Used only to
+#: compare an old value with a new one, never persisted.
+_ACCEPT_WIDTH = {ACCEPT_OFF: 0, ACCEPT_ALLOWLIST: 1, ACCEPT_ANYONE: 2}
+_COMMENTS_WIDTH = {COMMENTS_OFF: 0, COMMENTS_ALLOWLIST: 1, COMMENTS_ANYONE: 2}
+#: "final" freezes versions and comments, "trashed" kills the public link.
+#: ``_apply_policy`` refuses to set "trashed" here, but ranking it keeps the
+#: comparison total for a meta record that is already in the trash.
+_STATUS_WIDTH = {ARTIFACT_TRASHED: 0, ARTIFACT_FINAL: 1, ARTIFACT_DRAFT: 2}
+
+
+def _is_tightening(field_name: str, before: Any, after: Any) -> bool:
+    """Does changing ``field_name`` from ``before`` to ``after`` reduce access?
+
+    "Tightening" means the new value lets *no more* people read or contribute
+    than the old one did. The rules, one per access-relevant setting:
+
+    * ``password`` — setting one where there was none puts a gate up; replacing
+      an existing one revokes the credential its old holders have. Neither
+      widens anything, so both are tightening. Only clearing it is loosening.
+    * ``accept_versions_mode`` / ``comments_mode`` — ranked by how many people
+      the mode admits (``off`` < ``allowlist`` < ``anyone``); moving to an
+      equal-or-narrower rank is tightening.
+    * ``contributors`` — the allowlist itself. A new list that is a subset of
+      the old one can only remove people; anything that introduces a key that
+      was not there before is loosening.
+    * ``status`` — ``draft`` is open, ``final`` freezes contributions,
+      ``trashed`` additionally kills the public link. Freezing is tightening;
+      reopening is loosening.
+    * ``webhooks`` — an outbound copy of what happens to the artifact, so a URL
+      that was not registered before is a new recipient, i.e. loosening.
+      Removing one is tightening.
+
+    Anything not enumerated above is treated as tightening, which is the
+    fail-closed answer: an unclassified setting is then committed *before* the
+    content, where the worst case is a change that survives a failed request
+    while being no wider than what the owner asked for.
+    """
+    if before == after:
+        return True
+    if field_name == "password":
+        return after is not None
+    if field_name == "accept_versions_mode":
+        return _ACCEPT_WIDTH.get(after, 0) <= _ACCEPT_WIDTH.get(before, 0)
+    if field_name == "comments_mode":
+        return _COMMENTS_WIDTH.get(after, 0) <= _COMMENTS_WIDTH.get(before, 0)
+    if field_name == "status":
+        return _STATUS_WIDTH.get(after, 0) <= _STATUS_WIDTH.get(before, 0)
+    if field_name in ("contributors", "webhooks"):
+        return set(after or ()) <= set(before or ())
+    return True
+
+
+def _tightening_half(previous: ArtifactMeta, candidate: ArtifactMeta) -> ArtifactMeta:
+    """A copy of ``previous`` carrying only ``candidate``'s tightening changes.
+
+    The result is by construction no less restrictive than either input, which
+    is exactly what makes it safe to commit before the new content exists.
+    """
+    tightened = dataclasses.replace(previous)
+    for field_name in _ACCESS_SETTINGS:
+        before = getattr(previous, field_name)
+        after = getattr(candidate, field_name)
+        if _is_tightening(field_name, before, after):
+            setattr(tightened, field_name, after)
+    return tightened
+
+
+def _access_differs(before: ArtifactMeta, after: ArtifactMeta) -> bool:
+    """True when the two metas disagree about who may read or write."""
+    return any(
+        getattr(before, name) != getattr(after, name) for name in _ACCESS_SETTINGS
+    )
+
+
+#: 502 details for a partly-applied update. Each one names the state that is
+#: actually in force, because the owner's next move depends on it: a rolled-back
+#: update is retried whole, a stuck tightening needs the settings checked, and a
+#: published-but-not-loosened artifact needs only the settings resent.
+_UPDATE_ROLLED_BACK = (
+    "No new version was published and the settings this request would have "
+    "tightened were rolled back: the artifact's previous content and settings "
+    "are what is in force. Retry the whole update."
+)
+_UPDATE_TIGHTENING_STUCK = (
+    "No new version was published, and the settings this request tightened "
+    "could not be rolled back: they are still in force over the previous "
+    "content, which is more restrictive than before but not what you asked "
+    "for. Check the artifact's settings before retrying."
+)
+_UPDATE_LOOSENING_PENDING = (
+    "The new version was published and is live, but under the previous, more "
+    "restrictive settings: the requested changes that widen access were not "
+    "applied. Resend them."
+)
+_UPDATE_TIMESTAMP_PENDING = (
+    "The new version was published and is live; only the artifact's "
+    "updated-at timestamp could not be recorded, so access is unchanged."
+)
+
+
+def _partial_update_502(cause: Exception, statement: str) -> HTTPException:
+    """A 502 that keeps the underlying cause *and* states what is in force."""
+    reason = str(getattr(cause, "detail", None) or cause) or "storage was unavailable"
+    return HTTPException(status_code=502, detail=f"{reason}. {statement}")
+
+
 def _require_exactly_one_content(body: PublishBody | VersionBody) -> None:
     present = _content_fields(body)
     if len(present) != 1:
@@ -2619,7 +3458,37 @@ def _build(
 
 
 def _store_canonical(owner: Owner, token: str, artifact_id: str, html: str) -> int:
-    """Upload the canonical copy of the built HTML into the author's project."""
+    """Upload the canonical copy of the built HTML into the author's project.
+
+    **REL-075-009 — accepted residual: a process death here orphans this file.**
+
+    The copy lands in the *caller's* project, reachable only with the caller's
+    token, which is request-scope and never persisted (see CLAUDE.md, "Secrets
+    discipline"). Every *caught* failure downstream cleans it up while the
+    token is still in hand (:func:`_discard_canonical`). What cannot be cleaned
+    up is the container dying between this upload and the hub-side version
+    write: the token is gone, the hub has no record naming the file, and no
+    reconciler can search another project's Storage. The window is process
+    death only — a matter of milliseconds, and not something an API caller can
+    trigger.
+
+    Writing the external copy *last*, after the hub version file exists, would
+    close the window. It is not available: ``canonical_file_id`` lives inside
+    the version envelope, and version files are immutable by design (CLAUDE.md,
+    "Storage model" — one file per submitted version, never overwritten), so
+    the id cannot be filled in afterwards. Rewriting a version file to add it,
+    or writing the version with ``canonical_file_id=None`` and following up,
+    would trade a rare orphan in someone else's project for a hole in the
+    immutability the whole version/diff/anchor model rests on. The id is purely
+    informational anyway: it is echoed back once in the publish response and
+    never resolved back to a file, so the orphan costs storage and tidiness,
+    not correctness or confidentiality.
+
+    An operator reaping one by hand searches the *author's own* project for
+    Storage files tagged ``kbc-artifact`` (:data:`CANONICAL_TAG`) plus
+    ``artifact-id-{id}``, and deletes any whose artifact the hub does not
+    serve.
+    """
     backend = KbcFilesBackend(owner.stack_url, token)
     try:
         return backend.upload(
@@ -2796,13 +3665,17 @@ def landing_probe() -> PlainTextResponse:
 @app.get(
     "/health",
     tags=["service"],
-    summary="Liveness and index statistics",
+    summary="Readiness, liveness and index statistics",
     description=(
         "Reports process liveness, the running service version, and whether "
         "the in-memory artifact index has finished hydrating from Storage. "
         "'hydrated': false means Storage was unreachable at startup and the "
         "hub is serving in degraded mode (individual artifacts still resolve, "
-        "one Storage lookup at a time). Unauthenticated."
+        "one Storage lookup at a time). This is also the readiness signal: it "
+        "answers 503 when the hub has detected a second instance writing the "
+        "same state, which breaks the exactly-one-instance invariant the "
+        "artifact index, the version allocator and the state snapshots all "
+        "depend on. Unauthenticated."
     ),
     responses={
         200: {
@@ -2810,17 +3683,43 @@ def landing_probe() -> PlainTextResponse:
                 "JSON with 'status', 'version', 'artifacts' (indexed count) "
                 "and 'hydrated'."
             )
-        }
+        },
+        503: {
+            "description": (
+                "Not ready: another instance was detected writing this hub's "
+                "state. The body carries 'status': 'unready' and a 'detail' "
+                "naming the invariant. Operational state is read-only until "
+                "one container is left running and restarted."
+            )
+        },
     },
 )
-def health(request: Request) -> dict:
-    """Liveness plus index statistics."""
-    return {
+def health(request: Request) -> JSONResponse:
+    """Readiness and liveness, plus index statistics.
+
+    ARCH-100-001: the readiness half. Detecting a second writer used to be a
+    log line nobody read, while the process carried on serving and overwriting.
+    Now the detection latches (see ``src.statedb``) and shows up here as a 503,
+    so a platform health probe, a load balancer or an operator sees the broken
+    invariant instead of having to grep for it.
+
+    ``POST /`` is deliberately *not* affected: that is the Keboola platform's
+    own startup check (CLAUDE.md rule 3) and must keep answering 200, or the
+    container is killed and restarted into exactly the same situation.
+    """
+    body = {
         "status": "ok",
         "version": SERVICE_VERSION,
         "artifacts": request.app.state.store.count(),
         "hydrated": bool(getattr(request.app.state, "hydrated", False)),
     }
+    foreign = foreign_writer_detected()
+    if foreign is not None:
+        return JSONResponse(
+            {**body, "status": "unready", "detail": foreign},
+            status_code=503,
+        )
+    return JSONResponse(body)
 
 
 @app.get(
@@ -2911,7 +3810,11 @@ def context(request: Request) -> dict:
                 "method": "GET",
                 "path": "/health",
                 "auth": "none",
-                "purpose": "liveness, service version and index statistics",
+                "purpose": (
+                    "readiness and liveness, service version and index "
+                    "statistics; 503 when a second writing instance was "
+                    "detected"
+                ),
             },
             {
                 "method": "GET",
@@ -3110,7 +4013,9 @@ def context(request: Request) -> dict:
                 "purpose": (
                     "the whole artifact as a ready-to-open Obsidian vault "
                     "(application/zip): INDEX.md, document.md, versions/, "
-                    "comments/ and reasoning.md"
+                    "comments/ and reasoning.md. Budgeted: 413 above "
+                    "HUB_EXPORT_MAX_BYTES of history, 429 above "
+                    "HUB_MAX_EXPORTS_PER_HOUR builds per client per hour"
                 ),
             },
             {
@@ -3165,6 +4070,16 @@ def context(request: Request) -> dict:
                 "purpose": (
                     "list each registered webhook receiver with the signing "
                     "key its deliveries use"
+                ),
+            },
+            {
+                "method": "POST",
+                "path": "/api/artifacts/{id}/webhooks/{receiver_id}/rotate-key",
+                "auth": "storage token (owner project)",
+                "purpose": (
+                    "mint a fresh signing key for one receiver without "
+                    "touching its URL; the previous key still verifies for "
+                    "webhook_key_overlap_s seconds"
                 ),
             },
             {
@@ -3548,6 +4463,17 @@ def context(request: Request) -> dict:
                 "for another receiver or another artifact, and its key "
                 "reveals nothing about the hub's own."
             ),
+            "rotation": (
+                "POST /api/artifacts/{id}/webhooks/{receiver_id}/rotate-key "
+                "(owner only, receiver_id from the 'id' field GET .../webhooks "
+                "reports) mints a fresh key for one receiver without changing "
+                f"its URL. For {settings.webhook_key_overlap_s} seconds "
+                "(webhook_key_overlap_s) afterwards, deliveries carry both "
+                "the new signature (X-Hub-Signature-256) and the previous "
+                "one (X-Hub-Signature-256-Previous), then only the new one. "
+                "Both the listing and the rotate response are "
+                "Cache-Control: no-store."
+            ),
             "secrecy": (
                 "A webhook URL is itself a capability, so it is returned only "
                 "in the owner PUT response that set it; GET /api/artifacts "
@@ -3586,11 +4512,33 @@ def context(request: Request) -> dict:
             "max_thread_bytes": MAX_THREAD_BYTES,
             "max_contributors": MAX_CONTRIBUTORS,
             "max_unlock_attempts_per_hour": settings.max_unlock_attempts_per_hour,
+            "max_unlock_attempts_per_artifact_per_hour": (
+                settings.max_unlock_attempts_per_artifact_per_hour
+            ),
+            # SEC-100-004: the inbound body ceilings, so a client can size its
+            # request before sending it rather than discovering a 413.
+            "max_content_request_bytes": settings.max_content_request_bytes,
+            "max_small_request_bytes": settings.max_small_request_bytes,
+            "max_comment_body_chars": MAX_BODY_CHARS,
+            "max_comment_quote_chars": MAX_QUOTE_CHARS,
             "max_webhooks_per_artifact": settings.max_webhooks_per_artifact,
             "webhook_timeout_s": settings.webhook_timeout_s,
             "webhook_max_attempts": settings.webhook_max_attempts,
+            # SEC-100-006: how long a rotated receiver's previous key still
+            # verifies (X-Hub-Signature-256-Previous) after
+            # POST .../rotate-key -- see the "webhooks"."rotation" prose above
+            # for the full explanation; duplicated here as a plain number
+            # alongside its sibling webhook settings.
+            "webhook_key_overlap_s": settings.webhook_key_overlap_s,
             "max_invitations_per_artifact": settings.max_invitations_per_artifact,
             "max_invitation_name_chars": MAX_INVITATION_NAME_CHARS,
+            "export_max_bytes": settings.export_max_bytes,
+            "max_exports_per_hour": settings.max_exports_per_hour,
+            # SEC-075-011: which tokens of the owning project may run a
+            # destructive route on this deployment. The name only — never the
+            # allowlist's contents, which would tell an outsider exactly which
+            # token ids to go looking for.
+            "destructive_token_policy": settings.destructive_token_policy,
         },
         "notes": [
             "GET /a/{id} and /a/{id}/v/{n} return a wrapper page whose "
@@ -3611,6 +4559,13 @@ def context(request: Request) -> dict:
             "per artifact per client address per hour the answer is 429. "
             "Verifying an invitation secret costs a full PBKDF2, so an "
             "unthrottled public probe would be a CPU-exhaustion primitive.",
+            "GET /a/{id}/export/vault is the most expensive read here: it "
+            "diffs every visible version and converts every HTML document. It "
+            f"refuses an artifact whose history exceeds {settings.export_max_bytes} "
+            "bytes with 413 before building anything, and allows "
+            f"{settings.max_exports_per_hour} builds of one artifact per "
+            "client address per hour before answering 429. Pull a vault once "
+            "and keep it; do not poll it.",
             "A version published from a private repository (one that needed "
             "git_token) reports git.private true in public metadata and "
             "history, and its git.url is withheld.",
@@ -3622,6 +4577,20 @@ def context(request: Request) -> dict:
             "after POST /api/artifacts/{id}/rotate-link only the new share id "
             "resolves publicly, and the old link — plus the bare artifact id — "
             "answers 404 from the next request on.",
+            "Destructive routes — DELETE /api/artifacts/{id}, "
+            ".../purge, .../versions/{n} (as owner), "
+            "POST .../rotate-link and POST .../webhooks/{receiver_id}"
+            "/rotate-key — are additionally governed by this hub's "
+            f"destructive_token_policy, currently "
+            f"'{settings.destructive_token_policy}'. Under 'project' every "
+            "token of the owning project may run them; under 'admin' the "
+            "token must be a master token or belong to a project user with "
+            "the admin role; under 'allowlist' its token id must be one the "
+            "operator listed. A token that fails the policy gets 403 with a "
+            "detail naming it. Non-destructive owner routes (update, head "
+            "pin, promote, settings, invitations, stats, trash restore) are "
+            "never affected, and a contributor withdrawing their own "
+            "proposal is not a destructive operation.",
             "DELETE /api/artifacts/{id} moves an artifact to the trash "
             "(reversible with POST /api/artifacts/{id}/restore); DELETE "
             "/api/artifacts/{id}/purge is the irreversible erase. A trashed "
@@ -4283,9 +5252,10 @@ def read_meta(
     )
 
 
-#: The snapshot fields ``GET /a/{id}/live`` hashes into its ETag. Kept as an
-#: explicit tuple so the ETag can never start depending on something that is
-#: not in the body a client would receive.
+#: The fields ``GET /a/{id}/live`` reports. Kept as an explicit tuple because
+#: :func:`_live_etag` has to stay a *complete* summary of them: every one of
+#: these must be reachable only through a mutation that bumps an artifact's
+#: revision, or the ETag would go stale while the body moved.
 _LIVE_FIELDS = (
     "id",
     "head_version",
@@ -4299,11 +5269,17 @@ _LIVE_FIELDS = (
 
 
 def _live_snapshot(request: Request, meta: ArtifactMeta) -> dict:
-    """The tiny change-detection payload behind ``GET /a/{id}/live``."""
+    """The tiny change-detection payload behind ``GET /a/{id}/live``.
+
+    Built only when the ETag did *not* match, since this is the expensive
+    half: it enumerates versions and comment threads. The result is projected
+    through :data:`_LIVE_FIELDS` so the body can never quietly grow a field
+    the revision-derived ETag does not summarise.
+    """
     store = request.app.state.store
     head = store.get_head(meta.id)
     versions = store.list_versions(meta.id)
-    return {
+    snapshot = {
         # The public identifier, exactly as /a/{id}/meta reports it: a
         # capability-URL holder is not entitled to the internal id.
         "id": meta.share_id,
@@ -4317,19 +5293,44 @@ def _live_snapshot(request: Request, meta: ArtifactMeta) -> dict:
         "document_status": meta.status,
         "contributions_frozen": meta.is_frozen(),
     }
+    return {key: snapshot[key] for key in _LIVE_FIELDS}
 
 
-def _live_etag(snapshot: dict) -> str:
-    """A strong ETag over a canonical serialisation of the snapshot.
+def _live_etag(request: Request, meta: ArtifactMeta) -> str:
+    """A strong ETag for ``GET /a/{id}/live``, derived without reading anything.
 
-    Canonical (sorted keys, no incidental whitespace) so every replica of this
-    app derives the same tag from the same state — which is exactly why
-    polling was chosen over a per-process subscription. Truncated to 32 hex
-    characters: still 128 bits, and short enough to keep the request header
-    small when a browser echoes it back on every poll.
+    Closes REL-100-003. This used to hash the finished snapshot, which meant a
+    poll had to enumerate every version and every comment thread *before* it
+    could discover that the answer was 304 — so the conditional request saved
+    response bytes but none of the work, and a page left open in a tab (or a
+    capability-URL holder in a loop) could amplify a trivial request into
+    repeated Storage listings and envelope parsing. Now the tag comes from two
+    in-memory counters, so an unchanged artifact costs one dictionary lookup
+    each.
+
+    The tag is a complete summary of :data:`_LIVE_FIELDS` because every one of
+    those fields is reachable only through a store mutation that bumps a
+    revision: ``head_version``, ``versions_count`` and ``proposed_count``
+    through the version writes and deletes, ``id`` (the share id),
+    ``updated_at``, ``document_status`` and ``contributions_frozen`` through
+    the meta save every artifact-level change goes through, and
+    ``comment_threads`` through the comment store's own ledger. That the two
+    counters are in memory rather than persisted is exact, not approximate,
+    under this service's single-writer deployment — see
+    :class:`~src.store.RevisionLedger` for the argument, and for why a boot
+    nonce makes a restart re-issue fresh tags instead of stale ones.
+
+    Truncated to 32 hex characters: still 128 bits, and short enough to keep
+    the request header small when a browser echoes it back on every poll.
     """
-    payload = {key: snapshot.get(key) for key in _LIVE_FIELDS}
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    parts = [
+        # The share id, so a rotated link never inherits the old link's tag
+        # even at the same revision.
+        meta.share_id,
+        request.app.state.store.revision(meta.id),
+        request.app.state.comments.revision(meta.id),
+    ]
+    canonical = json.dumps(parts, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
     return f'"{digest}"'
 
@@ -4370,11 +5371,16 @@ def _etag_matches(header: str | None, etag: str) -> bool:
         "studio poll, roughly every ten seconds while their tab is visible, "
         "to update a reader's screen without a reload. Polling — rather than "
         "server-sent events or a websocket — because this service runs behind "
-        "a buffering platform proxy and may run more than one replica; a "
-        "conditional GET survives both.\n\n"
-        "The response carries a strong `ETag` computed from those fields. "
-        "Send it back as `If-None-Match` and an unchanged artifact answers "
-        "**304 with no body**, which is what makes polling this cheap. "
+        "a buffering platform proxy that would hold a long-lived stream; a "
+        "conditional GET survives it.\n\n"
+        "The response carries a strong `ETag`. Send it back as "
+        "`If-None-Match` and an unchanged artifact answers **304 with no "
+        "body** — and without the server enumerating anything either: the "
+        "tag is derived from a per-artifact revision counter that "
+        "every mutation bumps, so an unchanged poll is answered from memory. "
+        "The tag is opaque and process-local; after a restart the same "
+        "artifact answers with a *new* tag and one extra refresh, which is "
+        "the safe direction to be wrong in. "
         "`Cache-Control: no-store` keeps any intermediary from ever serving a "
         "stale snapshot in place of a fresh one.\n\n"
         "Like GET /a/{id}/meta — and unlike every content endpoint — this is "
@@ -4415,12 +5421,14 @@ def read_live(
     meta = _public_meta_of(request, public_id)
     if meta is None:
         return _not_found(public_id)
-    snapshot = _live_snapshot(request, meta)
-    etag = _live_etag(snapshot)
+    # The ETag first, and the snapshot only if it does not match: enumerating
+    # versions and threads to build a body nobody will receive is exactly the
+    # amplification REL-100-003 describes.
+    etag = _live_etag(request, meta)
     headers = {"ETag": etag, "Cache-Control": "no-store"}
     if _etag_matches(request.headers.get("if-none-match"), etag):
         return Response(status_code=304, headers=headers)
-    return JSONResponse(snapshot, headers=headers)
+    return JSONResponse(_live_snapshot(request, meta), headers=headers)
 
 @app.get(
     "/a/{artifact_id}/v/{version}",
@@ -4945,12 +5953,80 @@ def export_markdown(
     )
 
 
+# --------------------------------------------------------------------------
+# Vault export budgets (REL-100-002)
+#
+# Building a vault is the most expensive thing an unauthenticated caller can
+# ask this service to do: it diffs every visible version against its
+# predecessor and converts every HTML-authored one to Markdown. Two bounds sit
+# in front of it, using the same counter machinery as every other limit here —
+# a size ceiling on what a single build may chew through, and an hourly budget
+# on how often one client may ask for a build of one artifact.
+# --------------------------------------------------------------------------
+
+#: Counter scope for vault builds; keyed ``{artifact_id}:{client_ip}``, bucketed
+#: by UTC hour, exactly like the unlock throttle.
+COUNTER_EXPORTS = "exports"
+
+
+def _claim_export_slot(
+    app_obj: FastAPI | None, artifact_id: str, client_ip: str
+) -> bool:
+    """Count one vault build; False once the hourly budget is spent.
+
+    Bumped whether or not the budget was still open, like every other
+    ``_claim_*`` here: a caller who keeps hammering a spent budget keeps being
+    counted, so the window is self-limiting rather than a retry loop.
+    """
+    used = _bump_counter(
+        app_obj,
+        COUNTER_EXPORTS,
+        _counter_key(artifact_id, client_ip),
+        _utc_hour(),
+    )
+    return used <= settings.max_exports_per_hour
+
+
+def _export_rate_limited() -> JSONResponse:
+    """429 for a spent vault-export budget, in the shape the other limits use."""
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "too many exports this hour",
+            "detail": (
+                f"At most {settings.max_exports_per_hour} vault exports of "
+                "one artifact may be built per client address per hour "
+                "(HUB_MAX_EXPORTS_PER_HOUR)."
+            ),
+            "limit": settings.max_exports_per_hour,
+        },
+    )
+
+
+def _export_too_large(size: int, limit: int) -> JSONResponse:
+    """413 for an artifact whose history is too large to export at all."""
+    return JSONResponse(
+        status_code=413,
+        content={
+            "error": "export too large",
+            "detail": (
+                f"This artifact's visible history and comments come to about "
+                f"{size} characters, over this hub's {limit}-byte export "
+                "ceiling (HUB_EXPORT_MAX_BYTES). Ask the owner to delete "
+                "older versions, or export a single version with "
+                "GET /a/{id}/export/markdown."
+            ),
+            "limit": limit,
+        },
+    )
+
+
 @app.get(
     "/a/{artifact_id}/export/vault",
     tags=["public"],
     summary="Download an Obsidian vault of the whole artifact",
     description=(
-        "Builds an in-memory ZIP holding a ready-to-open Obsidian vault: "
+        "Builds a ZIP holding a ready-to-open Obsidian vault: "
         "INDEX.md (a wikilink hub), document.md (the served version), "
         "versions/v{n}.md (one note per version — proposals included — with "
         "author, date, status, note and a diff against its predecessor), "
@@ -4958,7 +6034,14 @@ def export_markdown(
         "and the resolution) and reasoning.md, a chronological trail of how "
         "the document ended up this way.\n\n"
         "The archive is deterministic: the same artifact state always "
-        "produces byte-identical bytes.\n\n" + PASSWORD_GATE_NOTE
+        "produces byte-identical bytes.\n\n"
+        "Two bounds guard the build, because it is the most expensive thing "
+        "an unauthenticated caller can ask for. An artifact whose visible "
+        "history and comments exceed HUB_EXPORT_MAX_BYTES is refused with "
+        "**413** before anything is rendered; export a single version with "
+        "GET /a/{id}/export/markdown instead. And one client address may "
+        "build HUB_MAX_EXPORTS_PER_HOUR vaults of one artifact per hour, "
+        "after which the answer is **429**.\n\n" + PASSWORD_GATE_NOTE
     ),
     responses={
         200: {
@@ -4972,7 +6055,20 @@ def export_markdown(
             )
         },
         404: RESP_NOT_FOUND,
-        429: RESP_UNLOCK_429,
+        413: {
+            "description": (
+                "This artifact's visible history and comments are larger than "
+                "HUB_EXPORT_MAX_BYTES; no archive was built."
+            )
+        },
+        429: {
+            "description": (
+                "Either this client address built HUB_MAX_EXPORTS_PER_HOUR "
+                "vaults of this artifact in the current hour, or it made "
+                "HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR failed password attempts "
+                "on it."
+            )
+        },
         502: RESP_HUB_502,
     },
 )
@@ -4988,24 +6084,101 @@ def export_vault(
     if not reader_allowed(meta, request):
         return _password_required()
 
+    # Budgets are claimed after the password gate, so a protected artifact's
+    # export budget cannot be spent by somebody who never got past it, and
+    # keyed by the *internal* id, so rotating the link does not hand a caller
+    # a fresh allowance.
+    if not _claim_export_slot(request.app, meta.id, _client_ip(request)):
+        return _export_rate_limited()
+
     store = request.app.state.store
     # Proposals are moderated content: the public vault must not leak them.
     # Only the owner or a proposal's author (authenticated via the standard
     # token headers) gets them included in their download.
     caller = optional_caller(request)
+    limit = settings.export_max_bytes
+
+    # Refuse an oversized artifact *before* rendering, and before the load
+    # itself finishes: the running total is checked after every envelope and
+    # every thread as it comes in from Storage, not once at the end. Summing
+    # a fully materialized (envelopes, threads) list first and estimating
+    # afterwards would let the very allocation this budget exists to bound --
+    # up to HUB_MAX_VERSIONS x HUB_MAX_ENVELOPE_BYTES of parsed envelopes --
+    # happen before the budget is ever consulted (REL-100-002). The moment
+    # the running total crosses the limit, loading stops: later versions are
+    # never fetched, comments are never even listed, and whatever was
+    # accumulated so far is discarded along with the request.
     envelopes: list[Envelope] = []
+    running_total = 0
     for row in store.list_versions(meta.id):
         envelope = store.get_version(meta.id, row["version"])
-        if envelope is not None and may_see(meta, envelope, caller):
-            envelopes.append(envelope)
-    threads = request.app.state.comments.list_for(meta.id)
+        if envelope is None or not may_see(meta, envelope, caller):
+            continue
+        envelopes.append(envelope)
+        running_total += export.envelope_source_chars(envelope)
+        if 0 < limit < running_total:
+            logger.info(
+                "Refusing a vault export of artifact %s: about %d characters "
+                "of source in the versions alone, over the %d limit",
+                meta.id, running_total, limit,
+            )
+            return _export_too_large(running_total, limit)
 
-    filename, payload = export.build_vault(meta, envelopes, threads)
-    return Response(
-        content=payload,
+    threads = request.app.state.comments.list_for(meta.id)
+    for thread in threads:
+        running_total += export.thread_source_chars(thread)
+        if 0 < limit < running_total:
+            logger.info(
+                "Refusing a vault export of artifact %s: about %d characters "
+                "of source, over the %d limit",
+                meta.id, running_total, limit,
+            )
+            return _export_too_large(running_total, limit)
+
+    estimate = running_total
+
+    # Streamed into an owner-only scratch file rather than a BytesIO: the peak
+    # memory of an anonymous request must not be the caller's to choose.
+    try:
+        filename, path, size = export.build_vault_file(
+            meta, envelopes, threads, settings.cache_dir, max_bytes=limit
+        )
+    except export.ExportTooLarge as exc:
+        # The write-time backstop fired, so the estimate under-counted. The
+        # partial file is already gone; report the same 413 as the estimate.
+        logger.warning(
+            "Vault export of artifact %s overran the %d byte ceiling while "
+            "being written (estimate said %d)",
+            meta.id, exc.limit, estimate,
+        )
+        return _export_too_large(exc.size, exc.limit)
+    except OSError as exc:
+        logger.error("Cannot write a vault export of artifact %s: %s", meta.id, exc)
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "export unavailable",
+                "detail": "The vault could not be written on the server.",
+            },
+        )
+
+    logger.info("Built a %d byte vault export of artifact %s", size, meta.id)
+    return FileResponse(
+        path,
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        # The scratch file holds a full copy of an artifact that may be
+        # password-protected; it lives exactly as long as the response does.
+        background=BackgroundTask(_unlink_export, path),
     )
+
+
+def _unlink_export(path: Path) -> None:
+    """Remove a finished export's scratch file. Never raises into serving."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:  # noqa: BLE001 - cleanup must not break a response
+        logger.warning("Could not remove the export scratch file %s: %s", path, exc)
 
 
 @app.get(
@@ -5342,7 +6515,15 @@ def publish_artifact(
             "description": (
                 "The caller's Keboola stack could not be reached to verify "
                 "the token, the canonical upload failed, or the hub's own "
-                "Storage is unavailable."
+                "Storage is unavailable.\n\n"
+                "When a request carried both content and settings, the "
+                "'detail' names exactly what is in force, because a partly "
+                "applied update is never left less restrictive than it was: "
+                "either nothing was applied, or the settings that *narrow* "
+                "access were applied without the new version (and could not "
+                "be rolled back), or the new version is live under the "
+                "previous, narrower settings and the changes that *widen* "
+                "access must be resent. Read the detail before retrying."
             )
         },
     },
@@ -5354,7 +6535,16 @@ def update_artifact(
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
     auth: tuple[Owner, str] = Depends(require_owner),
 ) -> Response:
-    """Add a live version and/or change the artifact-level settings."""
+    """Add a live version and/or change the artifact-level settings.
+
+    **Persistence contract (SEC-100-001).** When one request does both, the
+    settings are split by direction and committed around the content:
+    tightening first, then the version, then loosening. Whatever fails, the
+    publicly reachable state is never less restrictive than the last durable
+    commit, and the 502 says which state that is. See the long comment on the
+    ordering below for the reasoning and :func:`_is_tightening` for how each
+    individual setting is classified.
+    """
     owner, token = auth
     ensure_hydrated(request.app)
     store = request.app.state.store
@@ -5411,12 +6601,42 @@ def update_artifact(
     if present:
         built, source = _build(body)
 
-    # Content first, settings last. The settings used to be saved before the
-    # content, so a failed canonical upload or version write answered 502
-    # with a new password, policy or status already in force -- the caller
-    # was told nothing happened while the security-relevant half had. Now
-    # the version lands (or fails, with nothing changed) before any setting
-    # is written. The settings are applied to a *copy*: store.get_meta
+    # Fail-closed write ordering (SEC-100-001, the regressed REL-075-004).
+    #
+    # A single PUT can carry both new content and new settings, and the two
+    # naive orderings each fail open in one direction:
+    #
+    #   settings first (v0.7.5)  a failed content write left the new password,
+    #                            policy or status in force although the caller
+    #                            was told the update failed;
+    #   content first (v0.10.0)  a failed settings write left the new -- often
+    #                            confidential -- version as the *public head*
+    #                            under the old, looser policy. Strictly worse:
+    #                            less restrictive than the previous state and
+    #                            than the requested one.
+    #
+    # Neither is safe on its own, because one request can both narrow access (a
+    # password, submissions closed, the document finalized) and widen it
+    # (clear_password, submissions reopened, un-finalized). So the settings are
+    # split by direction -- see :func:`_is_tightening` for the per-setting
+    # rules -- and committed around the content:
+    #
+    #   (a) tightening settings, (b) the new version, (c) loosening settings.
+    #
+    # The contract this is here to keep, and which the tests in
+    # tests/test_review100_atomic_update.py pin at every step:
+    #
+    #   **after any partial failure the publicly reachable state is never less
+    #   restrictive than the last durable commit.**
+    #
+    # Concretely: if (a) fails, nothing changed. If (b) fails, (a) is rolled
+    # back best-effort and the 502 names whichever of the two states survived
+    # -- retained tightening is acceptable and is stated plainly, retained
+    # loosening never happens because loosening has not been written yet. If
+    # (c) fails, the new content is live under the tightened/previous settings
+    # and the 502 says the widening half must be resent.
+    #
+    # Everything is applied to *copies* (dataclasses.replace): store.get_meta
     # answers from cache, so mutating ``meta`` in place would let a failed
     # save_meta leave every later read on this process showing settings
     # Storage never received.
@@ -5428,48 +6648,127 @@ def update_artifact(
     _apply_policy(candidate, body)
     candidate.updated_at = now
 
-    if built is not None:
-        canonical_file_id = _store_canonical(owner, token, artifact_id, built.html)
-        envelope = Envelope(
-            id=artifact_id,
-            # Replaced by add_version_next, which allocates atomically.
-            version=0,
-            title=built.title,
-            html=built.html,
-            source_type=built.source_type,
-            source=source or {},
-            author=_identity(owner),
-            status=STATUS_LIVE,
-            canonical_file_id=canonical_file_id,
-            created_at=now,
-        )
+    finalized_emitted = False
+    if built is None:
+        # No content means nothing to order the settings around, so this stays
+        # the single save it has always been.
+        envelope = store.get_head(artifact_id)
+        if envelope is None:
+            return _not_found(artifact_id)
+        store.save_meta(candidate)
+        meta = candidate
+    else:
+        previous = meta
+        tightened = _tightening_half(previous, candidate)
+        tightened.updated_at = now
+        has_tightening = _access_differs(previous, tightened)
+        has_loosening = _access_differs(tightened, candidate)
+
+        # (a) Narrow access first, so a failure anywhere later can only leave
+        # the artifact more locked down than it was, never less.
+        if has_tightening:
+            store.save_meta(tightened)
+        committed = tightened if has_tightening else previous
+
+        # (b) The content. Both halves of it -- the canonical copy in the
+        # caller's project and the version envelope on the hub -- are undone on
+        # failure, and so is (a).
         try:
-            envelope.version = store.add_version_next(envelope)
-        except Exception:
-            # The copy in the caller's project has no version pointing at it
-            # and no other way to ever be found; discard it now, while the
-            # caller's token still works. The failure itself still propagates.
-            _discard_canonical(owner, token, artifact_id, canonical_file_id)
-            raise
-        # v1 is the publish itself, which the owner just did by hand and does
-        # not need a notification about; every later live version is news.
+            canonical_file_id = _store_canonical(owner, token, artifact_id, built.html)
+            envelope = Envelope(
+                id=artifact_id,
+                # Replaced by add_version_next, which allocates atomically.
+                version=0,
+                title=built.title,
+                html=built.html,
+                source_type=built.source_type,
+                source=source or {},
+                author=_identity(owner),
+                status=STATUS_LIVE,
+                canonical_file_id=canonical_file_id,
+                created_at=now,
+            )
+            try:
+                envelope.version = store.add_version_next(envelope)
+            except Exception:
+                # The copy in the caller's project has no version pointing at
+                # it and no other way to ever be found; discard it now, while
+                # the caller's token still works. The failure still propagates.
+                _discard_canonical(owner, token, artifact_id, canonical_file_id)
+                raise
+        except Exception as exc:
+            if not has_tightening:
+                # Nothing was committed at all, so the pre-existing behaviour
+                # -- the raw failure, as a 502 -- is already accurate.
+                raise
+            rolled_back = False
+            try:
+                store.save_meta(dataclasses.replace(previous))
+                rolled_back = True
+            except Exception:  # noqa: BLE001 - the original failure must win
+                logger.error(
+                    "Artifact %s: the new version failed *and* the tightened "
+                    "settings from the same request could not be rolled back; "
+                    "they remain in force over the previous content and need "
+                    "checking by hand",
+                    artifact_id,
+                )
+            raise _partial_update_502(
+                exc,
+                _UPDATE_ROLLED_BACK if rolled_back else _UPDATE_TIGHTENING_STUCK,
+            ) from exc
+
+        # Durable now, so the notification is truthful. v1 is the publish
+        # itself, which the owner just did by hand and does not need a
+        # notification about; every later live version is news. The receivers
+        # are the ones ``committed`` holds -- a request that removed a webhook
+        # tightened it away in (a), and it must not be notified.
         if envelope.version > 1:
             _emit_webhook(
                 request,
-                meta,
+                committed,
                 "version.published",
                 {"title": envelope.title, "version": envelope.version},
                 actor=owner,
             )
-    else:
-        envelope = store.get_head(artifact_id)
-        if envelope is None:
-            return _not_found(artifact_id)
+        # Finalizing is a tightening, so it became durable in (a). Emitting it
+        # here rather than at the end of the handler means a failing (c) does
+        # not swallow an event describing a freeze that really did take.
+        if committed.status == ARTIFACT_FINAL and not was_final:
+            _emit_webhook(
+                request,
+                committed,
+                "artifact.finalized",
+                {"title": envelope.title, "version": envelope.version},
+                actor=owner,
+            )
+            finalized_emitted = True
 
-    store.save_meta(candidate)
-    meta = candidate
+        # (c) Widen access last, once the content it applies to exists. Also
+        # the place a content-only update records its updated_at, which is why
+        # this runs when there is no settings change at all.
+        if has_loosening or not has_tightening:
+            try:
+                store.save_meta(candidate)
+            except Exception as exc:
+                logger.error(
+                    "Artifact %s: version %d is published and live, but the "
+                    "settings that widen access could not be saved; the "
+                    "previous, more restrictive settings stay in force",
+                    artifact_id,
+                    envelope.version,
+                )
+                raise _partial_update_502(
+                    exc,
+                    _UPDATE_LOOSENING_PENDING
+                    if has_loosening
+                    else _UPDATE_TIMESTAMP_PENDING,
+                ) from exc
+            meta = candidate
+        else:
+            meta = tightened
 
-    if meta.status == ARTIFACT_FINAL and not was_final:
+    if meta.status == ARTIFACT_FINAL and not was_final and not finalized_emitted:
         _emit_webhook(
             request,
             meta,
@@ -5596,7 +6895,7 @@ def list_artifacts(
         },
         400: RESP_STACK_400,
         401: RESP_TOKEN_401,
-        403: RESP_OWNER_403,
+        403: RESP_DESTRUCTIVE_403,
         404: RESP_NOT_FOUND,
         502: {
             "description": (
@@ -5622,6 +6921,7 @@ def delete_artifact(
     if meta is None:
         return _not_found(artifact_id)
     _owner_only(meta, owner)
+    _destructive_authority(owner)
 
     now = _now()
     if not store.trash(artifact_id, now):
@@ -5744,9 +7044,11 @@ def restore_artifact(
         "artifact's view statistics and rate-limit counters. All of its URLs "
         "stop resolving for good.\n\n"
         "The call is idempotent and resumable: each step is safe to repeat, "
-        "and the record that authorizes the operation is erased last, so a "
-        "call that fails partway can simply be retried with the same "
-        "credentials.\n\n"
+        "and the meta record that authorizes the operation is erased strictly "
+        "last — after the comment threads and after every version file — so a "
+        "call that fails partway leaves the artifact still owned by you and "
+        "can simply be retried with the same credentials, including after a "
+        "restart.\n\n"
         "An artifact does not have to be in the trash first, but the gentler "
         "path is DELETE /api/artifacts/{id} (soft, reversible) followed by "
         "this once you are sure. The canonical copies in the authors' own "
@@ -5761,20 +7063,21 @@ def restore_artifact(
         },
         400: RESP_STACK_400,
         401: RESP_TOKEN_401,
-        403: RESP_OWNER_403,
+        403: RESP_DESTRUCTIVE_403,
         404: RESP_NOT_FOUND,
         502: {
             "description": (
                 "The caller's Keboola stack could not be reached to verify "
                 "the token, the hub's own Storage is unavailable, or the "
                 "erasure only partially succeeded — some stored files could "
-                "not be removed, so the artifact is still readable and the "
-                "call must be retried. Comment threads are erased before the "
-                "artifact itself, so a partial comment erasure "
-                "('comment_threads_failed' says how many threads still have "
-                "files in Storage) leaves the artifact deliberately in place: "
-                "retrying the purge with the same credentials resumes it and "
-                "finishes the job."
+                "not be removed, so content may still be readable and the "
+                "call must be retried. Comment threads are erased first, then "
+                "the version files, then the meta record, so a partial "
+                "erasure at any point ('comment_threads_failed' says how many "
+                "threads still have files in Storage) leaves the artifact and "
+                "its ownership record deliberately in place: retrying the "
+                "purge with the same credentials resumes it and finishes the "
+                "job."
             )
         },
     },
@@ -5794,6 +7097,7 @@ def purge_artifact(
     if meta is None:
         return _not_found(artifact_id)
     _owner_only(meta, owner)
+    _destructive_authority(owner)
 
     # Children first, the authorizing record last. The order is the whole
     # design of this route: the meta record is what _owner_only reads, so
@@ -5841,6 +7145,11 @@ def purge_artifact(
         # confirmed gone; on a partial failure it keeps the index so the
         # artifact stays readable. Reporting "deleted": true here would tell an
         # owner their content is unreachable while it is still being served.
+        #
+        # REL-100-001: whatever survived, the artifact's meta record survived
+        # with it (store.delete deletes it strictly last), so this retry can
+        # authenticate and finish -- including after a restart, since the meta
+        # is what hydrate rebuilds the artifact from.
         logger.error(
             "Partial purge of artifact %s: some Storage files remain",
             artifact_id,
@@ -5850,8 +7159,10 @@ def purge_artifact(
             content={
                 "error": "artifact not fully deleted",
                 "detail": (
-                    "Some stored files could not be removed; the artifact is "
-                    "still readable. Retry the delete."
+                    "Some stored files could not be removed, so the erasure "
+                    "did not fully happen and content may still be readable. "
+                    "The artifact's ownership record was deliberately kept so "
+                    "this call can be retried; retry the purge to finish it."
                 ),
                 "id": artifact_id,
                 "comment_threads_deleted": threads,
@@ -5886,6 +7197,46 @@ def purge_artifact(
     )
 
 
+def _no_store(response: Response) -> Response:
+    """Force ``Cache-Control: no-store`` / ``Pragma: no-cache`` (SEC-100-006).
+
+    Assignment, not ``setdefault``: the ``artifact_headers`` middleware only
+    ever sets a *default* Cache-Control, and only on ``/a/*`` paths, so there
+    is nothing here for this to lose a conflict with -- but a secret-bearing
+    response must never depend on that staying true. Every response that can
+    carry a webhook receiver's signing key (this listing, and the rotate-key
+    response below) goes through this before it leaves the handler, so a
+    shared or browser cache can never be the reason a rotated-away key stays
+    reachable.
+    """
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+def _webhook_receiver_view(
+    dispatcher: WebhookDispatcher, artifact_id: str, url: str, record: dict | None
+) -> dict:
+    """One receiver's entry for the webhook-keys listing and rotate response.
+
+    ``record`` is the receiver's persisted epoch (``None`` for a receiver
+    that has never been rotated); the dispatcher is seeded with it by the
+    caller before this runs, so ``signing_key_for`` already reflects it.
+    ``rotate_key_url`` is included so a caller does not have to reimplement
+    :func:`src.webhooks.receiver_id_for` client-side just to rotate.
+    """
+    view = {
+        "url": url,
+        "id": receiver_id_for(url),
+        "signing_key": dispatcher.signing_key_for(artifact_id, url),
+        "rotated_at": record.get("rotated_at") if record else None,
+        "rotate_key_url": (
+            f"/api/artifacts/{artifact_id}/webhooks/{receiver_id_for(url)}/rotate-key"
+        ),
+    }
+    return view
+
+
 @app.get(
     "/api/artifacts/{artifact_id}/webhooks",
     tags=["artifacts"],
@@ -5903,13 +7254,21 @@ def purge_artifact(
         "The keys are on their own endpoint rather than in the general owner "
         "view because they are credentials: fetch one when you configure a "
         "receiver, store it where that receiver keeps its secrets, and do "
-        "not log it. Registering the same URL again yields the same key; "
-        "removing a URL and its receiver ends its use."
+        "not log it. Registering the same URL again yields the same key "
+        "**until it has been rotated** (SEC-100-006) — see `POST "
+        ".../webhooks/{receiver_id}/rotate-key`, listed here as "
+        "`rotate_key_url`, to mint an independent one without touching the "
+        "URL. This response, like the rotate response, always carries "
+        "`Cache-Control: no-store` and `Pragma: no-cache` — a receiver's key "
+        "is a credential and must never be served from a shared or browser "
+        "cache."
     ),
     responses={
         200: {
             "description": (
-                "The registered receivers, each with its own signing key."
+                "The registered receivers, each with its own signing key and "
+                "a `rotate_key_url`; `rotated_at` is null for a receiver "
+                "that has never been rotated."
             )
         },
         400: RESP_STACK_400,
@@ -5932,14 +7291,163 @@ def read_webhook_keys(
     _owner_only(meta, owner)
 
     dispatcher = request.app.state.webhooks
-    return JSONResponse(
-        {
-            "id": meta.id,
-            "webhooks": [
-                {"url": url, "signing_key": dispatcher.signing_key_for(meta.id, url)}
-                for url in list(meta.webhooks or [])
-            ],
-        }
+    dispatcher.configure_key_overlap_s(settings.webhook_key_overlap_s)
+    epochs = meta.webhook_key_epochs or {}
+    urls = list(meta.webhooks or [])
+    for url in urls:
+        # Re-seed the live epoch cache from the durable record on every read,
+        # not only on rotate: this is the point in the request lifecycle
+        # where a fresh process picks the persisted epoch back up (see the
+        # comment on WebhookDispatcher._epochs), and it costs nothing when
+        # there is nothing to seed.
+        dispatcher.seed_epoch(meta.id, url, epochs.get(url))
+    return _no_store(
+        JSONResponse(
+            {
+                "id": meta.id,
+                "webhooks": [
+                    _webhook_receiver_view(dispatcher, meta.id, url, epochs.get(url))
+                    for url in urls
+                ],
+            }
+        )
+    )
+
+
+@app.post(
+    "/api/artifacts/{artifact_id}/webhooks/{receiver_id}/rotate-key",
+    tags=["artifacts"],
+    summary="Rotate one webhook receiver's signing key",
+    description=(
+        "Owner-only (SEC-100-006). Mints a fresh, independent signing key "
+        "for one receiver without touching its URL, and returns the new "
+        "key. `receiver_id` is the value each entry of `GET "
+        ".../webhooks` reports as `id` (or the `rotate_key_url` there, used "
+        "as-is).\n\n"
+        "**A short grace period, not an instant cutover.** For "
+        "`webhook_key_overlap_s` seconds after rotation (config "
+        "`HUB_WEBHOOK_KEY_OVERLAP_S`, default 600), every delivery to this "
+        "receiver carries *both* signatures: the new key in the usual "
+        "`X-Hub-Signature-256`, and the previous key in "
+        "`X-Hub-Signature-256-Previous`. A receiver that only ever checks "
+        "the first header needs no code change and is protected the moment "
+        "the response is returned; a receiver that wants zero-downtime "
+        "rotation can accept either header until it has picked up the new "
+        "key from this response. Past the overlap window only "
+        "`X-Hub-Signature-256` is sent and the previous key no longer "
+        "verifies anything, full stop.\n\n"
+        "Rotating never changes the receiver's URL and never requires "
+        "re-registering it — `webhooks` on `PUT /api/artifacts/{id}` is "
+        "untouched by this call."
+    ),
+    responses={
+        200: {
+            "description": (
+                "Rotated; JSON with the new `signing_key`, `rotated_at`, and "
+                "`overlap_seconds` the previous key stays valid for. Carries "
+                "`Cache-Control: no-store` and `Pragma: no-cache`."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: RESP_DESTRUCTIVE_403,
+        404: {
+            "description": (
+                "No artifact with this id, or it has no registered receiver "
+                "with this receiver_id."
+            )
+        },
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable so the "
+                "meta record could not be rewritten."
+            )
+        },
+    },
+)
+@_serialized_per_artifact
+def rotate_webhook_key(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    receiver_id: str = PathParam(
+        ...,
+        description=(
+            "A receiver's `id` from `GET /api/artifacts/{id}/webhooks` "
+            "(a hash of its URL, not the URL itself)."
+        ),
+    ),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Mint a fresh key epoch for one receiver, keeping its URL unchanged."""
+    owner, _token = auth
+    ensure_hydrated(request.app)
+    store = request.app.state.store
+
+    meta = store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    _owner_only(meta, owner)
+    _destructive_authority(owner)
+
+    url = next(
+        (u for u in meta.webhooks or [] if receiver_id_for(u) == receiver_id), None
+    )
+    if url is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "webhook receiver not found",
+                "id": artifact_id,
+                "receiver_id": receiver_id,
+            },
+        )
+
+    existing = (meta.webhook_key_epochs or {}).get(url)
+    previous_epoch = existing.get("epoch") if existing else None
+    new_record = mint_key_epoch(previous_epoch, now=_now())
+
+    # Copy-then-save, not an in-place mutation: store.get_meta answers from an
+    # in-process cache, so every other concurrent reader in this process sees
+    # whatever ``meta`` holds right now. Building a new dict and handing
+    # save_meta a dataclasses.replace()'d copy (same pattern as
+    # revoke_invitation above) means a failed save leaves the cached meta --
+    # and therefore every concurrent read -- still describing the key that is
+    # actually still correct, instead of a rotation the write never durably
+    # committed.
+    updated_epochs = dict(meta.webhook_key_epochs or {})
+    updated_epochs[url] = new_record
+    candidate = dataclasses.replace(
+        meta, webhook_key_epochs=updated_epochs, updated_at=_now()
+    )
+    store.save_meta(candidate)
+
+    dispatcher = request.app.state.webhooks
+    dispatcher.configure_key_overlap_s(settings.webhook_key_overlap_s)
+    dispatcher.seed_epoch(candidate.id, url, new_record)
+
+    logger.info(
+        "Rotated the webhook signing key for artifact %s receiver %s "
+        "(owner project %s)",
+        artifact_id,
+        receiver_id,
+        owner.project_id,
+    )
+    return _no_store(
+        JSONResponse(
+            {
+                "id": artifact_id,
+                "receiver_id": receiver_id,
+                "signing_key": dispatcher.signing_key_for(candidate.id, url),
+                "rotated_at": new_record["rotated_at"],
+                "overlap_seconds": settings.webhook_key_overlap_s,
+                "note": (
+                    "The previous key still verifies deliveries to this "
+                    "receiver (X-Hub-Signature-256-Previous) for "
+                    "overlap_seconds after rotated_at, then stops working."
+                ),
+            }
+        )
     )
 
 
@@ -5973,7 +7481,7 @@ def read_webhook_keys(
         },
         400: RESP_STACK_400,
         401: RESP_TOKEN_401,
-        403: RESP_OWNER_403,
+        403: RESP_DESTRUCTIVE_403,
         404: RESP_NOT_FOUND,
         502: {
             "description": (
@@ -5999,6 +7507,7 @@ def rotate_link(
     if meta is None:
         return _not_found(artifact_id)
     _owner_only(meta, owner)
+    _destructive_authority(owner)
 
     previous = meta.share_id
     new_share = store.rotate_share(artifact_id, when_iso=_now())
@@ -6352,13 +7861,14 @@ def revoke_invitation(
 
     if not target.get("revoked"):
         # A copy, not an in-place flag. store.get_meta answers from cache, so
-        # ``meta`` is the object every later read on this replica gets:
+        # ``meta`` is the object every later read in this process gets:
         # marking the invitation revoked before the save succeeds means a
         # failed revocation still reads as revoked here, while Storage --
-        # and every other replica -- still honours the guest. The owner is
-        # told 502 and retries, but a restart rehydrates from Storage and
-        # quietly brings the guest back. save_meta uploads before it caches,
-        # so handing it a copy leaves the original untouched on failure.
+        # and therefore any process that later rehydrates from it -- still
+        # honours the guest. The owner is told 502 and retries, but a restart
+        # rehydrates from Storage and quietly brings the guest back. save_meta
+        # uploads before it caches, so handing it a copy leaves the original
+        # untouched on failure.
         revoked = [
             {**invitation, "revoked": True}
             if invitation.get("id") == invitation_id
@@ -6664,7 +8174,7 @@ def promote_version(
     "/api/artifacts/{artifact_id}/versions/{version}",
     tags=["versions"],
     summary="Delete a version or withdraw a proposal",
-    description="The owning project may delete any version except the last live one. A contributor may delete only their own proposal — withdrawing a submission they no longer stand behind.",
+    description="The owning project may delete any version except the last live one and the version the head is currently pinned to. A contributor may delete only their own proposal — withdrawing a submission they no longer stand behind. Deleting the pinned version is refused with 409: pin the head to another live version, or switch it back to 'latest', and then delete.",
     responses={
         200: {
             "description": (
@@ -6674,12 +8184,20 @@ def promote_version(
         400: RESP_STACK_400,
         401: RESP_TOKEN_401,
         403: {
-            "description": "Not the owner, and not the author of this proposal."
+            "description": (
+                "Not the owner, and not the author of this proposal; or the "
+                "owner, but without the admin/allowlisted token this hub's "
+                "destructive_token_policy requires (see GET /context, "
+                "'limits'). Withdrawing your own proposal is never gated by "
+                "that policy."
+            )
         },
         404: {"description": "No artifact, or no such version."},
         409: {
             "description": (
-                "This is the only live version; an artifact must keep one."
+                "This is the only live version and an artifact must keep one, "
+                "or this is the version the head is pinned to — re-pin the "
+                "head or switch it to 'latest' first."
             )
         },
         422: {"description": "'version' is not an integer."},
@@ -6713,9 +8231,10 @@ def delete_version(
     if envelope is None:
         return _version_not_found(artifact_id, version)
 
-    if meta.owner_key != caller.key and not (
+    withdrawing_own_proposal = (
         envelope.status == STATUS_PROPOSED and envelope.author_key == caller.key
-    ):
+    )
+    if meta.owner_key != caller.key and not withdrawing_own_proposal:
         raise HTTPException(
             status_code=403,
             detail=(
@@ -6723,6 +8242,13 @@ def delete_version(
                 "contributor may withdraw their own proposal"
             ),
         )
+    if not withdrawing_own_proposal:
+        # SEC-075-011: only the *owner authority* path is gated. Withdrawing
+        # a proposal you yourself submitted is removing your own contribution,
+        # not exercising project-wide destructive power over someone else's
+        # history, so no hub policy should stand between a contributor and
+        # their own draft.
+        _destructive_authority(caller)
 
     # store.delete_version answers False for two very different reasons: the
     # policy refusal below, and a backend delete that did not confirm. The
@@ -6744,6 +8270,49 @@ def delete_version(
                 ),
                 "id": artifact_id,
                 "version": version,
+            },
+        )
+
+    # COR-075-006: refuse to delete the version the head is pinned to.
+    #
+    # The delete used to succeed and leave the meta record naming a version
+    # that no longer existed. Nothing was corrupted in a way a reader would
+    # notice -- get_head logs the dangling pin and falls back to the newest
+    # live version -- and that silence was the problem: the owner had asked
+    # for one specific version to be served, the stored answer to "what does
+    # /a/{id} serve" still said that version, and what was actually served was
+    # something else. A pin is an explicit editorial decision, so resolving it
+    # by guessing is worse than refusing.
+    #
+    # Of the two options in the review roadmap -- refuse, or silently rewrite
+    # the head to "latest" in the same operation -- this is the refusal. It
+    # keeps the head pointer something only the owner ever moves, and it costs
+    # them one extra call that says out loud what the alternative would have
+    # done behind their back. The invariant it establishes: after any
+    # successful version delete, a stored "pinned" head still names a live
+    # version.
+    #
+    # The check reads the meta record loaded above rather than the head
+    # envelope, because a stale pin is exactly the state being guarded and
+    # get_head would have already resolved it away. Both this route and
+    # PUT /head are @_serialized_per_artifact, so the pin cannot move between
+    # this check and the delete below.
+    if meta.head_mode == HEAD_PINNED and meta.head_version == version:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "cannot delete the pinned head version",
+                "detail": (
+                    f"The head is pinned to version {version}, so deleting it "
+                    "would leave the artifact pointing at a version that no "
+                    "longer exists. Pin the head to another live version, or "
+                    "switch it back to 'latest' "
+                    f"(PUT /api/artifacts/{artifact_id}/head), then delete."
+                ),
+                "id": artifact_id,
+                "version": version,
+                "head_mode": meta.head_mode,
+                "head_version": meta.head_version,
             },
         )
 
@@ -7035,6 +8604,7 @@ def _may_moderate_thread(
         },
         404: RESP_NOT_FOUND,
         409: RESP_FINAL_409,
+        413: RESP_BODY_413,
         422: {
             "description": (
                 "The referenced version does not exist, the quote is empty or "
@@ -7149,6 +8719,7 @@ def create_comment(
         },
         404: RESP_THREAD_404,
         409: RESP_FINAL_409,
+        413: RESP_BODY_413,
         422: {"description": "The reply body is empty or too long."},
         429: RESP_COMMENTS_429,
         502: {
@@ -7193,7 +8764,7 @@ def reply_to_comment(
         return _comment_rate_limited(guest=caller is None)
 
     # A copy, not an append. CommentStore.get answers from its in-memory LRU,
-    # so the object here is the very one every later read on this replica
+    # so the object here is the very one every later read in this process
     # gets: mutating it before the write succeeds means a refused reply is
     # still shown, and is persisted by whatever writes the thread next.
     candidate = dataclasses.replace(

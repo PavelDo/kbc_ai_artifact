@@ -5,6 +5,7 @@ defaults — the app fails fast at startup with a clear error instead of
 inventing values. Optional limits have documented defaults overridable via env.
 """
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,10 +18,85 @@ REQUIRED_ENV = ["HUB_STORAGE_TOKEN", "HUB_STACK_URL", "HUB_SECRET_KEY"]
 #: startup rather than silently accepted.
 MIN_SECRET_KEY_CHARS = 32
 
+#: Head-room added on top of the largest document the hub accepts when sizing
+#: the inbound request-body ceiling of the content routes (SEC-100-004). A
+#: document travels inside a JSON envelope, escaped, next to a handful of
+#: sibling fields, so the request is always somewhat larger than the document
+#: it carries; without this allowance a legitimate maximum-size publish would
+#: be rejected before it was ever parsed.
+REQUEST_ENVELOPE_SLACK_BYTES = 1024 * 1024
+
+#: One parsed entry of ``HUB_TRUSTED_PROXY_CIDRS``.
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+#: Accepted values of ``HUB_DESTRUCTIVE_TOKEN_POLICY`` (SEC-075-011), from
+#: widest to narrowest. ``project`` is the historical behaviour and stays the
+#: default so an upgrade never silently locks an operator out of their own
+#: artifacts; the other two are opt-in.
+DESTRUCTIVE_TOKEN_POLICIES = ("project", "admin", "allowlist")
+DEFAULT_DESTRUCTIVE_TOKEN_POLICY = "project"
+
 
 def _int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     return int(raw) if raw else default
+
+
+def _cidr_env(name: str) -> tuple[IPNetwork, ...]:
+    """Parse a comma-separated list of CIDR networks, or fail fast at startup.
+
+    A malformed entry is a configuration error, not something to skip with a
+    warning: this list decides whose ``X-Real-IP`` the brute-force limiter
+    believes (SEC-100-003), so silently dropping an unparseable entry would
+    quietly widen or narrow that trust in a way nobody would notice until it
+    mattered. ``strict=False`` accepts a host address carrying a prefix
+    (``10.0.0.7/8``) and a bare address (``10.0.0.7`` becomes ``/32``), which
+    is how operators usually write down a proxy's address.
+    """
+    networks: list[IPNetwork] = []
+    for entry in os.environ.get(name, "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{name} contains an entry that is not a valid CIDR network "
+                f"({entry!r}): {exc}"
+            ) from exc
+    return tuple(networks)
+
+
+def _destructive_policy_env(name: str) -> str:
+    """Parse the destructive-token policy, or fail fast at startup.
+
+    A typo here is not a small thing: ``HUB_DESTRUCTIVE_TOKEN_POLICY=admn``
+    silently falling back to the default would leave an operator believing
+    they had narrowed destructive authority when they had not. That is exactly
+    the failure mode the control exists to prevent, so an unrecognized value
+    stops the process instead.
+    """
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return DEFAULT_DESTRUCTIVE_TOKEN_POLICY
+    if raw not in DESTRUCTIVE_TOKEN_POLICIES:
+        raise RuntimeError(
+            f"{name}={raw!r} is not a known policy. Use one of: "
+            f"{', '.join(DESTRUCTIVE_TOKEN_POLICIES)}."
+        )
+    return raw
+
+
+def _token_ids_env(name: str) -> tuple[str, ...]:
+    """Parse a comma-separated list of Storage token ids, order-preserving."""
+    seen: list[str] = []
+    for entry in os.environ.get(name, "").split(","):
+        entry = entry.strip()
+        if entry and entry not in seen:
+            seen.append(entry)
+    return tuple(seen)
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -87,11 +163,89 @@ class Settings:
     # anyway. Local development behind a proxy opts in with
     # HUB_TRUST_FORWARDED_HEADERS=1.
     trust_forwarded_headers: bool = False
+    # Networks whose members are believed when they name the real client in a
+    # forwarded header (env HUB_TRUSTED_PROXY_CIDRS, comma-separated CIDRs).
+    # SEC-100-003: X-Real-IP is the key of the brute-force budget, and anyone
+    # can send it, so a caller could reset their own budget at will. A
+    # forwarded client address is now honoured only when
+    # HUB_TRUST_FORWARDED_HEADERS is on *and* the direct peer
+    # (request.client.host) falls inside one of these networks. Empty (the
+    # default) therefore means "never believe a forwarded client address" —
+    # everything buckets by the peer address, which is safe but coarse behind
+    # a proxy, since every caller then shares the proxy's bucket.
+    trusted_proxy_cidrs: tuple[IPNetwork, ...] = ()
+    # How many X-Forwarded-For entries the client-address walk examines,
+    # counted from the right (env HUB_MAX_FORWARDED_CHAIN_ENTRIES).
+    # SEC-100-003: the header is caller-supplied and arbitrarily long, and the
+    # walk parses one address per entry, so an unbounded chain would let a
+    # single request buy thousands of parses. Sixteen is far more hops than
+    # any real path — client, platform proxy, nginx is three — and a chain
+    # that reaches the cap without finding an untrusted entry simply falls
+    # back to the peer address, which is the safe answer anyway.
+    max_forwarded_chain_entries: int = 16
+    # Which tokens of the owning project may run a *destructive* route — soft
+    # delete, purge, rotate-link, version delete, webhook key rotation
+    # (env HUB_DESTRUCTIVE_TOKEN_POLICY). SEC-075-011: ownership is a
+    # (stack, project) pair, so before this every token of that project — a
+    # read-only one included — could purge every artifact the project owns.
+    #
+    #   "project"   every token of the owning project (the historical
+    #               behaviour, and the default: an upgrade must not lock an
+    #               operator out of artifacts they already own)
+    #   "admin"     a master token, or one belonging to a project user whose
+    #               admin.role is "admin"
+    #   "allowlist" only tokens whose id appears in
+    #               HUB_DESTRUCTIVE_TOKEN_IDS
+    #
+    # Non-destructive owner routes (update, head pin, promote, settings,
+    # invitations, stats, trash restore) are untouched by every mode.
+    destructive_token_policy: str = DEFAULT_DESTRUCTIVE_TOKEN_POLICY
+    # Storage token ids allowed to run destructive routes under the
+    # "allowlist" policy (env HUB_DESTRUCTIVE_TOKEN_IDS, comma-separated).
+    # A token id is an identifier, not a secret. Ignored in the other modes;
+    # required non-empty in "allowlist", since an empty allowlist would refuse
+    # the owner their own destructive routes with no way to tell that from a
+    # deliberate lockdown.
+    destructive_token_ids: tuple[str, ...] = ()
     # Failed unlock attempts allowed per (artifact, client IP) per UTC hour
     # before the password gate answers 429 (env
     # HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR). Each attempt costs a full PBKDF2
     # verification, so this bounds both brute force and the CPU it can burn.
     max_unlock_attempts_per_hour: int = 30
+    # Failed unlock (or guest-credential) attempts allowed against one
+    # artifact per UTC hour *from every address together*
+    # (HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR). Defence in depth for
+    # SEC-100-003: the per-address budget above is only as strong as the
+    # address is hard to change, and behind a NAT, a botnet or a proxy whose
+    # network is trusted it can be changed cheaply. This budget cannot be
+    # rotated away at all, so it is set far above what a real audience of one
+    # document would ever spend — it is a stop on industrial guessing, not a
+    # per-reader limit.
+    max_unlock_attempts_per_artifact_per_hour: int = 500
+    # Largest inbound request body accepted by every route that does not carry
+    # a document — comments, replies, invitations, the unlock form, webhook
+    # management, policy-only calls (HUB_MAX_SMALL_REQUEST_BYTES). SEC-100-004:
+    # before this ceiling an anonymous caller could have megabytes read and
+    # parsed before authentication, a lock or a 404 ever happened. The content
+    # routes get the much larger ``max_content_request_bytes`` instead.
+    max_small_request_bytes: int = 256 * 1024
+    # Most per-artifact mutation locks kept once nothing holds them
+    # (HUB_LOCK_REGISTRY_MAX_ENTRIES). SEC-100-002: the registry used to keep
+    # an entry per key it ever saw, including keys invented by anonymous
+    # callers. Idle entries above this are dropped least-recently-used; a lock
+    # somebody is holding or waiting on is never dropped, so the bound cannot
+    # break serialization.
+    lock_registry_max_entries: int = 1024
+    # Artifact ids Storage has confirmed do not exist, remembered so a repeat
+    # lookup costs a dict hit instead of a tag search
+    # (HUB_NEGATIVE_LOOKUP_CACHE_ENTRIES). SEC-100-002 moved target resolution
+    # in front of authentication, which made every well-formed made-up id an
+    # unauthenticated Storage round trip; this bounds the damage a stream of
+    # them can do. Entries are dropped least-recently-used above this, and
+    # invalidated by every write that can make an id appear, so the bound
+    # trades memory for round trips and never for correctness. 0 disables the
+    # cache entirely.
+    negative_lookup_cache_entries: int = 4096
     # Operational state sidecar (phase 4, src/statedb.py)
     # Seconds between SQLite snapshots into the host project's Storage Files
     # (env HUB_STATE_SNAPSHOT_INTERVAL_S). 0 disables the background thread and
@@ -104,6 +258,12 @@ class Settings:
     # File name of the SQLite sidecar; main.py joins it with cache_dir, which is
     # the only writable (and ephemeral) path the container has.
     state_db_filename: str = "state.sqlite3"
+    # ARCH-100-001: file name of the exclusive startup lock, also under
+    # cache_dir (HUB_INSTANCE_LOCK_FILENAME). The lifespan takes a non-blocking
+    # flock on it and holds it for the life of the process, so a second uvicorn
+    # worker or a second container sharing the disk fails to start instead of
+    # quietly corrupting the state the whole design assumes only it writes.
+    instance_lock_filename: str = "instance.lock"
     # Outbound webhooks (phase 4, src/webhooks.py)
     # Per-request HTTP timeout for a webhook delivery (HUB_WEBHOOK_TIMEOUT_S).
     webhook_timeout_s: int = 10
@@ -119,12 +279,51 @@ class Settings:
     # without limit; past the ceiling the newest delivery is dropped with a
     # log line rather than blocking the request that produced it.
     webhook_queue_max: int = 1000
+    # SEC-100-006: how long, in seconds, a receiver's previous signing key
+    # stays valid after the owner rotates it (HUB_WEBHOOK_KEY_OVERLAP_S).
+    # During this window a delivery carries both the current signature
+    # (X-Hub-Signature-256) and the previous one
+    # (X-Hub-Signature-256-Previous), so a receiver that has not yet picked
+    # up the freshly rotated key does not immediately start failing
+    # verification. 0 disables the grace period — rotation takes effect
+    # immediately for every subsequent delivery.
+    webhook_key_overlap_s: int = 600
     # Guest invitations (0.7.0)
     # How many invitations one artifact may hold at once
     # (HUB_MAX_INVITATIONS_PER_ARTIFACT). Each entry is a named capability
     # stored in the artifact's meta record, so this bounds both the meta file
     # and the number of people who can comment without a Keboola account.
     max_invitations_per_artifact: int = 20
+    # Vault exports (REL-100-002)
+    # Ceiling on the source material one GET /a/{id}/export/vault may render,
+    # and on the archive it may write (HUB_EXPORT_MAX_BYTES). 0 disables the
+    # bound. Derived from the two limits that decide the worst case: an
+    # artifact may keep HUB_MAX_VERSIONS (50) records of up to
+    # HUB_MAX_ENVELOPE_BYTES (20 MiB) each, so an unbounded export is a ~1 GiB
+    # request anybody holding the capability URL can repeat. The default is
+    # three envelopes' worth -- comfortably above any real document's whole
+    # history, far below what a container with one process can absorb.
+    export_max_bytes: int = 64 * 1024 * 1024
+    # Vault builds allowed per (artifact, client address) per UTC hour before
+    # the export answers 429 (HUB_MAX_EXPORTS_PER_HOUR). Building a vault
+    # diffs every version and converts every HTML document, so this bounds how
+    # often one capability-URL holder can ask for that work.
+    max_exports_per_hour: int = 20
+
+    @property
+    def max_content_request_bytes(self) -> int:
+        """Inbound body ceiling for the routes that carry a document.
+
+        Derived rather than configured on its own, so it can never drift below
+        the documents the hub already promises to accept: whichever of
+        ``max_html_bytes`` and ``max_envelope_bytes`` is larger, plus
+        :data:`REQUEST_ENVELOPE_SLACK_BYTES` for the JSON envelope around it.
+        Raising either content limit raises this with it.
+        """
+        return (
+            max(self.max_html_bytes, self.max_envelope_bytes)
+            + REQUEST_ENVELOPE_SLACK_BYTES
+        )
 
 
 def load_settings() -> Settings:
@@ -147,6 +346,18 @@ def load_settings() -> Settings:
         for s in os.environ.get("HUB_EXTRA_STACKS", "").split(",")
         if s.strip()
     )
+    destructive_policy = _destructive_policy_env("HUB_DESTRUCTIVE_TOKEN_POLICY")
+    destructive_token_ids = _token_ids_env("HUB_DESTRUCTIVE_TOKEN_IDS")
+    if destructive_policy == "allowlist" and not destructive_token_ids:
+        # SEC-075-011: an empty allowlist is never what somebody meant. It
+        # would refuse every destructive call, including the operator's own,
+        # and look identical to a deliberate freeze — so it is a startup
+        # error, not a very strict configuration.
+        raise RuntimeError(
+            "HUB_DESTRUCTIVE_TOKEN_POLICY=allowlist requires a non-empty "
+            "HUB_DESTRUCTIVE_TOKEN_IDS (comma-separated Storage token ids). "
+            "Read a token's id from GET {stack}/v2/storage/tokens/verify."
+        )
     return Settings(
         hub_storage_token=os.environ["HUB_STORAGE_TOKEN"],
         hub_stack_url=os.environ["HUB_STACK_URL"].rstrip("/"),
@@ -172,8 +383,20 @@ def load_settings() -> Settings:
         reap_aborted_publish_after_s=_int_env("HUB_REAP_ABORTED_PUBLISH_AFTER_S", 3600),
         max_proposed_versions=_int_env("HUB_MAX_PROPOSED_VERSIONS", 50),
         trust_forwarded_headers=_bool_env("HUB_TRUST_FORWARDED_HEADERS", False),
+        trusted_proxy_cidrs=_cidr_env("HUB_TRUSTED_PROXY_CIDRS"),
+        max_forwarded_chain_entries=_int_env("HUB_MAX_FORWARDED_CHAIN_ENTRIES", 16),
+        destructive_token_policy=destructive_policy,
+        destructive_token_ids=destructive_token_ids,
         max_unlock_attempts_per_hour=_int_env(
             "HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR", 30
+        ),
+        max_unlock_attempts_per_artifact_per_hour=_int_env(
+            "HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR", 500
+        ),
+        max_small_request_bytes=_int_env("HUB_MAX_SMALL_REQUEST_BYTES", 256 * 1024),
+        lock_registry_max_entries=_int_env("HUB_LOCK_REGISTRY_MAX_ENTRIES", 1024),
+        negative_lookup_cache_entries=_int_env(
+            "HUB_NEGATIVE_LOOKUP_CACHE_ENTRIES", 4096
         ),
         state_snapshot_interval_s=_int_env("HUB_STATE_SNAPSHOT_INTERVAL_S", 300),
         state_max_snapshot_bytes=_int_env(
@@ -182,11 +405,18 @@ def load_settings() -> Settings:
         state_db_filename=(
             os.environ.get("HUB_STATE_DB_FILENAME", "").strip() or "state.sqlite3"
         ),
+        instance_lock_filename=(
+            os.environ.get("HUB_INSTANCE_LOCK_FILENAME", "").strip()
+            or "instance.lock"
+        ),
         webhook_timeout_s=_int_env("HUB_WEBHOOK_TIMEOUT_S", 10),
         webhook_max_attempts=_int_env("HUB_WEBHOOK_MAX_ATTEMPTS", 3),
         max_webhooks_per_artifact=_int_env("HUB_MAX_WEBHOOKS_PER_ARTIFACT", 5),
         webhook_queue_max=_int_env("HUB_WEBHOOK_QUEUE_MAX", 1000),
+        webhook_key_overlap_s=_int_env("HUB_WEBHOOK_KEY_OVERLAP_S", 600),
         max_invitations_per_artifact=_int_env(
             "HUB_MAX_INVITATIONS_PER_ARTIFACT", 20
         ),
+        export_max_bytes=_int_env("HUB_EXPORT_MAX_BYTES", 64 * 1024 * 1024),
+        max_exports_per_hour=_int_env("HUB_MAX_EXPORTS_PER_HOUR", 20),
     )

@@ -1,6 +1,6 @@
 [project]
 name = "kbc-artifact-hub"
-version = "0.10.0"
+version = "0.11.0"
 description = "Keboola App that hosts HTML+JS artifacts under public URLs, backed by Keboola Storage Files"
 requires-python = ">=3.11"
 dependencies = [
@@ -20,6 +20,16 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "respx>=0.21.0",
+    # SUP-100-001: the CI and release dependency audit runs `uv run pip-audit`
+    # rather than `uvx pip-audit`, so the tool that decides whether the
+    # production graph is clean is itself pinned by uv.lock instead of being
+    # resolved fresh from the index on every privileged run.
+    "pip-audit>=2.9.0",
+    # tests/test_review100_release_controls.py parses .github/workflows/*.yml
+    # structurally (pinned actions, per-job permissions, the gates the release
+    # job must re-run) rather than grepping it. Declared explicitly instead of
+    # leaning on pip-audit happening to pull it in.
+    "pyyaml>=6.0",
 ]
 
 [tool.uv]

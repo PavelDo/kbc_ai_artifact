@@ -59,6 +59,7 @@ import json
 from datetime import datetime, timezone
 import logging
 import os
+import secrets
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
@@ -170,6 +171,70 @@ ARTIFACT_SETTABLE_STATUSES = (ARTIFACT_DRAFT, ARTIFACT_FINAL)
 SCHEMA_VERSION = 2
 
 
+class RevisionLedger:
+    """A monotonic mutation counter per artifact, for O(1) change detection.
+
+    Closes REL-100-003. ``GET /a/{id}/live`` used to enumerate every version
+    and every comment thread just to hash them into an ETag, which meant a
+    conditional poll that answers "nothing changed" still paid the full price
+    of finding that out. With this ledger the poll turns
+    :meth:`token` into an ETag and answers 304 having read one dictionary
+    entry.
+
+    **Why an in-memory counter is exact here, not an approximation.** Per
+    CLAUDE.md this service is deployed as exactly one Keboola Data App
+    container running exactly one uvicorn process, and that is a deployment
+    invariant rather than a scaling choice -- the version allocator, the
+    per-process locks and the StateDB snapshot cycle already depend on it.
+    Under it, this process is the only writer that exists, and no artifact can
+    change without passing through the store method that bumps its number. So
+    "same token" really does mean "same state", with no window in which
+    somebody else moved the artifact behind our back.
+
+    **Why a boot nonce.** The ledger does not survive a restart, and a bare
+    counter restarting at zero would let a cold process re-issue a tag it had
+    already used for older content -- a client would be told "unchanged" about
+    something that had in fact moved. Mixing a random per-process nonce into
+    every token makes that impossible: after a restart the same artifact in
+    the same state hands out a *different* tag, so a stale client refetches
+    once (cheap, correct) instead of missing an update (silent, wrong).
+
+    **Why reads never insert.** :meth:`token` treats an unknown artifact as
+    revision 0 rather than creating an entry, and :meth:`forget` drops an
+    artifact when it is purged. Between them the ledger stays bounded by the
+    number of live artifacts, so neither anonymous polling of made-up ids nor
+    a create/purge loop can grow it -- the failure mode SEC-100-002 found in
+    the lock registry.
+    """
+
+    def __init__(self) -> None:
+        # 128 bits: this only has to be unique across process lifetimes, and
+        # it is public (it ends up hashed into an ETag), never a secret.
+        self._boot = secrets.token_hex(16)
+        self._revisions: dict[str, int] = {}
+        # Its own lock, never taken while a store lock is held, so bumping can
+        # be called from inside a store method without any ordering concern.
+        self._lock = threading.Lock()
+
+    def bump(self, artifact_id: str) -> int:
+        """Record one committed mutation of an artifact; returns the new number."""
+        with self._lock:
+            value = self._revisions.get(artifact_id, 0) + 1
+            self._revisions[artifact_id] = value
+            return value
+
+    def token(self, artifact_id: str) -> str:
+        """This artifact's current revision, as an opaque per-process token."""
+        with self._lock:
+            value = self._revisions.get(artifact_id, 0)
+        return f"{self._boot}:{value}"
+
+    def forget(self, artifact_id: str) -> None:
+        """Drop a purged artifact's entry. Ids are random and never come back."""
+        with self._lock:
+            self._revisions.pop(artifact_id, None)
+
+
 def tag_for_id(artifact_id: str) -> str:
     """Storage tag identifying every file of a single artifact."""
     return f"{_TAG_ID_PREFIX}{artifact_id}"
@@ -270,6 +335,60 @@ def _clean_invitations(raw: object) -> list[dict]:
                 "revoked": _clean_revoked(entry),
             }
         )
+    return cleaned
+
+
+def _clean_webhook_key_epoch_record(entry: object) -> dict | None:
+    """Normalize one receiver's epoch record, or ``None`` if it is unusable.
+
+    A usable record needs a non-empty string ``epoch`` — that is the value
+    :func:`src.webhooks.receiver_signing_key` mixes into the derivation, so
+    without it there is nothing to rotate to. ``previous_epoch`` may
+    legitimately be ``None`` (the receiver's first-ever rotation, out of the
+    epoch-less legacy state) or a non-empty string; anything else is coerced
+    to ``None`` rather than dropping the whole record, since the current
+    epoch is still perfectly usable without it — it just means a rotation in
+    flight would stop offering the previous key's grace period early rather
+    than accepting a forged one. ``rotated_at`` is coerced to a string the
+    same tolerant way every other timestamp field on this class is.
+    """
+    if not isinstance(entry, dict):
+        return None
+    epoch = entry.get("epoch")
+    if not isinstance(epoch, str) or not epoch:
+        return None
+    previous_epoch = entry.get("previous_epoch")
+    if not isinstance(previous_epoch, str) or not previous_epoch:
+        previous_epoch = None
+    return {
+        "epoch": epoch,
+        "previous_epoch": previous_epoch,
+        "rotated_at": str(entry.get("rotated_at") or ""),
+    }
+
+
+def _clean_webhook_key_epochs(raw: object) -> dict[str, dict]:
+    """Normalize the webhook receiver key-rotation map read from meta.
+
+    Keyed by receiver URL, so an entry survives only under a non-empty string
+    key; the value goes through :func:`_clean_webhook_key_epoch_record` and is
+    dropped entirely rather than kept half-shaped, exactly like
+    :func:`_clean_invitations` drops an invitation it cannot use. Missing
+    (every meta file written before SEC-100-006) or non-dict input becomes an
+    empty map -- the same "no epoch on record" state a receiver that has never
+    been rotated is already in, so :func:`src.webhooks.receiver_signing_key`
+    falls back to its original epoch-less derivation and an old-shape
+    persisted receiver keeps verifying without any migration step.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, dict] = {}
+    for url, entry in raw.items():
+        if not isinstance(url, str) or not url:
+            continue
+        record = _clean_webhook_key_epoch_record(entry)
+        if record is not None:
+            cleaned[url] = record
     return cleaned
 
 
@@ -374,6 +493,22 @@ class ArtifactMeta:
     # deleted; 0 (or absent, for every older meta file) means "nothing beyond
     # what exists", which is exactly what max(existing) already gives.
     version_high_water: int = 0
+    # SEC-100-006: per-receiver signing-key rotation. Keyed by webhook URL (an
+    # entry only exists for a URL currently or formerly in ``webhooks`` that
+    # has been rotated at least once); value shaped
+    #   {"epoch": str, "previous_epoch": str | None, "rotated_at": str}
+    # — see :func:`src.webhooks.mint_key_epoch`. No key *material* is ever
+    # stored here, only the random epoch marker src.webhooks.receiver_signing_key
+    # mixes into its derivation, so a leaked meta file no more discloses a
+    # receiver's key than it already would have via ``webhooks`` + the hub's
+    # own secret. Absent (every meta file written before this field existed,
+    # and every receiver that has never been rotated) means "derive the
+    # original epoch-less key" — the exact behaviour this field's absence
+    # already had, so an old-shape persisted receiver keeps verifying without
+    # a migration. Declared last, after ``version_high_water``, for the same
+    # reason ``invitations`` is: positional ArtifactMeta(...) construction
+    # elsewhere keeps meaning what it meant before this field existed.
+    webhook_key_epochs: dict[str, dict] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Normalize the enum-ish fields so an unknown value can never leak in."""
@@ -407,6 +542,7 @@ class ArtifactMeta:
             ]
         else:
             self.webhooks = []
+        self.webhook_key_epochs = _clean_webhook_key_epochs(self.webhook_key_epochs)
         self.invitations = _clean_invitations(self.invitations)
 
     @property
@@ -483,6 +619,7 @@ class ArtifactMeta:
             "schema": self.schema,
             "invitations": self.invitations,
             "version_high_water": self.version_high_water,
+            "webhook_key_epochs": self.webhook_key_epochs,
         }
         return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -575,6 +712,11 @@ class ArtifactMeta:
                 and high_water > 0
                 else 0
             ),
+            # SEC-100-006: absent (every meta file written before this field
+            # existed) becomes an empty map in __post_init__, which is exactly
+            # the "never rotated" state — the receiver keeps verifying under
+            # its original epoch-less key with no migration needed.
+            webhook_key_epochs=data.get("webhook_key_epochs"),
         )
 
 
@@ -885,6 +1027,7 @@ class ArtifactStore:
         max_envelope_bytes: int = 20 * 1024 * 1024,
         max_proposed_versions: int = 50,
         reap_aborted_after_s: int = 0,
+        negative_lookup_cache_entries: int = 4096,
     ) -> None:
         self._backend = backend
         self._cache_dir = Path(cache_dir)
@@ -906,9 +1049,28 @@ class ArtifactStore:
         # re-checked against the meta record before it is trusted.
         self._share_index: dict[str, str] = {}
         self._share_of: dict[str, str] = {}
+        # SEC-100-002: ids a Storage tag search has confirmed do not exist,
+        # newest last so the bound evicts least-recently-used. Since target
+        # resolution now runs *before* authentication (see
+        # ``_serialized_per_comment_target`` in src/main.py), an anonymous
+        # caller can otherwise turn a stream of well-formed made-up ids into
+        # one Storage round trip each; remembering the miss makes a repeat
+        # free. Membership is only ever a shortcut to "not found", so a stale
+        # entry could only ever hide an artifact that appeared behind our
+        # back -- which the single-writer invariant (CLAUDE.md, "Exactly one
+        # instance, ever") does not allow: this process is the only writer, it
+        # writes through this store, and every path that can make an id
+        # resolvable drops the entry. A read racing a create in *this* process
+        # is not a concern either, since the create's invalidation lands under
+        # the same lock before the new artifact is reachable at all.
+        self._negative_max_entries = max(0, int(negative_lookup_cache_entries))
+        self._absent: OrderedDict[str, None] = OrderedDict()
         self._memory: OrderedDict[tuple[str, int], Envelope] = OrderedDict()
         self._meta_memory: OrderedDict[tuple[str, int], ArtifactMeta] = OrderedDict()
         self._lock = threading.Lock()
+        # Bumped by every write method below, read by the live-poll ETag.
+        # See :class:`RevisionLedger` (REL-100-003).
+        self._revisions = RevisionLedger()
         try:
             _harden_cache_dir(self._cache_dir)
         except OSError as exc:  # Disk cache is optional — degrade gracefully.
@@ -945,6 +1107,11 @@ class ArtifactStore:
             # from an empty share cache and re-learns lazily (resolve_share).
             self._share_index = {}
             self._share_of = {}
+            # A rebuild is the moment Storage's own state becomes
+            # authoritative again, so every remembered absence is discarded
+            # rather than reconciled: some of them may be in the index we just
+            # built (SEC-100-002).
+            self._absent.clear()
         logger.info("Hydrated index with %d artifact(s)", len(index))
         return len(index)
 
@@ -953,20 +1120,33 @@ class ArtifactStore:
     ) -> None:
         """Delete meta records that have no version and are too old to be in flight.
 
+        Two aborted operations leave this shape, and both want the same
+        treatment.
+
         Publish writes the meta record first, so that a failed canonical
         upload can be rolled back by deleting it; if the process dies between
         that write and the version write, the record stays. It is inert --
         every read answers 404 for it, because there is no head -- but it is
-        also invisible to every API and accumulates forever. Nothing else can
-        have this shape: a purge removes everything, the last live version
-        cannot be deleted, and a legacy envelope counts as a version.
+        also invisible to every API and accumulates forever.
 
-        Age is the whole safety argument. Right after a restart this very
-        shape is also what a publish looks like between its two writes, so
-        only a record older than ``reap_aborted_after_s`` is touched -- an
-        hour by default, against a request that takes seconds. A timestamp
-        that cannot be read is treated as young. Runs only from
-        :meth:`hydrate`, never from the lazy per-artifact fallback.
+        Since REL-100-001, :meth:`delete` produces it too: a purge deletes
+        every child before the authorizing meta record, so a process death in
+        that last gap leaves a meta whose versions are all gone. **The
+        deliberate choice is to keep such a record rather than treat it as
+        garbage the moment it is seen**, because it is exactly what makes the
+        purge finishable: the meta is the file ``_owner_only`` authorizes
+        against, so while it exists the owner can retry and complete the
+        erasure, and there is no content left for it to expose in the
+        meantime. It shows up in the owner's listing as an artifact with zero
+        versions -- visible, empty, and removable -- and never publicly.
+
+        Age is the whole safety argument for eventually reaping it. Right
+        after a restart this very shape is also what a publish looks like
+        between its two writes, so only a record older than
+        ``reap_aborted_after_s`` is touched -- an hour by default, against a
+        request that takes seconds. A timestamp that cannot be read is treated
+        as young. Runs only from :meth:`hydrate`, never from the lazy
+        per-artifact fallback.
         """
         if self._reap_aborted_after_s <= 0:
             return
@@ -1001,44 +1181,105 @@ class ArtifactStore:
         with self._lock:
             return len(self._index)
 
+    def revision(self, artifact_id: str) -> str:
+        """Opaque token that changes whenever this artifact is mutated.
+
+        The cheap half of the live poll: see :class:`RevisionLedger` for why
+        an in-memory number is exact under this service's single-writer
+        deployment, and why it carries a per-process boot nonce.
+        """
+        return self._revisions.token(artifact_id)
+
     def _resolve(self, artifact_id: str) -> _ArtEntry | None:
         """Index lookup with a Storage fallback for artifacts we never saw.
 
-        Another replica may have written after our last hydrate, so an index
-        miss is re-checked against Storage before we answer "not found".
+        The startup index can be incomplete -- degraded-mode startup (a failed
+        hydration) serves with an empty index and discovers artifacts lazily --
+        so an index miss is re-checked against Storage before we answer "not
+        found", rather than trusting a startup snapshot that may not have run.
+
+        SEC-100-002: that re-check used to run on *every* miss, including the
+        made-up ids an unauthenticated caller supplies by the thousand, so a
+        confirmed absence is now remembered in a bounded LRU and answered from
+        memory. Nothing but a write of this process's own can make an absent
+        id appear (single writer, CLAUDE.md), and every such write invalidates
+        the entry, so a read that legitimately races a just-created artifact
+        cannot be served a stale "missing".
         """
         with self._lock:
             entry = self._index.get(artifact_id)
+            if entry is None and artifact_id in self._absent:
+                self._absent.move_to_end(artifact_id)
+                return None
         if entry is not None:
             return entry
 
         files = self._backend.search_by_tag(tag_for_id(artifact_id))
         if not files:
+            with self._lock:
+                self._remember_absent_locked(artifact_id)
             return None
         fresh = _ArtEntry()
         for info in files:
             _absorb_file(fresh, info)
 
         with self._lock:
+            self._forget_absent_locked(artifact_id)
             current = self._index.get(artifact_id)
             if current is None:
                 self._index[artifact_id] = fresh
                 return fresh
             return current
 
+    def negative_cache_size(self) -> int:
+        """How many confirmed-absent ids are remembered right now.
+
+        Exposed so the bound can be asserted on without reaching into the
+        store's internals; nothing in the service reads it.
+        """
+        with self._lock:
+            return len(self._absent)
+
+    def _remember_absent_locked(self, artifact_id: str) -> None:
+        """Record that Storage has no file for ``artifact_id``. Holds the lock."""
+        if self._negative_max_entries <= 0:
+            return
+        self._absent[artifact_id] = None
+        self._absent.move_to_end(artifact_id)
+        while len(self._absent) > self._negative_max_entries:
+            self._absent.popitem(last=False)
+
+    def _forget_absent_locked(self, artifact_id: str) -> None:
+        """Drop a remembered absence. Caller holds the lock.
+
+        Called from every path that can make an id resolvable, which is what
+        keeps the cache from ever answering "missing" about something that
+        exists: creation and version writes (``save_meta``, ``add_version``,
+        ``add_version_next``), a share id being learned or rotated
+        (``_learn_share_locked``), a full rebuild (``hydrate``) and an
+        explicit per-artifact re-read (``refresh``).
+        """
+        self._absent.pop(artifact_id, None)
+
     def refresh(self, artifact_id: str) -> bool:
         """Re-read one artifact's files from Storage, replacing its index entry.
 
-        The startup index is built once and never expires, so after another
-        replica writes a new version or rewrites the meta file, this replica's
-        cached entry is stale. ``refresh`` re-runs the artifact's tag search and
-        swaps in a fresh entry (dropping this artifact's in-memory LRU so the
-        next read reloads), letting a caller pick up cross-replica writes on
-        demand. Returns ``True`` when the artifact still exists in Storage.
+        The startup index is built once and never expires, so it can lag
+        behind whatever this process itself most recently wrote through a path
+        that did not update it, or behind a Storage tag rebuild after a
+        degraded-mode startup. ``refresh`` re-runs the artifact's tag search
+        and swaps in a fresh entry (dropping this artifact's in-memory LRU so
+        the next read reloads), letting a caller opt in to Storage's current
+        state on demand. Returns ``True`` when the artifact still exists.
 
-        Residual limitation: this is an explicit, per-artifact catch-up, not
-        continuous cross-replica consistency — full consistency needs shared
-        state (out of scope). Callers opt in via ``fresh=True`` on the readers.
+        Residual limitation: this is an explicit, per-artifact catch-up, not a
+        subscription -- nothing calls it automatically, so a reader that never
+        passes ``fresh=True`` only ever sees what the in-memory index already
+        holds. Under the exactly-one-process invariant (CLAUDE.md, "Exactly
+        one instance, ever") that index is always this process's own most
+        recent write; ``fresh=True`` exists as defence in depth and to bypass
+        the LRU, not to reconcile with a second writer, which this deployment
+        does not allow to exist.
         """
         files = self._backend.search_by_tag(tag_for_id(artifact_id))
         if not files:
@@ -1047,16 +1288,20 @@ class ArtifactStore:
                 self._forget_memory_locked(artifact_id)
                 self._forget_meta_locked(artifact_id)
                 self._forget_share_locked(artifact_id)
+                # Storage has just confirmed the absence, so record it the
+                # same way a plain lookup miss would (SEC-100-002).
+                self._remember_absent_locked(artifact_id)
             return False
         rebuilt = _ArtEntry()
         for info in files:
             _absorb_file(rebuilt, info)
         with self._lock:
             self._index[artifact_id] = rebuilt
+            self._forget_absent_locked(artifact_id)
             self._forget_memory_locked(artifact_id)
             self._forget_meta_locked(artifact_id)
-            # The refreshed meta file may carry a share id rotated by another
-            # replica; drop what we knew and re-learn it on the next resolve.
+            # The refreshed meta file may carry a share id rotated since we
+            # last learned it; drop what we knew and re-learn it on resolve.
             self._forget_share_locked(artifact_id)
         return True
 
@@ -1098,6 +1343,7 @@ class ArtifactStore:
 
         with self._lock:
             entry = self._index.setdefault(artifact_id, _ArtEntry())
+            self._forget_absent_locked(artifact_id)
             previous = entry.meta_file_id
             entry.meta_file_id = file_id
             self._forget_meta_locked(artifact_id)
@@ -1111,6 +1357,10 @@ class ArtifactStore:
         if previous is not None and previous != file_id:
             self._delete_disk_cache(artifact_id, previous)
         self._delete_stale_meta_files(artifact_id, keep_file_id=file_id)
+        # Every artifact-level change -- settings, password, head pin, status,
+        # trash/restore, link rotation, invitations -- lands here, so this one
+        # bump is what makes all of them visible to a live poll (REL-100-003).
+        self._revisions.bump(artifact_id)
 
     def owner_key_of(self, artifact_id: str) -> str | None:
         """Owner key of an artifact, or None when the artifact is unknown."""
@@ -1129,6 +1379,11 @@ class ArtifactStore:
                 self._share_index.pop(previous, None)
         self._share_of[artifact_id] = share_id
         self._share_index[share_id] = artifact_id
+        # A rotation mints an id an anonymous caller may already have probed
+        # and had recorded as absent; both halves of the identity pair are
+        # live from here on (SEC-100-002).
+        self._forget_absent_locked(artifact_id)
+        self._forget_absent_locked(share_id)
 
     def _forget_share_locked(self, artifact_id: str) -> None:
         """Drop everything we know about an artifact's share id. Holds lock."""
@@ -1175,9 +1430,9 @@ class ArtifactStore:
         Lookup order, cheapest first: the share cache, then the in-memory index
         (is this an artifact id?), then a scan of indexed artifacts whose share
         id we have not learned yet (their metas are loaded once and cached), and
-        finally a Storage tag search for an artifact this replica has never
-        seen. Every share id learned along the way is cached, so a warm index
-        answers in O(1).
+        finally a Storage tag search for an artifact this process has not
+        indexed yet. Every share id learned along the way is cached, so a warm
+        index answers in O(1).
         """
         wanted = share_or_artifact_id
         if not wanted:
@@ -1196,9 +1451,9 @@ class ArtifactStore:
                     # The mapping still holds, so this is the final answer:
                     # servable, unless the artifact sits in the trash.
                     return None if meta.is_trashed() else cached
-                # Rotated away by another replica. ``wanted`` is revoked for
-                # this artifact; keep looking on the slower paths in case it
-                # now belongs to a different one.
+                # Rotated away since this process last learned it. ``wanted``
+                # is revoked for this artifact; keep looking on the slower
+                # paths in case it now belongs to a different one.
 
         with self._lock:
             known_artifact = wanted in self._index
@@ -1213,11 +1468,40 @@ class ArtifactStore:
         if found is not None:
             return found
 
-        # Never seen by this replica: fall back to a Storage tag search, which
-        # is what every other read path does on an index miss.
+        # Not yet indexed by this process: fall back to a Storage tag search,
+        # which is what every other read path does on an index miss.
         if self._resolve(wanted) is None:
             return None
         return self._share_hit(wanted, wanted)
+
+    def resolve_lock_target(self, path_id: str) -> str | None:
+        """Map either half of an artifact's identity pair to its internal id.
+
+        What the comment routes need in order to take the right lock: a live
+        share id resolves to the artifact behind it, and so does the bare
+        internal id of an artifact whose public link has been rotated away or
+        which sits in the trash -- both are still real artifacts whose
+        mutations have to serialize against their owner's routes, even though
+        neither is publicly servable. Anything naming no artifact at all
+        answers ``None``.
+
+        SEC-100-002: the caller used to get this by asking twice
+        (``resolve_share`` and then ``get_meta``), which cost an unauthenticated
+        caller two Storage tag searches per made-up id. Resolving both halves in
+        one pass costs one -- and, for a repeat of the same id, none, since the
+        confirmed absence is remembered (see :meth:`_resolve`).
+        """
+        if not path_id:
+            return None
+        internal_id = self.resolve_share(path_id)
+        if internal_id is not None:
+            return internal_id
+        # ``resolve_share`` has already re-checked Storage for an id this
+        # process has not indexed, so this second half reads the index (or the
+        # negative cache) and never repeats the tag search.
+        if self._resolve(path_id) is None:
+            return None
+        return path_id if self.get_meta(path_id) is not None else None
 
     def _scan_for_share(self, wanted: str) -> str | None:
         """Load the metas whose share id we do not know yet, looking for one.
@@ -1328,6 +1612,7 @@ class ArtifactStore:
 
         with self._lock:
             entry = self._index.setdefault(artifact_id, _ArtEntry())
+            self._forget_absent_locked(artifact_id)
             previous = entry.versions.get(version)
             entry.versions[version] = _VerEntry(
                 file_id=file_id, status=env.status, size_bytes=len(raw)
@@ -1340,6 +1625,9 @@ class ArtifactStore:
             self._delete_file(artifact_id, previous.file_id)
         self._prune_versions(artifact_id)
         self._prune_proposals(artifact_id)
+        # Also the choke point for set_status (promote/withdraw rewrite the
+        # version file through here), so a live poll sees those too.
+        self._revisions.bump(artifact_id)
 
     def add_version_next(self, env: Envelope) -> int:
         """Atomically allocate the next version number and write the version.
@@ -1351,9 +1639,12 @@ class ArtifactStore:
         second allocation sees it taken. ``env.version`` is ignored and
         replaced; the assigned number is returned.
 
-        Residual limitation: this coordinates a single process only. Two
-        replicas can still pick the same number (no shared allocator); that
-        needs shared state and is out of scope here.
+        Residual limitation: this coordinates a single process only, which is
+        CLAUDE.md's deployment invariant ("Exactly one instance, ever") --
+        running two of this service at once is not a supported configuration.
+        If that invariant were ever violated, two processes could still pick
+        the same number (no shared allocator); that needs shared state and is
+        out of scope here.
         """
         artifact_id = env.id
         # Loading the meta record seeds the high-water mark into the index, so
@@ -1362,6 +1653,7 @@ class ArtifactStore:
         self.get_meta(artifact_id)
         with self._lock:
             entry = self._index.setdefault(artifact_id, _ArtEntry())
+            self._forget_absent_locked(artifact_id)
             version = entry.next_free_number()
             entry.reserving.add(version)
 
@@ -1381,6 +1673,7 @@ class ArtifactStore:
 
         with self._lock:
             entry = self._index.setdefault(artifact_id, _ArtEntry())
+            self._forget_absent_locked(artifact_id)
             entry.reserving.discard(version)
             entry.high_water = max(entry.high_water, version)
             previous = entry.versions.get(version)
@@ -1395,6 +1688,7 @@ class ArtifactStore:
             self._delete_file(artifact_id, previous.file_id)
         self._prune_versions(artifact_id)
         self._prune_proposals(artifact_id)
+        self._revisions.bump(artifact_id)
         return version
 
     def get_version(
@@ -1403,7 +1697,9 @@ class ArtifactStore:
         """One version by number, regardless of its status; None when missing.
 
         ``fresh=True`` re-reads the artifact's Storage tags first (see
-        :meth:`refresh`) so a version another replica added is picked up; the
+        :meth:`refresh`) instead of trusting the in-memory index -- defence in
+        depth under the exactly-one-process rule (CLAUDE.md), not a way to
+        reconcile with a second writer, which this deployment never runs; the
         default stays fast (index only, with the usual miss fallback).
         """
         if fresh:
@@ -1417,8 +1713,10 @@ class ArtifactStore:
         """The version ``/a/{id}`` serves: the pinned one, else the newest live.
 
         ``fresh=True`` re-reads the artifact's Storage tags first (see
-        :meth:`refresh`) so a newer head written by another replica is served;
-        the default stays fast (index only, with the usual miss fallback).
+        :meth:`refresh`) instead of trusting the in-memory index -- defence in
+        depth under the exactly-one-process rule (CLAUDE.md), not a way to
+        reconcile with a second writer, which this deployment never runs; the
+        default stays fast (index only, with the usual miss fallback).
         """
         if fresh:
             self.refresh(artifact_id)
@@ -1486,7 +1784,9 @@ class ArtifactStore:
         """Public metadata of every version (live and proposed), newest first.
 
         ``fresh=True`` re-reads the artifact's Storage tags first (see
-        :meth:`refresh`) so versions added by another replica appear.
+        :meth:`refresh`) instead of trusting the in-memory index -- defence in
+        depth under the exactly-one-process rule (CLAUDE.md), not a way to
+        reconcile with a second writer, which this deployment never runs.
         """
         if fresh:
             self.refresh(artifact_id)
@@ -1562,6 +1862,14 @@ class ArtifactStore:
         delete fails the file still exists, so the index keeps pointing at it
         and this returns ``False`` — never a success claim over a file that is
         still there.
+
+        ``False`` deliberately has exactly two meanings — "policy says no" and
+        "the backend did not confirm" — because the API layer needs to tell a
+        409 from a 502. The other destructive policy (COR-075-006: a version
+        the head is pinned to may not be deleted, since that would leave the
+        stored head naming a version that no longer exists) is therefore
+        enforced in ``src.main.delete_version``, where it can carry its own
+        409 and an explanation, rather than folded into this ``False``.
         """
         entry = self._resolve(artifact_id)
         if entry is None:
@@ -1627,6 +1935,9 @@ class ArtifactStore:
             if legacy_file_id is not None and entry.legacy_file_id == legacy_file_id:
                 entry.legacy_file_id = None
                 self._memory.pop((artifact_id, legacy_file_id), None)
+        # Bumped only on a confirmed deletion: a failed backend delete left the
+        # version in place, so nothing changed for a poller either.
+        self._revisions.bump(artifact_id)
         return True
 
     # ---------------------------------------------------------------- trash
@@ -1702,29 +2013,67 @@ class ArtifactStore:
         delete fails, the residual files stay in Storage, so the index/cache are
         left intact and this returns ``False`` — the caller must not report a
         full deletion. An unknown artifact (no files) also returns ``False``.
+
+        **REL-100-001: children first, the meta record strictly last.** The tag
+        search answers in no order the caller may rely on, and this used to walk
+        it as it came. When a version delete failed *after* the meta file was
+        already gone, the artifact lost the only record that
+        :func:`src.main._owner_only` can authorize against: the route answered
+        502 "retry the purge", the retry found no artifact and 404ed, and the
+        surviving version file became unreachable and undeletable forever.
+
+        So the files are classified (:meth:`_classify_for_delete`) and deleted
+        in two phases. Every child — version files, a schema-1 legacy envelope,
+        anything else tagged for this artifact — goes first; the meta record is
+        touched only once every child is confirmed gone. The guarantee that buys
+        is the one that matters: **whenever any child survives, its meta
+        survives too**, so the purge stays authorizable and a retry (in this
+        process or after a restart with an empty disk) resumes rather than
+        strands. Deleting an already-deleted file is a no-op for the backend, so
+        the retry is idempotent by construction.
+
+        Superseded meta files (an interrupted :meth:`save_meta` can leave one)
+        are deleted oldest-first, so the *authorizing* record — the highest file
+        ID, which is what :func:`_absorb_file` elects — is the very last file to
+        go.
         """
         files: list[FileInfo] = self._backend.search_by_tag(tag_for_id(artifact_id))
         if not files:
             return False
+        children, metas = self._classify_for_delete(files)
+
+        # Phase 1: every child. A failure here does not abort the phase — the
+        # other children are independent files and clearing them is real
+        # progress for the retry — but it does veto phase 2 entirely.
         all_ok = True
-        for info in files:
-            try:
-                self._backend.delete(info.id)
-            except BackendError as exc:
-                all_ok = False
-                logger.warning(
-                    "Cannot delete file %s of artifact %s: %s",
-                    info.id,
-                    artifact_id,
-                    exc,
-                )
+        for info in children:
+            all_ok = self._delete_file_confirmed(artifact_id, info.id) and all_ok
 
         if not all_ok:
             logger.warning(
                 "Partial delete of artifact %s: some Storage files remain; "
-                "keeping the index entry to avoid a false 'deleted' claim",
+                "keeping its meta record and index entry so the purge stays "
+                "authorized and can be retried",
                 artifact_id,
             )
+            self._resync_after_partial_delete(artifact_id)
+            return False
+
+        # Phase 2: the authorizing record, now that nothing it authorizes is
+        # left. A failure here leaves a meta with no version — inert (every read
+        # answers 404), still purgeable by the owner, and reaped by
+        # :meth:`_reap_aborted_publishes` once it is too old to be in flight.
+        for info in metas:
+            all_ok = self._delete_file_confirmed(artifact_id, info.id) and all_ok
+
+        if not all_ok:
+            logger.warning(
+                "Partial delete of artifact %s: its meta record could not be "
+                "removed; the artifact has no content left and the purge can "
+                "be retried",
+                artifact_id,
+            )
+            self._resync_after_partial_delete(artifact_id)
             return False
 
         with self._lock:
@@ -1732,8 +2081,65 @@ class ArtifactStore:
             self._forget_memory_locked(artifact_id)
             self._forget_meta_locked(artifact_id)
             self._forget_share_locked(artifact_id)
+            # Every file of this artifact is gone from Storage, so the id is
+            # absent in exactly the sense the negative cache records; saying
+            # so here spares the next probe of a purged id a tag search
+            # (SEC-100-002).
+            self._remember_absent_locked(artifact_id)
         self._purge_disk_cache(artifact_id)
+        # The artifact is gone, so its revision has nothing left to describe;
+        # dropping it keeps a create/purge loop from growing the ledger.
+        self._revisions.forget(artifact_id)
         return True
+
+    def _resync_after_partial_delete(self, artifact_id: str) -> None:
+        """Re-read an artifact's tags after a delete that only partly landed.
+
+        Some of its files are gone but the index still names them, so a read
+        would try to download a file that no longer exists. Re-running the tag
+        search leaves the index describing what is actually in Storage — the
+        meta record included, which is exactly what the retry needs to
+        authenticate. Best effort: a failure here only costs accuracy of an
+        entry the caller is already being told is incomplete.
+        """
+        try:
+            self.refresh(artifact_id)
+        except BackendError as exc:
+            logger.warning(
+                "Cannot refresh artifact %s after a partial delete: %s",
+                artifact_id,
+                exc,
+            )
+
+    @staticmethod
+    def _classify_for_delete(
+        files: list[FileInfo],
+    ) -> tuple[list[FileInfo], list[FileInfo]]:
+        """Split an artifact's files into (children, meta records) for REL-100-001.
+
+        The split follows the Storage model exactly as documented in the module
+        docstring and in CLAUDE.md: a meta record is the file tagged
+        :data:`TAG_META`, a version file is tagged ``artifact-ver-{n}``, and a
+        file with neither tag is a schema-1 legacy envelope (or some other
+        record an older build wrote). Only the meta tag is treated as special —
+        everything else is a child and goes first — because getting the
+        classification wrong in the *other* direction is what created the
+        unreachable orphan this fixes.
+
+        Children come back newest-first (highest file ID), which is how the
+        backend answers anyway; meta records come back oldest-first, so the
+        authorizing one is deleted last of all.
+        """
+        children: list[FileInfo] = []
+        metas: list[FileInfo] = []
+        for info in files:
+            if TAG_META in (info.tags or []):
+                metas.append(info)
+            else:
+                children.append(info)
+        children.sort(key=lambda info: info.id, reverse=True)
+        metas.sort(key=lambda info: info.id)
+        return children, metas
 
     # ----------------------------------------------------------------- list
 

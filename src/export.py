@@ -7,10 +7,23 @@ Three renderings live here, all **pure functions of their inputs**:
   has one (Markdown-authored, or HTML published with ``markdown_source``), and
   otherwise a conversion of the built HTML.
 - :func:`markdown_of_html` — that conversion, on its own.
-- :func:`build_vault` — an in-memory ZIP holding an Obsidian vault
-  (``INDEX.md`` hub, ``document.md``, ``versions/v{n}.md``,
-  ``comments/{tid}.md``, ``reasoning.md``), used by
-  ``GET /a/{id}/export/vault``.
+- :func:`build_vault` — a ZIP holding an Obsidian vault (``INDEX.md`` hub,
+  ``document.md``, ``versions/v{n}.md``, ``comments/{tid}.md``,
+  ``reasoning.md``), returned as bytes.
+- :func:`build_vault_file` — the same archive, streamed entry by entry into an
+  owner-only temporary file instead of being held whole in memory. This is
+  what ``GET /a/{id}/export/vault`` uses (REL-100-002); both spellings write
+  through the same :func:`_write_vault`, so their bytes are identical.
+- :func:`envelope_source_chars` / :func:`thread_source_chars` — the
+  per-envelope and per-thread halves of that estimate, so the route can add
+  them up incrementally *while it loads* each record from Storage and stop
+  reading the moment the running total crosses the budget (REL-100-002) —
+  rather than paying to load and parse the whole visible history first and
+  only then discovering it should have been refused.
+- :func:`vault_source_chars` — the same estimate over a fully materialized
+  ``(envelopes, threads)`` pair, built from the two functions above. Kept for
+  callers (tests, anything computing the estimate post hoc) that already have
+  everything in hand; the export route itself no longer calls it.
 
 Design constraints, in order of importance:
 
@@ -37,10 +50,13 @@ from __future__ import annotations
 import difflib
 import io
 import logging
+import os
 import re
+import tempfile
 import unicodedata
 import zipfile
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import urlsplit
 
 from src.diff import _comparable as _comparable_text
@@ -55,10 +71,28 @@ __all__ = [
     "head_source",
     "markdown_of_html",
     "build_vault",
+    "build_vault_file",
+    "envelope_source_chars",
+    "thread_source_chars",
+    "vault_source_chars",
+    "ExportTooLarge",
     "SOURCE_ORIGINAL",
     "SOURCE_CONVERTED",
     "SOURCE_NONE",
 ]
+
+
+class ExportTooLarge(Exception):
+    """An export exceeded the configured budget and was refused.
+
+    Carries the numbers the API layer reports back, so the 413 can say what
+    the ceiling was without the route re-deriving it.
+    """
+
+    def __init__(self, size: int, limit: int) -> None:
+        super().__init__(f"export of {size} exceeds the {limit} limit")
+        self.size = size
+        self.limit = limit
 
 #: Fixed ZIP entry timestamp so repeated builds are byte-identical.
 _ZIP_DATE = (2020, 1, 1, 0, 0, 0)
@@ -887,15 +921,86 @@ def _add(archive: zipfile.ZipFile, path: str, text: str) -> None:
     archive.writestr(info, text.encode("utf-8"))
 
 
-def build_vault(
+def envelope_source_chars(env: Envelope) -> int:
+    """How much source material one version envelope contributes to the budget.
+
+    This is the per-record unit :func:`vault_source_chars` used to sum over a
+    whole ``envelopes`` list; split out so the export route can add it to a
+    running total *as each envelope is loaded* from Storage (REL-100-002),
+    rather than loading everything first and estimating afterwards -- which
+    would let the very allocation the budget exists to bound happen before
+    the budget is ever consulted.
+
+    The unit is **characters, not bytes**, deliberately -- see
+    :func:`vault_source_chars` for why.
+    """
+    total = len(env.html or "") + len(env.title or "") + len(env.note or "")
+    source = env.source if isinstance(env.source, dict) else {}
+    markdown = source.get("markdown")
+    if isinstance(markdown, str):
+        total += len(markdown)
+    return total
+
+
+def thread_source_chars(thread: "CommentThread") -> int:
+    """How much source material one comment thread contributes to the budget.
+
+    The comment-side counterpart to :func:`envelope_source_chars`, for the
+    same incremental-loading reason (REL-100-002).
+    """
+    total = len(getattr(thread, "body", "") or "")
+    selector = getattr(thread, "selector", None)
+    total += len(getattr(selector, "exact", "") or "")
+    for reply in list(getattr(thread, "replies", None) or []):
+        total += len(getattr(reply, "body", "") or "")
+    return total
+
+
+def vault_source_chars(
+    envelopes: list[Envelope], threads: list["CommentThread"]
+) -> int:
+    """How much source material a vault of these inputs would chew through.
+
+    Counted *before* anything is rendered, so the caller can refuse an
+    oversized export without paying for it: a vault runs a ``difflib``
+    comparison per version and an HTML-to-Markdown conversion per
+    HTML-authored one, and every one of those is superlinear in nothing but
+    this number.
+
+    The unit is **characters, not bytes**, deliberately. It is what the diff
+    and conversion passes actually work on, and it needs no encode pass of its
+    own -- encoding tens of megabytes of HTML purely to measure it would cost
+    as much as the work being guarded against. One character is at least one
+    UTF-8 byte, so a byte budget compared against this is never over-strict.
+
+    This is a convenience wrapper over :func:`envelope_source_chars` and
+    :func:`thread_source_chars` for callers that already hold the full lists
+    in memory (tests, mainly). The export route does **not** call this: it
+    needs the estimate *while* loading each record, one at a time, so it can
+    stop reading Storage the instant the running total crosses the limit
+    (REL-100-002) -- summing this function requires everything to already be
+    loaded, which is exactly the allocation the budget is meant to prevent.
+    """
+    total = sum(envelope_source_chars(env) for env in envelopes or [])
+    total += sum(thread_source_chars(thread) for thread in threads or [])
+    return total
+
+
+def _write_vault(
+    archive: zipfile.ZipFile,
     meta: ArtifactMeta,
     envelopes: list[Envelope],
     threads: list["CommentThread"],
-) -> tuple[str, bytes]:
-    """Build an Obsidian vault ZIP for one artifact: ``(filename, zip_bytes)``.
+    guard: Callable[[], None] | None = None,
+) -> str:
+    """Write every vault entry into an open archive; returns the root slug.
 
-    Everything is derived from the three arguments, so two builds from the same
-    inputs produce byte-identical archives.
+    The single definition of the vault's layout and entry order: both
+    :func:`build_vault` and :func:`build_vault_file` go through here, which is
+    what keeps the streamed archive byte-identical to the in-memory one.
+
+    ``guard`` -- when given -- is called after each entry and may raise to
+    abandon the build (see :func:`build_vault_file`'s write-time ceiling).
     """
     ordered = sorted(envelopes or [], key=lambda env: env.version)
     head = _pick_head(meta, ordered)
@@ -907,24 +1012,108 @@ def build_vault(
         meta, ordered, head, thread_pairs, html_document=document_html is not None
     )
 
+    def written() -> None:
+        if guard is not None:
+            guard()
+
+    _add(archive, f"{root}/INDEX.md", index_md)
+    written()
+    _add(archive, f"{root}/document.md", document_md)
+    written()
+    if document_html is not None:
+        _add(archive, f"{root}/document.html", document_html)
+        written()
+
+    previous: Envelope | None = None
+    for env in ordered:
+        version_md, version_html = _render_version(env, previous)
+        _add(archive, f"{root}/versions/v{env.version}.md", version_md)
+        written()
+        if version_html is not None:
+            _add(archive, f"{root}/versions/v{env.version}.html", version_html)
+            written()
+        previous = env
+
+    for thread, name in thread_pairs:
+        _add(archive, f"{root}/comments/{name}.md", _render_comment(thread))
+        written()
+
+    _add(archive, f"{root}/reasoning.md", _render_reasoning(meta, ordered, head, thread_pairs))
+    written()
+    return root
+
+
+def build_vault(
+    meta: ArtifactMeta,
+    envelopes: list[Envelope],
+    threads: list["CommentThread"],
+) -> tuple[str, bytes]:
+    """Build an Obsidian vault ZIP for one artifact: ``(filename, zip_bytes)``.
+
+    Everything is derived from the three arguments, so two builds from the same
+    inputs produce byte-identical archives.
+
+    This spelling holds the whole archive in memory and is kept for callers
+    that genuinely want the bytes (the determinism tests, above all). The
+    public export route uses :func:`build_vault_file` instead, because a
+    capability-URL holder must not be able to decide how much of this
+    process's memory an anonymous request allocates.
+    """
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        _add(archive, f"{root}/INDEX.md", index_md)
-        _add(archive, f"{root}/document.md", document_md)
-        if document_html is not None:
-            _add(archive, f"{root}/document.html", document_html)
-
-        previous: Envelope | None = None
-        for env in ordered:
-            version_md, version_html = _render_version(env, previous)
-            _add(archive, f"{root}/versions/v{env.version}.md", version_md)
-            if version_html is not None:
-                _add(archive, f"{root}/versions/v{env.version}.html", version_html)
-            previous = env
-
-        for thread, name in thread_pairs:
-            _add(archive, f"{root}/comments/{name}.md", _render_comment(thread))
-
-        _add(archive, f"{root}/reasoning.md", _render_reasoning(meta, ordered, head, thread_pairs))
-
+        root = _write_vault(archive, meta, envelopes, threads)
     return f"{root}-vault.zip", buffer.getvalue()
+
+
+def build_vault_file(
+    meta: ArtifactMeta,
+    envelopes: list[Envelope],
+    threads: list["CommentThread"],
+    directory: Path | str,
+    max_bytes: int = 0,
+) -> tuple[str, Path, int]:
+    """Stream the same vault into a scratch file: ``(filename, path, size)``.
+
+    Closes REL-100-002's memory half. Entries are compressed straight into the
+    file as they are rendered, so peak memory is one entry rather than the
+    whole archive plus a second copy of it from ``BytesIO.getvalue()``.
+
+    The file is created with :func:`tempfile.mkstemp` in ``directory`` (the
+    hub's cache directory, the only writable path the container has), which
+    means mode 0600 and a name no other process can predict -- it holds a
+    complete copy of an artifact that may be password-protected, so
+    owner-only is not optional.
+
+    ``max_bytes`` (0 disables) is a write-time ceiling checked after every
+    entry: the caller's pre-build estimate is deliberately cheap and can
+    under-count, so this is the backstop that makes the bound real. Overrunning
+    it -- like any other failure -- unlinks the partial file before raising, so
+    a refused export never leaves bytes on the disk.
+
+    The caller owns the returned path and must unlink it once the response has
+    been sent. A process killed mid-response leaks one file, which is
+    acceptable here and nowhere near worth a sweeper: per CLAUDE.md the
+    container has no permanent disk, so a restart starts from an empty one.
+    """
+    directory = Path(directory)
+    # 0700 to match the store's own cache-directory hardening: these archives
+    # can contain a password-protected artifact in full.
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle_fd, raw_path = tempfile.mkstemp(
+        prefix="vault-", suffix=".zip", dir=str(directory)
+    )
+    path = Path(raw_path)
+    try:
+        with os.fdopen(handle_fd, "w+b") as handle:
+            def guard() -> None:
+                position = handle.tell()
+                if 0 < max_bytes < position:
+                    raise ExportTooLarge(position, max_bytes)
+
+            with zipfile.ZipFile(handle, "w", zipfile.ZIP_DEFLATED) as archive:
+                root = _write_vault(archive, meta, envelopes, threads, guard=guard)
+            size = handle.tell()
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return f"{root}-vault.zip", path, size
