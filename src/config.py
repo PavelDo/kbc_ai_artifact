@@ -108,6 +108,12 @@ class Settings:
     # How many webhook URLs one artifact may register
     # (HUB_MAX_WEBHOOKS_PER_ARTIFACT).
     max_webhooks_per_artifact: int = 5
+    # Ceiling on queued-but-undelivered webhook deliveries
+    # (HUB_WEBHOOK_QUEUE_MAX). One thread consumes them and sleeps through
+    # retry backoff, so a stalled receiver would otherwise let the queue grow
+    # without limit; past the ceiling the newest delivery is dropped with a
+    # log line rather than blocking the request that produced it.
+    webhook_queue_max: int = 1000
     # Guest invitations (0.7.0)
     # How many invitations one artifact may hold at once
     # (HUB_MAX_INVITATIONS_PER_ARTIFACT). Each entry is a named capability
@@ -173,6 +179,7 @@ def load_settings() -> Settings:
         webhook_timeout_s=_int_env("HUB_WEBHOOK_TIMEOUT_S", 10),
         webhook_max_attempts=_int_env("HUB_WEBHOOK_MAX_ATTEMPTS", 3),
         max_webhooks_per_artifact=_int_env("HUB_MAX_WEBHOOKS_PER_ARTIFACT", 5),
+        webhook_queue_max=_int_env("HUB_WEBHOOK_QUEUE_MAX", 1000),
         max_invitations_per_artifact=_int_env(
             "HUB_MAX_INVITATIONS_PER_ARTIFACT", 20
         ),

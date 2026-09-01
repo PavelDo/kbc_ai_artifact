@@ -4,19 +4,25 @@ An artifact can register a handful of https URLs; whenever something happens to
 it (a version is published or proposed, a comment lands, it gets finalized) the
 hub POSTs a small JSON envelope to each of them::
 
-    {"event": "version.published", "artifact_id": "...", "payload": {...},
+    {"event": "version.published", "event_id": "...", "delivery_id": "...",
+     "artifact_id": "...", "payload": {...},
      "created_at": "2026-09-01T09:30:00+00:00"}
 
 signed with ``X-Hub-Signature-256: sha256=<hmac hex>`` over the exact bytes sent,
-so a receiver can tell a genuine delivery from a forged one. URLs whose host ends
+so a receiver can tell a genuine delivery from a forged one. Every delivery also
+carries ``X-Hub-Event-Id`` and ``X-Hub-Delivery-Id``: the event id is the same
+across every receiver and every retry, the delivery id is the same across
+retries to one receiver, so a receiver can recognise a retry as the same work
+rather than doing it twice. URLs whose host ends
 in ``hooks.slack.com`` get Slack's ``{"text": ...}`` shape instead, because
 posting the envelope there renders as an empty message.
 
 Two deliberate limits, both documented rather than engineered around:
 
-* **The queue is in memory.** Push is best effort — a restart drops whatever was
-  pending. The Storage Files record of what happened is the durable part; the
-  notification is a convenience on top of it.
+* **The queue is in memory and bounded.** Push is best effort — a restart drops
+  whatever was pending, and so does a queue that has reached ``queue_max``. The
+  Storage Files record of what happened is the durable part; the notification is
+  a convenience on top of it.
 * **Delivery is one background thread.** Retries sleep in that thread, so a slow
   or failing receiver delays the others. Fine at this scale, and it keeps a
   failing webhook from spawning unbounded work.
@@ -34,6 +40,7 @@ import ipaddress
 import json
 import logging
 import queue
+import secrets
 import threading
 import time
 from dataclasses import dataclass, field
@@ -47,6 +54,8 @@ from src.builder import _BLOCKED_HOSTNAMES, _ip_is_blocked, _resolve_host_ips
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DELIVERY_ID_HEADER",
+    "EVENT_ID_HEADER",
     "EVENT_KINDS",
     "SIGNATURE_HEADER",
     "USER_AGENT",
@@ -54,6 +63,16 @@ __all__ = [
     "WebhookEvent",
     "validate_webhook_url",
 ]
+
+#: Ceiling on queued deliveries when the caller does not configure one
+#: (``HUB_WEBHOOK_QUEUE_MAX``). Generous next to the per-artifact webhook cap,
+#: so only a genuinely stalled receiver ever reaches it.
+DEFAULT_QUEUE_MAX = 1000
+
+#: Headers letting a receiver deduplicate: the event is the same across every
+#: receiver and retry, the delivery is the same across retries to one receiver.
+EVENT_ID_HEADER = "X-Hub-Event-Id"
+DELIVERY_ID_HEADER = "X-Hub-Delivery-Id"
 
 #: Header carrying the HMAC-SHA256 of the delivered body, GitHub-style
 #: (``sha256=<hex digest>``).
@@ -98,11 +117,35 @@ class WebhookEvent:
     kind: str
     payload: dict = field(default_factory=dict)
     created_at: str = ""
+    #: Identifies *what happened*, once, across every receiver and retry.
+    #: Generated here when the caller does not supply one, so no producer has
+    #: to remember to.
+    event_id: str = ""
 
-    def envelope(self) -> dict:
+    def __post_init__(self) -> None:
+        if not self.event_id:
+            # frozen dataclass: this is the sanctioned way to fill a default
+            # that has to be computed.
+            object.__setattr__(self, "event_id", secrets.token_hex(16))
+
+    def delivery_id_for(self, url: str) -> str:
+        """Identifies *this event going to this receiver*, stably across retries.
+
+        Derived rather than random so a retry cannot invent a new one: the
+        same (event, url) always yields the same value, while two receivers
+        of the same event get different ones, so neither can guess or replay
+        the other's. The URL is hashed rather than sent, so the id never
+        discloses one receiver's endpoint to another.
+        """
+        digest = hashlib.sha256(f"{self.event_id}\x00{url}".encode("utf-8"))
+        return digest.hexdigest()[:32]
+
+    def envelope(self, url: str) -> dict:
         """The generic JSON body posted to non-Slack receivers."""
         return {
             "event": self.kind,
+            "event_id": self.event_id,
+            "delivery_id": self.delivery_id_for(url),
             "artifact_id": self.artifact_id,
             "payload": dict(self.payload),
             "created_at": self.created_at,
@@ -199,7 +242,7 @@ def _body_for(url: str, event: WebhookEvent) -> bytes:
     if _is_slack(url):
         document: dict = {"text": _slack_text(event)}
     else:
-        document = event.envelope()
+        document = event.envelope(url)
     return json.dumps(document, ensure_ascii=False).encode("utf-8")
 
 
@@ -219,13 +262,28 @@ class WebhookDispatcher:
     :param timeout_s: per-request HTTP timeout.
     :param max_attempts: total POST attempts per (url, event) before giving up.
     :param sign_secret: HMAC key for :data:`SIGNATURE_HEADER`.
+    :param queue_max: ceiling on queued deliveries; see :meth:`emit`.
     """
 
-    def __init__(self, timeout_s: int, max_attempts: int, sign_secret: str) -> None:
+    def __init__(
+        self,
+        timeout_s: int,
+        max_attempts: int,
+        sign_secret: str,
+        queue_max: int = DEFAULT_QUEUE_MAX,
+    ) -> None:
         self._timeout_s = max(1, int(timeout_s))
         self._max_attempts = max(1, int(max_attempts))
         self._secret = sign_secret
-        self._queue: queue.Queue[tuple[str, WebhookEvent] | None] = queue.Queue()
+        # Bounded on purpose. Deliveries are produced in the request path and
+        # consumed by a single thread that sleeps through retry backoff, so a
+        # stalled receiver lets production outrun consumption indefinitely --
+        # an unbounded queue turns that into unbounded memory in a container
+        # with a fixed limit. The bound makes the failure a bounded, logged
+        # loss of best-effort notifications instead.
+        self._queue: queue.Queue[tuple[str, WebhookEvent] | None] = queue.Queue(
+            maxsize=max(1, int(queue_max))
+        )
         self._thread: threading.Thread | None = None
         self._stopping = threading.Event()
         #: Injection points for tests: no real sleeping, no real HTTP, no real DNS.
@@ -264,13 +322,28 @@ class WebhookDispatcher:
     def emit(self, urls: list[str], event: WebhookEvent) -> None:
         """Enqueue one delivery per URL. Returns immediately.
 
-        Never raises into the request path: an unusable URL is dropped with a
-        log line rather than failing the publish that triggered it.
+        Never raises into the request path, and never blocks it: an unusable
+        URL is dropped with a log line rather than failing the publish that
+        triggered it, and so is a delivery that arrives when the queue is
+        already at ``queue_max``. Dropping the newest is the deliberate
+        choice -- the alternative, blocking on ``put``, would make a stalled
+        receiver slow down publishing itself, which is the one thing push
+        notifications must never do.
         """
         for url in urls or []:
             if not isinstance(url, str) or not url.strip():
                 continue
-            self._queue.put((url.strip(), event))
+            try:
+                self._queue.put_nowait((url.strip(), event))
+            except queue.Full:
+                logger.warning(
+                    "Dropping webhook delivery of %s for artifact %s to %s: "
+                    "queue is full (%d pending)",
+                    event.kind,
+                    event.artifact_id,
+                    _safe_url(url.strip()),
+                    self._queue.maxsize,
+                )
 
     def pending(self) -> int:
         """Number of deliveries still queued (diagnostics and tests)."""
@@ -321,10 +394,16 @@ class WebhookDispatcher:
         here may propagate into the caller or the loop.
         """
         body = _body_for(url, event)
+        # Built once, outside the retry loop, which is what makes the delivery
+        # id stable across attempts. Sent as headers as well as in the body so
+        # a receiver can dedupe without parsing -- and so Slack deliveries,
+        # whose body is a different shape entirely, carry them too.
         headers = {
             "Content-Type": "application/json",
             "User-Agent": USER_AGENT,
             SIGNATURE_HEADER: sign_body(body, self._secret),
+            EVENT_ID_HEADER: event.event_id,
+            DELIVERY_ID_HEADER: event.delivery_id_for(url),
         }
         for attempt in range(self._max_attempts):
             if attempt:
@@ -391,14 +470,22 @@ class WebhookDispatcher:
         with the dispatcher's (injectable) resolver so a rebind after
         registration is caught. Never raises.
 
-        A blocked hostname (metadata/internal names) or a name/literal that
-        resolves to a private, loopback, link-local, reserved or metadata
-        address returns ``False`` and the delivery is dropped. A host that
-        cannot be resolved *now* (``OSError``/no addresses) is allowed through:
-        the registration guard already required it to resolve to a public
-        address, an unresolvable name cannot be connected to at all (so it is
-        not an SSRF vector — the POST would simply fail), and dropping only on a
-        positively-blocked answer is what defends the rebind-to-internal case.
+        Fails closed. A blocked hostname (metadata/internal names), a
+        name/literal resolving to a private, loopback, link-local, reserved or
+        metadata address, *and* a host that cannot be resolved right now
+        (``OSError`` or an empty answer) all return ``False`` and drop the
+        delivery.
+
+        Allowing an unresolvable host through used to look safe -- a name that
+        does not resolve cannot be connected to, so the POST would just fail.
+        That reasoning does not hold, because this lookup and the one httpx
+        performs when it opens the connection are two separate queries. A DNS
+        server the attacker controls can answer this probe with SERVFAIL and
+        then hand httpx a loopback address a moment later; fail-open would let
+        that through without the attacker even having to win a race against a
+        public answer. Refusing to deliver what we cannot positively clear
+        costs only an attempt, and the caller retries with backoff, so a
+        genuine resolver blip behaves like any other transient failure.
         """
         hostname = (urlparse(url).hostname or "").strip().rstrip(".").lower()
         if not hostname:
@@ -411,11 +498,11 @@ class WebhookDispatcher:
             try:
                 candidates = self._resolver(hostname)
             except OSError:
-                return True
+                return False
         else:
             candidates = [hostname]
         if not candidates:
-            return True
+            return False
         return not any(_ip_is_blocked(ip) for ip in candidates)
 
     def _http_post(self, url: str, body: bytes, headers: dict) -> int:

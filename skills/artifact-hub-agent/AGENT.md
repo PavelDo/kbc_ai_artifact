@@ -542,6 +542,15 @@ Slack message; any other URL gets the generic signed JSON envelope. Fired on:
 `comment.created`, `comment.replied`, `artifact.finalized`,
 `artifact.trashed`, `artifact.restored`, `link.rotated`.
 
+**Recognising a retry.** Every delivery — Slack included — carries
+`X-Hub-Event-Id` and `X-Hub-Delivery-Id`, and non-Slack bodies repeat them as
+`event_id` and `delivery_id`. The event id identifies what happened, the same
+across every receiver and every retry; the delivery id identifies this event
+going to *this* receiver, and stays the same when a failed attempt is retried.
+A receiver that acts on a delivery should record the delivery id and ignore a
+repeat, since the hub retries on any non-2xx (including one you answered
+slowly).
+
 **Verifying a delivery's signature** (skip for Slack — it has no signature
 header): every non-Slack POST carries
 `X-Hub-Signature-256: sha256=<hex>`, an HMAC-SHA256 of the exact request body

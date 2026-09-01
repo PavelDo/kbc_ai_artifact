@@ -4235,6 +4235,10 @@ def hooked(api: Api, monkeypatch):
 
     dispatcher = main.app.state.webhooks
     monkeypatch.setattr(dispatcher, "_post", record)
+    # The delivery-time SSRF guard fails closed, and "hooks.test" does not
+    # resolve, so it needs the same injected public answer tests/test_webhooks.py
+    # uses. Without this the deliveries are (correctly) dropped before the POST.
+    monkeypatch.setattr(dispatcher, "_resolver", lambda _hostname: ["93.184.216.34"])
     # The dispatcher's own thread would race drain(); stop it and drive
     # delivery from the test thread instead.
     dispatcher.stop()

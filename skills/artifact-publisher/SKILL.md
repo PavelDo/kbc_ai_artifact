@@ -886,6 +886,15 @@ project's **name** (or a guest's display name plus " (guest)"), and the
 public `url` built from the current share id — never a token, an owner key, or
 a password record.
 
+### Recognise a retry
+
+Every delivery carries `X-Hub-Event-Id` and `X-Hub-Delivery-Id` as headers, and
+non-Slack bodies repeat them as `event_id` and `delivery_id`. The event id is
+the same across every receiver and every retry; the delivery id is the same
+across retries to one receiver. Record the delivery id and skip a repeat — the
+hub retries on any non-2xx, so a receiver that acted but answered slowly will
+see the same delivery again.
+
 ### Verify the signature
 
 Every non-Slack delivery carries `X-Hub-Signature-256: sha256=<hex>` — an

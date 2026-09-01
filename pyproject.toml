@@ -21,6 +21,19 @@ dev = [
     "respx>=0.21.0",
 ]
 
+[tool.uv]
+# kbcstorage 0.9.5 (the newest release) declares urllib3<2.0.0, which is the
+# single constraint keeping the production graph on urllib3 1.26.20 -- a
+# version with five current advisories, the highest of which is only fixed in
+# 2.7.0. The pin is stale rather than substantive: kbcstorage never imports
+# urllib3, it talks HTTP through requests and boto3, and both of those declare
+# urllib3<3. botocore and requests already allow 2.x here.
+#
+# Revisit when kbcstorage relaxes its own pin; this override exists only to
+# stop a transitive dependency's hygiene constraint from holding a known
+# vulnerable version in a deployed image.
+override-dependencies = ["urllib3>=2.7.0"]
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"

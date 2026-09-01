@@ -1,0 +1,48 @@
+name: CI
+
+# The checks CLAUDE.md requires before any commit, plus the dependency
+# advisory gate the v0.7.5 review asked for. Runs on 3.11 because that is
+# what the deployed Data App runs -- notably, f-string rules differ in 3.12+,
+# so a newer interpreter here would not catch what production rejects.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Tests
+        run: uv run pytest tests/ -q
+
+      - name: Compile on the deployed interpreter
+        run: uv run python -m compileall -q src/
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+
+      # The *production* graph only: dev-only advisories must not fail a
+      # release, and the project itself is not a published package.
+      - name: Export the production lock
+        run: uv export --no-dev --no-emit-project --format requirements-txt -o requirements-prod.txt
+
+      - name: Audit it
+        run: uvx pip-audit -r requirements-prod.txt --disable-pip

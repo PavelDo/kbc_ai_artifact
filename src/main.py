@@ -779,6 +779,7 @@ async def lifespan(app: FastAPI):
         settings.webhook_timeout_s,
         settings.webhook_max_attempts,
         derive_key(settings.secret_key, KEY_LABEL_WEBHOOK),
+        queue_max=settings.webhook_queue_max,
     )
     app.state.webhooks = webhooks
     try:

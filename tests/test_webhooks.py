@@ -42,10 +42,13 @@ class Recorder:
         return outcome
 
 
-def make_dispatcher(statuses: list, *, max_attempts: int = 3):
+def make_dispatcher(statuses: list, *, max_attempts: int = 3, queue_max: int = 1000):
     """A dispatcher wired to a Recorder, with sleeping neutered."""
     dispatcher = WebhookDispatcher(
-        timeout_s=5, max_attempts=max_attempts, sign_secret=SECRET
+        timeout_s=5,
+        max_attempts=max_attempts,
+        sign_secret=SECRET,
+        queue_max=queue_max,
     )
     recorder = Recorder(statuses)
     slept: list[float] = []
@@ -77,7 +80,13 @@ class TestDelivery:
 
         url, body, headers = recorder.posts[0]
         assert url == HOOK_URL
-        assert json.loads(body) == {
+        document = json.loads(body)
+        # The two ids are generated per event/receiver, so they are checked
+        # for identity behaviour in TestDeliveryIdentity rather than pinned
+        # to a literal here.
+        ids = {"event_id": document.pop("event_id"), "delivery_id": document.pop("delivery_id")}
+        assert all(ids.values())
+        assert document == {
             "event": "version.published",
             "artifact_id": "abc123",
             "payload": {"title": "Quarterly review", "version": 4},
@@ -352,6 +361,33 @@ class TestDeliveryTimeSsrfGuard:
         # First attempt posted (got 500), second attempt blocked before posting.
         assert len(recorder.posts) == 1
 
+    def test_a_resolver_error_at_delivery_drops_the_delivery(self) -> None:
+        """Failing to resolve is not proof the destination is safe.
+
+        The guard's resolver and httpx's own resolution are two separate
+        lookups. A DNS server the attacker controls can answer this probe
+        with SERVFAIL and then hand httpx 127.0.0.1 a moment later -- so
+        treating "could not resolve" as "allowed" lets a rebind through
+        without even having to win a race against a public answer.
+        """
+        def unresolvable(_hostname: str) -> list[str]:
+            raise OSError("SERVFAIL")
+
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher._resolver = unresolvable
+
+        dispatcher.emit([HOOK_URL], an_event())
+        assert dispatcher.drain() == 1
+        assert recorder.posts == []
+
+    def test_an_empty_answer_at_delivery_drops_the_delivery(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher._resolver = lambda _hostname: []
+
+        dispatcher.emit([HOOK_URL], an_event())
+        assert dispatcher.drain() == 1
+        assert recorder.posts == []
+
     def test_metadata_hostname_is_dropped_at_delivery(self) -> None:
         dispatcher, recorder, _ = make_dispatcher([200])
         dispatcher._resolver = self.public  # would be public, but host is blocked
@@ -412,3 +448,99 @@ class TestLifecycle:
     def test_stop_without_start_is_a_no_op(self) -> None:
         dispatcher, _, _ = make_dispatcher([200])
         dispatcher.stop()
+
+
+class TestDeliveryIdentity:
+    """A receiver has to be able to tell a retry from a new event.
+
+    Without an identifier that survives a retry, a receiver that answered
+    slowly -- or answered 500 after acting -- has no way to recognise the
+    second POST as the same delivery, so retries become duplicate work.
+    """
+
+    def test_the_envelope_carries_an_event_and_delivery_id(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher.emit([HOOK_URL], an_event())
+        dispatcher.drain()
+
+        body = json.loads(recorder.posts[0][1])
+        assert body["event_id"]
+        assert body["delivery_id"]
+        assert body["event_id"] != body["delivery_id"]
+
+    def test_a_retry_repeats_the_same_delivery_id(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([500, 200])
+        dispatcher.emit([HOOK_URL], an_event())
+        dispatcher.drain()
+
+        assert len(recorder.posts) == 2
+        first, second = (json.loads(post[1]) for post in recorder.posts)
+        assert first["delivery_id"] == second["delivery_id"]
+        assert first["event_id"] == second["event_id"]
+
+    def test_two_receivers_share_the_event_but_not_the_delivery(self) -> None:
+        other = "https://example.com/hooks/second"
+        dispatcher, recorder, _ = make_dispatcher([200, 200])
+        dispatcher.emit([HOOK_URL, other], an_event())
+        dispatcher.drain()
+
+        first, second = (json.loads(post[1]) for post in recorder.posts)
+        assert first["event_id"] == second["event_id"]
+        assert first["delivery_id"] != second["delivery_id"]
+
+    def test_two_events_get_different_event_ids(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([200, 200])
+        dispatcher.emit([HOOK_URL], an_event())
+        dispatcher.emit([HOOK_URL], an_event())
+        dispatcher.drain()
+
+        first, second = (json.loads(post[1]) for post in recorder.posts)
+        assert first["event_id"] != second["event_id"]
+
+    def test_slack_deliveries_carry_the_ids_in_headers(self) -> None:
+        """Slack gets a different body, so the ids have to travel in headers.
+
+        They are sent on every delivery, not just Slack's, so a receiver can
+        dedupe without parsing the body at all.
+        """
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher.emit([SLACK_URL], an_event())
+        dispatcher.drain()
+
+        _url, body, headers = recorder.posts[0]
+        assert "text" in json.loads(body)
+        assert headers["X-Hub-Event-Id"]
+        assert headers["X-Hub-Delivery-Id"]
+
+
+class TestQueueIsBounded:
+    """A queue with no ceiling turns a stalled receiver into a memory leak.
+
+    Deliveries are produced in the request path and consumed by one thread
+    that sleeps through retries, so production can outrun consumption
+    indefinitely.
+    """
+
+    def test_emitting_past_the_ceiling_drops_rather_than_grows(self) -> None:
+        dispatcher, _recorder, _ = make_dispatcher([], queue_max=3)
+        for _ in range(10):
+            dispatcher.emit([HOOK_URL], an_event())
+
+        assert dispatcher.pending() == 3
+
+    def test_emit_never_blocks_the_caller(self) -> None:
+        dispatcher, _recorder, _ = make_dispatcher([], queue_max=1)
+        started = time.monotonic()
+        for _ in range(50):
+            dispatcher.emit([HOOK_URL], an_event())
+        assert time.monotonic() - started < 1.0
+
+    def test_room_frees_up_once_deliveries_are_consumed(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([200, 200], queue_max=2)
+        for _ in range(5):
+            dispatcher.emit([HOOK_URL], an_event())
+        assert dispatcher.pending() == 2
+
+        assert dispatcher.drain() == 2
+        dispatcher.emit([HOOK_URL], an_event())
+        assert dispatcher.pending() == 1

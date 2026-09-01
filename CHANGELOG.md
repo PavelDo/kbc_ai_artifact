@@ -24,6 +24,19 @@ have.
   in place, rather than the redirect it used to promise.
 - Documentation now says plainly that pending proposals are subject to their
   own retention cap, instead of claiming they are kept forever.
+- The deployed image no longer ships a networking library with five known
+  vulnerabilities. Every release now fails automatically if a dependency with
+  a published advisory reaches the production dependency list.
+- A push notification is no longer sent to a destination the service could not
+  check. A name that fails to resolve at delivery time now stops the delivery
+  instead of being sent anyway, closing a way to redirect a notification to an
+  internal address.
+- Push notifications now carry an event id and a delivery id, so a receiver can
+  tell a retry from something new and avoid acting twice.
+- A receiver that stops answering can no longer make the service accumulate
+  pending notifications without limit; past a configurable ceiling
+  (`HUB_WEBHOOK_QUEUE_MAX`) the newest is dropped, and publishing is never held
+  up waiting for one.
 
 ## 0.8.0 — Documents that update themselves (2026-09-01)
 

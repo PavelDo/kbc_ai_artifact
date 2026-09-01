@@ -609,6 +609,32 @@ class TestGitHostSsrfGuard:
                 resolver=lambda h: ["169.254.169.254"],
             )
 
+    def test_a_resolver_error_is_refused_not_allowed(self):
+        """The host guard must fail closed, like the webhook one.
+
+        This check and git's own resolution are separate lookups, so "could
+        not resolve" is not evidence the destination is safe: a DNS server
+        the attacker controls can fail this probe and answer git with an
+        internal address a moment later.
+        """
+        def unresolvable(_hostname: str) -> list[str]:
+            raise OSError("SERVFAIL")
+
+        with pytest.raises(BuildError, match="resolve"):
+            _check_git_host(
+                "https://evil.example.com/r.git",
+                allow_private=False,
+                resolver=unresolvable,
+            )
+
+    def test_an_empty_answer_is_refused(self):
+        with pytest.raises(BuildError, match="resolve"):
+            _check_git_host(
+                "https://evil.example.com/r.git",
+                allow_private=False,
+                resolver=lambda _h: [],
+            )
+
     def test_private_10_range_rejected(self):
         with pytest.raises(BuildError):
             _check_git_host(
