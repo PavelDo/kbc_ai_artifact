@@ -14,7 +14,7 @@ import zipfile
 
 import pytest
 
-from src.export import build_vault, head_source, slugify
+from src.export import build_vault, head_source, markdown_of_html, slugify
 from src.store import STATUS_LIVE, STATUS_PROPOSED, ArtifactMeta, Envelope
 
 try:  # pragma: no cover - exercised implicitly by whichever branch applies
@@ -196,26 +196,164 @@ def _frontmatter_lines(text: str) -> list[str]:
 # --------------------------------------------------------------- head_source
 
 
-def test_head_source_markdown_branch():
+def test_head_source_markdown_branch_is_byte_identical_to_the_original():
+    """The author's own Markdown is never touched — not even re-wrapped."""
     env = _envelope(2, markdown=V2_MD)
-    filename, content_type, body = head_source(env)
+    filename, content_type, body, kind = head_source(env)
     assert filename == f"{ROOT}.md"
     assert content_type == "text/markdown; charset=utf-8"
     assert body == V2_MD
+    assert kind == "original"
 
 
-def test_head_source_html_branch():
+def test_head_source_of_supplied_markdown_source_is_original_too():
+    """An HTML artifact published with markdown_source exports that verbatim."""
+    env = _envelope(
+        4, title="Raw HTML doc", markdown=V2_MD, html=V3_HTML, source_type="html"
+    )
+    filename, content_type, body, kind = head_source(env)
+    assert filename == "raw-html-doc.md"
+    assert content_type == "text/markdown; charset=utf-8"
+    assert body == V2_MD
+    assert kind == "original"
+
+
+def test_head_source_html_branch_converts_to_markdown():
     env = _envelope(3, title="Raw HTML doc", html=V3_HTML, source_type="html")
-    filename, content_type, body = head_source(env)
+    filename, content_type, body, kind = head_source(env)
+    assert filename == "raw-html-doc.md"
+    assert content_type == "text/markdown; charset=utf-8"
+    assert body == "# Proposal\n"
+    assert kind == "converted"
+
+
+def test_head_source_falls_back_to_html_when_conversion_fails(monkeypatch):
+    """A converter failure degrades to the old behaviour, it never raises."""
+    monkeypatch.setattr(
+        "src.export._converter", _boom, raising=True
+    )
+    env = _envelope(3, title="Raw HTML doc", html=V3_HTML, source_type="html")
+    filename, content_type, body, kind = head_source(env)
     assert filename == "raw-html-doc.html"
     assert content_type == "text/html; charset=utf-8"
     assert body == V3_HTML
+    assert kind == "none"
 
 
 def test_head_source_falls_back_to_artifact_id_for_empty_title():
     env = _envelope(1, title="", markdown=V1_MD)
-    filename, _, _ = head_source(env)
+    filename, _, _, _ = head_source(env)
     assert filename == f"{slugify('', ARTIFACT_ID)}.md"
+
+
+# ------------------------------------------------------- markdown_of_html
+
+
+def _boom(*args, **kwargs):
+    raise RuntimeError("converter exploded")
+
+
+RICH_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<title>Q3 review</title>
+<style>body { color: #ff0000; font-family: "Secret Sans"; }</style>
+<script>window.TRACKING_TOKEN = "leaky-value";</script>
+</head>
+<body>
+<h1 id="q3-review">Q3 review</h1>
+<p>See the <a href="https://example.com/runbook">runbook</a>.</p>
+<h2>Numbers</h2>
+<table>
+<thead><tr><th>Metric</th><th>Q2</th><th>Q3</th></tr></thead>
+<tbody>
+<tr><td>Runs</td><td>120</td><td>184</td></tr>
+<tr><td>Failures</td><td>9</td><td>3</td></tr>
+</tbody>
+</table>
+<h2>Pipeline</h2>
+<pre class="mermaid">flowchart LR
+  A[Extract] --&gt; B[Load]</pre>
+<pre><code class="language-python">settings = Settings(max_retries=3)
+</code></pre>
+<ul><li>first<ul><li>nested</li></ul></li><li>second</li></ul>
+<canvas id="chart" aria-label="Revenue by quarter"></canvas>
+<svg viewBox="0 0 4 4"><title>Architecture sketch</title><circle r="1"/></svg>
+<img src="data:image/png;base64,AAAA" alt="Inlined logo">
+</body>
+</html>
+"""
+
+
+@pytest.fixture(scope="module")
+def rich() -> str:
+    converted = markdown_of_html(RICH_HTML)
+    assert converted is not None
+    return converted
+
+
+def test_conversion_keeps_headings_links_and_nested_lists(rich):
+    assert "# Q3 review" in rich
+    assert "## Numbers" in rich
+    assert "[runbook](https://example.com/runbook)" in rich
+    assert "- first\n  - nested\n- second" in rich
+
+
+def test_conversion_produces_a_gfm_pipe_table(rich):
+    assert "| Metric | Q2 | Q3 |" in rich
+    assert "| --- | --- | --- |" in rich
+    assert "| Runs | 120 | 184 |" in rich
+
+
+def test_conversion_restores_mermaid_and_language_fences(rich):
+    assert "```mermaid\nflowchart LR\n  A[Extract] --> B[Load]\n```" in rich
+    assert "```python\nsettings = Settings(max_retries=3)\n```" in rich
+
+
+def test_conversion_never_leaks_script_or_style_content(rich):
+    assert "leaky-value" not in rich
+    assert "TRACKING_TOKEN" not in rich
+    assert "Secret Sans" not in rich
+    assert "#ff0000" not in rich
+
+
+def test_conversion_degrades_canvas_svg_and_inlined_images_to_placeholders(rich):
+    assert "_[chart: Revenue by quarter — not exportable to Markdown]_" in rich
+    assert "_[image: Architecture sketch — not exportable to Markdown]_" in rich
+    assert "_[image: Inlined logo — not exportable to Markdown]_" in rich
+    # The base64 blob itself must never land in the Markdown.
+    assert "base64" not in rich
+    assert "<svg" not in rich and "<canvas" not in rich
+
+
+def test_conversion_collapses_blank_line_runs(rich):
+    assert "\n\n\n" not in rich
+    assert rich.endswith("\n") and not rich.endswith("\n\n")
+    assert not any(line != line.rstrip() for line in rich.splitlines())
+
+
+def test_conversion_is_deterministic():
+    assert markdown_of_html(RICH_HTML) == markdown_of_html(RICH_HTML)
+
+
+def test_conversion_uses_the_document_title_when_the_body_has_no_h1():
+    converted = markdown_of_html(
+        "<html><head><title>Notes</title></head><body><p>Hi</p></body></html>"
+    )
+    assert converted == "# Notes\n\nHi\n"
+
+
+def test_conversion_of_nothing_is_none():
+    assert markdown_of_html("") is None
+    assert markdown_of_html("   ") is None
+    assert markdown_of_html("<html><body></body></html>") is None
+
+
+def test_conversion_failure_is_swallowed_and_logged(monkeypatch, caplog):
+    monkeypatch.setattr("src.export._converter", _boom, raising=True)
+    with caplog.at_level("ERROR"):
+        assert markdown_of_html(RICH_HTML) is None
+    assert "conversion failed" in caplog.text
 
 
 # ------------------------------------------------------------------- slugify
@@ -344,7 +482,8 @@ def test_document_carries_head_markdown(meta, envelopes, threads):
     assert f"{ROOT}/document.html" not in archive.namelist()
 
 
-def test_html_head_produces_document_html_sidecar(meta):
+def test_html_head_produces_converted_markdown_plus_an_html_sidecar(meta):
+    """document.md carries real Markdown; the HTML stays alongside it."""
     html_head = _envelope(
         1,
         title="Raw doc",
@@ -355,14 +494,35 @@ def test_html_head_produces_document_html_sidecar(meta):
     _, _, archive = _open(meta, [html_head], [])
     assert "raw-doc/document.html" in archive.namelist()
     assert _read(archive, "raw-doc/document.html") == V3_HTML
-    assert "document.html" in _read(archive, "raw-doc/document.md")
+
+    document = _read(archive, "raw-doc/document.md")
+    assert document.startswith("# Proposal\n")
+    assert "converted from it" in document
+    assert "`document.html`" in document
     assert "`document.html`" in _read(archive, "raw-doc/INDEX.md")
 
 
-def test_html_version_gets_html_sidecar(meta, envelopes, threads):
+def test_html_head_with_a_supplied_markdown_source_is_not_converted(meta):
+    """markdown_source wins over conversion, verbatim, and needs no footnote."""
+    html_head = _envelope(
+        1,
+        title="Raw doc",
+        markdown=V2_MD,
+        html=V3_HTML,
+        source_type="html",
+        created_at="2026-01-01T10:00:00+00:00",
+    )
+    _, _, archive = _open(meta, [html_head], [])
+    assert _read(archive, "raw-doc/document.md") == V2_MD
+    assert "raw-doc/document.html" not in archive.namelist()
+
+
+def test_html_version_gets_converted_markdown_and_an_html_sidecar(meta, envelopes, threads):
     _, _, archive = _open(meta, envelopes, threads)
     assert _read(archive, f"{ROOT}/versions/v3.html") == V3_HTML
     body = _read(archive, f"{ROOT}/versions/v3.md")
+    assert "# Proposal" in body
+    assert "converted from it" in body
     assert "`v3.html`" in body
     assert f"{ROOT}/versions/v1.html" not in archive.namelist()
     assert f"{ROOT}/versions/v2.html" not in archive.namelist()

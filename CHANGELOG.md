@@ -4,6 +4,82 @@ KBC Artifact Hub is one web address where you publish a document and
 collaborate on it with your team, secured by the Keboola account you already
 have.
 
+## 0.9.0 — Documents you can hand to another tool (this release) (2026-09-01)
+
+- **Asking for a document in Markdown now actually gets you Markdown**,
+  including when the author originally wrote it as a designed web page —
+  tables, diagrams and code come through intact, and anything that can't
+  survive the trip, like charts or images, is called out rather than
+  silently dropped.
+- **An author publishing a designed page can now attach the Markdown they
+  wrote it from**, so a colleague or an AI assistant reading the document
+  gets the author's own words instead of an automatic conversion of the
+  finished page.
+- **The downloadable history of a document now includes readable Markdown
+  for every version**, not just the original files, so the full archive is
+  usable outside a browser.
+- The instructions we give AI assistants working with this service now tell
+  them to always make a Markdown version available, so this is the default
+  going forward rather than something you have to ask for.
+
+## 0.8.0 — Documents update while you are reading them (2026-09-01)
+
+- **Share a link, publish a revision, and everyone who already has the page
+  open sees it appear** — no reload, no message telling people to refresh.
+  This covers the document page, the review page, and the studio an owner
+  uses to manage everything.
+- Nothing is pulled out from under a reader: a document only swaps itself in
+  if you're still at the top of it; scroll in, and you get a quiet notice
+  instead. Anyone reading one specific version is never bumped off it, and a
+  half-written comment always survives.
+- Reviewers see each other's comments and new versions land in real time,
+  and an owner reviewing proposals sees them appear without touching the
+  page.
+- Built to work everywhere reliably, including through office and hotel
+  networks that quietly break flashier "live" approaches — and it costs
+  almost nothing to run when nothing has actually changed.
+
+## 0.7.4–0.7.5 — A password-protected document can now be reviewed by an outside guest (2026-09-01)
+
+- An invited reviewer opening a password-protected document on their
+  personal link used to hit a dead end — there was nowhere to type the
+  password, the document wouldn't load, and a comment they'd written failed
+  at the last step with no way to recover it.
+- The review page now asks for the password itself, explains that the
+  invitation is still valid and the password is a separate lock, and says
+  plainly when a password is wrong or has been tried too many times.
+- A comment written before unlocking is kept and sent automatically once the
+  document opens, instead of being lost.
+- The fix reaches all the way through: reviewers used to be bounced to a
+  generic "enter password" screen first, which discarded the part of their
+  link that identified them as the invited guest. That no longer happens —
+  they stay on their own link throughout, and the document, its versions and
+  its comments remain closed until the correct password is given.
+
+## 0.7.3 — Live demo, and knowing when a document is settled (2026-09-01)
+
+- **A live demo is now linked from the landing page.** It walks through a
+  full real example: one document published by one Keboola project, revised
+  by a reviewer on a different project and a different Keboola stack,
+  commented on by an outside guest with no Keboola account, then approved
+  and locked — all on the hub itself, so you can click through it rather
+  than take our word for it.
+- **Anyone checking on a document from outside can now tell whether it's
+  actually finished.** A finalized document no longer advertises that it's
+  still open for changes — previously the only status on offer described
+  the current version, not the document as a whole.
+
+## 0.7.2 — Comments land where they were meant to (2026-09-01)
+
+- A comment submitted by automation, such as an AI assistant, now attaches
+  correctly to the passage it quotes even when line breaks in the quoted
+  text don't match exactly. Previously such a comment was accepted silently
+  but showed no highlight and an unhelpful "quote not found" message.
+  Comments made by selecting text by hand in the browser were never
+  affected.
+- A guest reviewer's comment is now credited with their name in the
+  downloaded project archive, instead of showing up as "unknown project."
+
 ## 0.7.1 — Security follow-up (2026-09-01)
 
 - Documents opened through the machine-readable link now render inside the

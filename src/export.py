@@ -1,10 +1,12 @@
 """Exports of an artifact: single-file source and a ready-to-open Obsidian vault.
 
-Two renderings live here, both **pure functions of their inputs**:
+Three renderings live here, all **pure functions of their inputs**:
 
-- :func:`head_source` — the served version's original Markdown (or the built
-  HTML when the artifact was published as HTML), used by
-  ``GET /a/{id}/export/markdown``.
+- :func:`head_source` — the served version's Markdown, used by
+  ``GET /a/{id}/export/markdown``: the author's own Markdown when the version
+  has one (Markdown-authored, or HTML published with ``markdown_source``), and
+  otherwise a conversion of the built HTML.
+- :func:`markdown_of_html` — that conversion, on its own.
 - :func:`build_vault` — an in-memory ZIP holding an Obsidian vault
   (``INDEX.md`` hub, ``document.md``, ``versions/v{n}.md``,
   ``comments/{tid}.md``, ``reasoning.md``), used by
@@ -15,11 +17,16 @@ Design constraints, in order of importance:
 1. **Determinism.** The same ``(meta, envelopes, threads)`` must produce
    byte-identical ZIP bytes: entry order is fixed, entry timestamps are pinned
    to :data:`_ZIP_DATE`, and nothing here reads the clock, the environment or a
-   random source. Everything written into the vault is reconstructible from the
-   Storage records that were passed in — per CLAUDE.md, a vault must never
-   carry state that cannot be rebuilt from Storage.
-2. **No new dependencies.** ``zipfile`` + ``difflib`` + a tiny hand-rolled YAML
-   string escaper (:func:`_yaml_value`) instead of PyYAML.
+   random source — HTML→Markdown conversion included. Everything written into
+   the vault is reconstructible from the Storage records that were passed in —
+   per CLAUDE.md, a vault must never carry state that cannot be rebuilt from
+   Storage.
+2. **Few dependencies.** ``zipfile`` + ``difflib`` + a tiny hand-rolled YAML
+   string escaper (:func:`_yaml_value`) instead of PyYAML. The one exception is
+   ``markdownify`` (BeautifulSoup-based), used only by
+   :func:`markdown_of_html`; it was picked over ``html2text`` because it emits
+   GFM pipe tables and real ``` fences (so a language and our mermaid blocks
+   survive), where html2text emits indented code blocks and pipe-less tables.
 3. **Loose coupling to comments.** :class:`~src.comments.CommentThread` is
    imported for typing only; at runtime threads are read by attribute access so
    any object with the documented shape works.
@@ -29,6 +36,8 @@ from __future__ import annotations
 
 import difflib
 import io
+import logging
+import re
 import unicodedata
 import zipfile
 from typing import TYPE_CHECKING, Any
@@ -40,7 +49,16 @@ from src.store import HEAD_PINNED, STATUS_LIVE, ArtifactMeta, Envelope
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps runtime import-free
     from src.comments import CommentThread
 
-__all__ = ["head_source", "build_vault"]
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "head_source",
+    "markdown_of_html",
+    "build_vault",
+    "SOURCE_ORIGINAL",
+    "SOURCE_CONVERTED",
+    "SOURCE_NONE",
+]
 
 #: Fixed ZIP entry timestamp so repeated builds are byte-identical.
 _ZIP_DATE = (2020, 1, 1, 0, 0, 0)
@@ -68,6 +86,33 @@ _ARTIFACT_STATUSES = (_STATUS_DRAFT, _STATUS_FINAL)
 
 _MARKDOWN_CONTENT_TYPE = "text/markdown; charset=utf-8"
 _HTML_CONTENT_TYPE = "text/html; charset=utf-8"
+
+#: Values of the ``X-Artifact-Markdown-Source`` response header, and of the
+#: fourth element of a :func:`head_source` result.
+#: The author's own Markdown, byte for byte.
+SOURCE_ORIGINAL = "original"
+#: Markdown reverse-engineered from the built HTML document.
+SOURCE_CONVERTED = "converted"
+#: Neither was possible — the HTML document itself is being served.
+SOURCE_NONE = "none"
+
+#: Elements whose *text* must never reach the Markdown. Scripts and styles are
+#: code, not prose; ``template`` and ``noscript`` hold markup that the page
+#: never showed a reader either.
+_DROP_ELEMENTS = ("script", "style", "noscript", "template")
+
+#: Elements that carry no text at all and therefore degrade to a placeholder.
+#: ``canvas`` is a chart drawn by script; ``svg`` is an illustration whose
+#: markup would be pure noise in a Markdown file.
+_PLACEHOLDER_ELEMENTS = {"canvas": "chart", "svg": "image"}
+
+#: Attributes consulted, in order, for a human label of a placeholder element.
+_LABEL_ATTRS = ("aria-label", "alt", "title", "data-label")
+
+#: Three or more newlines (converters emit plenty) collapse to a blank line.
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+#: Trailing spaces/tabs on a line — never meaningful in our output.
+_TRAILING_WS_RE = re.compile(r"[ \t]+\n")
 
 _YAML_ESCAPES = {
     "\\": "\\\\",
@@ -227,6 +272,178 @@ def _display_name(who: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# HTML → Markdown
+# ---------------------------------------------------------------------------
+
+
+def _element_label(element: Any) -> str:
+    """Human label of an un-convertible element, from its accessible attributes.
+
+    ``aria-label`` first (it is what a screen reader would announce), then the
+    usual ``alt``/``title``. Empty when the element carries none of them, in
+    which case the placeholder says only what kind of thing was there.
+    """
+    attrs = getattr(element, "attrs", None) or {}
+    for name in _LABEL_ATTRS:
+        value = attrs.get(name)
+        if isinstance(value, str) and value.strip():
+            return " ".join(value.split())
+    # An <svg> names itself with a <title> child rather than an attribute.
+    child = element.find("title") if hasattr(element, "find") else None
+    if child is not None:
+        text = " ".join(child.get_text().split())
+        if text:
+            return text
+    return ""
+
+
+def _placeholder(kind: str, label: str) -> str:
+    """One honest line standing in for content Markdown cannot carry."""
+    inside = f"{kind}: {label}" if label else kind
+    return f"\n\n_[{inside} — not exportable to Markdown]_\n\n"
+
+
+def _code_language(pre: Any) -> str:
+    """Fence language for a ``<pre>``, round-tripping the hub's own rendering.
+
+    ``src.builder`` renders a ```` ```mermaid ```` fence as
+    ``<pre class="mermaid">`` and every other fence as
+    ``<pre><code class="language-X">``, so both come back as the fence they
+    started life as instead of an anonymous blob.
+    """
+    classes = (getattr(pre, "attrs", None) or {}).get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    if "mermaid" in classes:
+        return "mermaid"
+    code = pre.find("code") if hasattr(pre, "find") else None
+    code_classes = (getattr(code, "attrs", None) or {}).get("class") or []
+    if isinstance(code_classes, str):
+        code_classes = code_classes.split()
+    for name in code_classes:
+        if name.startswith("language-") and len(name) > len("language-"):
+            return name[len("language-") :]
+    return ""
+
+
+def _build_converter() -> Any:
+    """The project's :class:`markdownify.MarkdownConverter` subclass.
+
+    Built lazily (and cached by :func:`_converter`) so importing this module
+    stays cheap and a converter problem can never break vault exports at import
+    time.
+    """
+    from markdownify import MarkdownConverter  # local import: see docstring
+
+    class _ArtifactConverter(MarkdownConverter):  # type: ignore[misc]
+        """Markdownify tuned to the documents this hub actually serves."""
+
+        def convert_soup(self, soup: Any) -> str:
+            # Scripts, styles and friends are dropped *before* conversion:
+            # markdownify's own `strip=` option removes the tag but keeps its
+            # text, which would spill a stylesheet into the Markdown.
+            for element in soup.find_all(_DROP_ELEMENTS):
+                element.decompose()
+            title = ""
+            head = soup.find("head")
+            if head is not None:
+                title_tag = head.find("title")
+                if title_tag is not None:
+                    title = " ".join(title_tag.get_text().split())
+                head.decompose()
+            body = soup.find("body") or soup
+            text = super().convert_soup(body)
+            # A document whose only title lived in <head> would otherwise lose
+            # it; one that already opens with a heading keeps just that.
+            if title and not body.find("h1"):
+                text = f"\n\n# {title}\n\n{text}"
+            return text
+
+        def convert_img(self, el: Any, text: str, parent_tags: Any) -> str:
+            # A data: URI is an inlined image (git artifacts get these): the
+            # base64 blob is worse than useless in a text file.
+            src = (getattr(el, "attrs", None) or {}).get("src") or ""
+            if isinstance(src, str) and src.strip().lower().startswith("data:"):
+                return _placeholder("image", _element_label(el))
+            return super().convert_img(el, text, parent_tags)
+
+        def convert_input(self, el: Any, text: str, parent_tags: Any) -> str:
+            # Task lists: markdown-it renders "- [ ] item" as a checkbox input,
+            # so it converts back into the checkbox it came from.
+            attrs = getattr(el, "attrs", None) or {}
+            if str(attrs.get("type") or "").lower() != "checkbox":
+                return ""
+            # No trailing space: markdown-it leaves whitespace between the
+            # checkbox and the label, and two spaces would read as ragged.
+            return "[x]" if "checked" in attrs else "[ ]"
+
+    for tag, kind in _PLACEHOLDER_ELEMENTS.items():
+        def _convert(el: Any, text: str, parent_tags: Any, _kind: str = kind) -> str:
+            return _placeholder(_kind, _element_label(el))
+
+        setattr(_ArtifactConverter, f"convert_{tag}", staticmethod(_convert))
+
+    return _ArtifactConverter(
+        heading_style="atx",
+        bullets="-",
+        code_language_callback=_code_language,
+        # A literal "*" in prose would otherwise come back as emphasis, so it
+        # is escaped. Underscores are not: GFM does not emphasise intra-word
+        # ones, and escaping them turns every snake_case identifier into
+        # backslash soup. escape_misc (the rest of the punctuation) is off for
+        # the same "must read as hand-written" reason.
+        escape_asterisks=True,
+        escape_underscores=False,
+        escape_misc=False,
+    )
+
+
+_CONVERTER: Any = None
+
+
+def _converter() -> Any:
+    """The single, reused converter instance (it is stateless between calls)."""
+    global _CONVERTER
+    if _CONVERTER is None:
+        _CONVERTER = _build_converter()
+    return _CONVERTER
+
+
+def _tidy(markdown: str) -> str:
+    """Make converter output look hand-written: no ragged blank-line runs."""
+    text = markdown.replace("\r\n", "\n").replace("\r", "\n")
+    text = _TRAILING_WS_RE.sub("\n", text)
+    text = _BLANK_RUN_RE.sub("\n\n", text)
+    text = text.strip("\n")
+    return text + "\n" if text else ""
+
+
+def markdown_of_html(html: str) -> str | None:
+    """Markdown for an HTML document, or ``None`` when that is not possible.
+
+    Deterministic: the same HTML always produces byte-identical Markdown, which
+    is what lets the vault ZIP stay reproducible.
+
+    A conversion is always second-best — a ``<canvas>`` chart or an ``<svg>``
+    illustration degrades to a one-line placeholder, and inlined images go the
+    same way — so an author who publishes HTML should hand over their own
+    Markdown as ``markdown_source`` instead of relying on this.
+
+    Never raises: any failure (a converter bug, unparsable markup, an empty
+    result) is logged and answered with ``None``, and the caller then falls
+    back to serving the HTML document itself.
+    """
+    if not html or not html.strip():
+        return None
+    try:
+        converted = _tidy(_converter().convert(html))
+    except Exception:  # noqa: BLE001 - an export must never 500 over this
+        logger.exception("HTML→Markdown conversion failed; falling back to HTML")
+        return None
+    return converted or None
+
+
+# ---------------------------------------------------------------------------
 # Head selection and single-file source export
 # ---------------------------------------------------------------------------
 
@@ -247,18 +464,29 @@ def _git_of(envelope: Envelope) -> dict:
     return git if isinstance(git, dict) else {}
 
 
-def head_source(envelope: Envelope) -> tuple[str, str, str]:
-    """Downloadable source of one version: ``(filename, content_type, body)``.
+def head_source(envelope: Envelope) -> tuple[str, str, str, str]:
+    """One version as a download: ``(filename, content_type, body, kind)``.
 
-    Markdown-authored artifacts export their original Markdown; everything else
-    exports the built HTML document. The filename is derived from the version's
-    title so a browser "Save as" lands on something readable.
+    ``kind`` is one of :data:`SOURCE_ORIGINAL`, :data:`SOURCE_CONVERTED` or
+    :data:`SOURCE_NONE`, and is what the route reports in
+    ``X-Artifact-Markdown-Source``. In precedence order:
+
+    1. the author's own Markdown — Markdown-authored, or HTML published with
+       ``markdown_source`` — returned **verbatim**, byte for byte;
+    2. otherwise Markdown converted from the built HTML;
+    3. and only if that conversion fails, the HTML document itself.
+
+    The filename is derived from the version's title so a browser "Save as"
+    lands on something readable.
     """
     stem = slugify(envelope.title, fallback=envelope.id)
     markdown = _markdown_of(envelope)
     if markdown is not None:
-        return f"{stem}.md", _MARKDOWN_CONTENT_TYPE, markdown
-    return f"{stem}.html", _HTML_CONTENT_TYPE, envelope.html or ""
+        return f"{stem}.md", _MARKDOWN_CONTENT_TYPE, markdown, SOURCE_ORIGINAL
+    converted = markdown_of_html(envelope.html or "")
+    if converted is not None:
+        return f"{stem}.md", _MARKDOWN_CONTENT_TYPE, converted, SOURCE_CONVERTED
+    return f"{stem}.html", _HTML_CONTENT_TYPE, envelope.html or "", SOURCE_NONE
 
 
 def _pick_head(meta: ArtifactMeta, ordered: list[Envelope]) -> Envelope | None:
@@ -379,8 +607,9 @@ def _render_index(
     parts.append(served + "\n")
     if html_document:
         parts.append(
-            "\nThe document was published as raw HTML; the HTML itself is in "
-            "`document.html`.\n"
+            "\nThe document was published as raw HTML without a Markdown "
+            "source, so [[document]] holds a conversion of it — lossy for "
+            "charts and images — and the HTML itself is in `document.html`.\n"
         )
 
     parts.append("\n## Versions\n\n")
@@ -413,6 +642,20 @@ def _render_index(
     return "".join(parts)
 
 
+def _converted_note(sidecar: str, env: Envelope) -> str:
+    """Footer marking a note whose body was reverse-engineered from HTML.
+
+    The vault keeps the HTML itself alongside (``sidecar``), so nothing is lost
+    — but a reader has to be told which of the two is the original.
+    """
+    return (
+        "\n---\n\n_This version was published as HTML (source type "
+        f"`{env.source_type}`) without a Markdown source, so the text above was "
+        f"converted from it — charts and images do not survive that. The "
+        f"document itself is stored alongside as `{sidecar}`._\n"
+    )
+
+
 def _render_document(head: Envelope | None) -> tuple[str, str | None]:
     """``(document.md body, document.html body or None)``."""
     if head is None:
@@ -425,6 +668,11 @@ def _render_document(head: Envelope | None) -> tuple[str, str | None]:
     if markdown is not None:
         return markdown, None
 
+    html = head.html or ""
+    converted = markdown_of_html(html)
+    if converted is not None:
+        return converted + _converted_note("document.html", head), html
+
     body = (
         f"# {_snippet(head.title, _SLUG_MAX_CHARS) or 'Document'}\n\n"
         f"This artifact was published as raw HTML (source type "
@@ -432,7 +680,7 @@ def _render_document(head: Envelope | None) -> tuple[str, str | None]:
         f"The served document (version {head.version}) is stored next to this "
         f"note as `document.html`.\n"
     )
-    return body, (head.html or "")
+    return body, html
 
 
 def _render_diff(previous: Envelope, current: Envelope) -> str:
@@ -492,11 +740,16 @@ def _render_version(env: Envelope, previous: Envelope | None) -> tuple[str, str 
         parts.append(markdown.rstrip("\n") + "\n")
     else:
         html_body = env.html or ""
-        parts.append(
-            f"This version carries raw HTML (source type `{env.source_type}`) "
-            f"rather than Markdown; the document itself is stored alongside as "
-            f"`v{env.version}.html`.\n"
-        )
+        converted = markdown_of_html(html_body)
+        if converted is not None:
+            parts.append(converted.rstrip("\n") + "\n")
+            parts.append(_converted_note(f"v{env.version}.html", env))
+        else:
+            parts.append(
+                f"This version carries raw HTML (source type `{env.source_type}`) "
+                f"rather than Markdown; the document itself is stored alongside as "
+                f"`v{env.version}.html`.\n"
+            )
 
     parts.append("\n## Changes vs previous version\n\n")
     if previous is None:

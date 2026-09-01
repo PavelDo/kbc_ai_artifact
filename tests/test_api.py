@@ -2425,11 +2425,20 @@ def test_export_markdown_returns_the_source_as_an_attachment(api: Api) -> None:
     assert resp.headers["content-disposition"] == (
         'attachment; filename="q3-review.md"'
     )
+    assert resp.headers["x-artifact-markdown-source"] == "original"
     assert resp.text == markdown
 
 
-def test_export_markdown_of_an_html_artifact_returns_html(api: Api) -> None:
-    document = "<html><head><title>Notes</title></head><body><p>Hi</p></body></html>"
+def test_export_markdown_of_an_html_artifact_converts_to_markdown(api: Api) -> None:
+    """The URL promises Markdown, so an HTML-authored artifact is converted."""
+    document = (
+        "<html><head><title>Notes</title>"
+        "<style>b { color: #ff0000; }</style></head>"
+        "<body><h1>Notes</h1><p>Ship <b>fast</b>.</p>"
+        "<table><thead><tr><th>Metric</th><th>Q3</th></tr></thead>"
+        "<tbody><tr><td>Runs</td><td>184</td></tr></tbody></table>"
+        "</body></html>"
+    )
     published = api.client.post(
         "/api/artifacts", json={"html": document, "title": "Notes"}, headers=AUTH_HEADERS
     )
@@ -2438,9 +2447,157 @@ def test_export_markdown_of_an_html_artifact_returns_html(api: Api) -> None:
 
     resp = api.client.get(f"/a/{artifact_id}/export/markdown")
     assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/markdown")
+    assert resp.headers["content-disposition"] == 'attachment; filename="notes.md"'
+    assert resp.headers["x-artifact-markdown-source"] == "converted"
+    assert resp.text == (
+        "# Notes\n\nShip **fast**.\n\n"
+        "| Metric | Q3 |\n| --- | --- |\n| Runs | 184 |\n"
+    )
+    assert "#ff0000" not in resp.text
+
+    # The document itself is untouched by any of this.
+    assert api.client.get(f"/a/{artifact_id}/raw").text == document
+
+
+def test_export_markdown_falls_back_to_html_when_conversion_fails(
+    api: Api, monkeypatch
+) -> None:
+    """A converter failure degrades to the old behaviour instead of a 500."""
+    document = "<html><head><title>Notes</title></head><body><p>Hi</p></body></html>"
+    published = api.client.post(
+        "/api/artifacts", json={"html": document, "title": "Notes"}, headers=AUTH_HEADERS
+    )
+    artifact_id = published.json()["id"]
+
+    def _boom() -> None:
+        raise RuntimeError("converter exploded")
+
+    monkeypatch.setattr("src.export._converter", _boom, raising=True)
+    resp = api.client.get(f"/a/{artifact_id}/export/markdown")
+    assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/html")
     assert resp.headers["content-disposition"] == 'attachment; filename="notes.html"'
+    assert resp.headers["x-artifact-markdown-source"] == "none"
     assert resp.text == document
+
+
+# --------------------------------------------------------------------------
+# markdown_source: the author's own Markdown alongside a published HTML
+# --------------------------------------------------------------------------
+
+MS_HTML = (
+    "<html><head><title>Board deck</title></head>"
+    "<body><h1>Board deck</h1>"
+    "<canvas id=\"chart\" aria-label=\"Revenue\"></canvas></body></html>"
+)
+MS_MARKDOWN = "# Board deck\n\nRevenue chart: see the deck.\n"
+
+
+def _publish_html_with_markdown_source(api: Api) -> str:
+    resp = api.client.post(
+        "/api/artifacts",
+        json={
+            "html": MS_HTML,
+            "markdown_source": MS_MARKDOWN,
+            "title": "Board deck",
+        },
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def test_markdown_source_is_accepted_with_html_and_stored_on_the_version(
+    api: Api,
+) -> None:
+    artifact_id = _publish_html_with_markdown_source(api)
+    envelope = main.app.state.store.get_head(artifact_id)
+    assert envelope is not None
+    assert envelope.source_type == "html"
+    assert envelope.source["markdown"] == MS_MARKDOWN
+    # Rendering is untouched: the served document is the submitted HTML.
+    assert envelope.html == MS_HTML
+    assert api.client.get(f"/a/{artifact_id}/raw").text == MS_HTML
+
+
+def test_markdown_source_is_what_the_exports_serve(api: Api) -> None:
+    artifact_id = _publish_html_with_markdown_source(api)
+
+    export = api.client.get(f"/a/{artifact_id}/export/markdown")
+    assert export.status_code == 200
+    assert export.headers["content-type"].startswith("text/markdown")
+    assert export.headers["x-artifact-markdown-source"] == "original"
+    assert export.text == MS_MARKDOWN
+
+    source = api.client.get(f"/a/{artifact_id}/source")
+    assert source.status_code == 200
+    assert source.headers["content-type"].startswith("text/markdown")
+    assert source.text == MS_MARKDOWN
+
+    vault = api.client.get(f"/a/{artifact_id}/export/vault")
+    with zipfile.ZipFile(io.BytesIO(vault.content)) as archive:
+        document = archive.read("board-deck/document.md").decode("utf-8")
+    assert document == MS_MARKDOWN
+    assert "not exportable to Markdown" not in document
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"markdown": "# Hi\n", "markdown_source": MS_MARKDOWN},
+        {"git_url": "https://github.com/octocat/Hello-World", "markdown_source": MS_MARKDOWN},
+        {"markdown_source": MS_MARKDOWN},
+    ],
+    ids=["with-markdown", "with-git-url", "alone"],
+)
+def test_markdown_source_without_html_is_422(api: Api, payload: dict) -> None:
+    resp = api.client.post("/api/artifacts", json=payload, headers=AUTH_HEADERS)
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"] == (
+        "'markdown_source' is only valid together with 'html'"
+    )
+
+
+def test_markdown_source_is_rejected_the_same_way_on_update_and_versions(
+    api: Api,
+) -> None:
+    artifact_id = _publish_markdown(api, "# Hi\n", title="Hi")
+
+    update = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"markdown": "# Hi again\n", "markdown_source": MS_MARKDOWN},
+        headers=AUTH_HEADERS,
+    )
+    assert update.status_code == 422
+    assert update.json()["detail"] == (
+        "'markdown_source' is only valid together with 'html'"
+    )
+
+    version = api.client.post(
+        f"/api/artifacts/{artifact_id}/versions",
+        json={"markdown_source": MS_MARKDOWN},
+        headers=AUTH_HEADERS,
+    )
+    assert version.status_code == 422
+    assert version.json()["detail"] == (
+        "'markdown_source' is only valid together with 'html'"
+    )
+
+
+def test_markdown_source_rides_along_with_a_new_html_version(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Hi\n", title="Hi")
+    resp = api.client.post(
+        f"/api/artifacts/{artifact_id}/versions",
+        json={"html": MS_HTML, "markdown_source": MS_MARKDOWN, "title": "Board deck"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+
+    export = api.client.get(f"/a/{artifact_id}/export/markdown")
+    assert export.headers["x-artifact-markdown-source"] == "original"
+    assert export.text == MS_MARKDOWN
+    assert api.client.get(f"/a/{artifact_id}/raw").text == MS_HTML
 
 
 def test_export_markdown_of_unknown_artifact_is_404(api: Api) -> None:
