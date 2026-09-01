@@ -1254,6 +1254,7 @@ Keboola Storage API token, on any stack, is the only credential you need.</p>
 <a href="{base}/skill">/skill</a>
 <a href="{base}/agent">/agent</a>
 <a href="{base}/context">/context</a>
+<a href="{base}/changelog">Changelog</a>
 </div>
 </section>
 
@@ -1343,6 +1344,7 @@ two management headers.</p>
 <span class="spacer"></span>
 <a href="{base}/admin">Admin studio</a>
 <a href="{base}/agent">/agent</a>
+<a href="{base}/changelog">Changelog</a>
 <a href="{repo}">github.com/padak/kbc_ai_artifact</a>
 <a href="{base}/health">/health</a>
 </footer>

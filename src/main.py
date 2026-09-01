@@ -112,6 +112,12 @@ AGENT_PATH = (
     Path(__file__).resolve().parent.parent / "skills/artifact-hub-agent/AGENT.md"
 )
 
+#: Path of the repository changelog, served at ``/changelog`` (rendered) and
+#: ``/changelog.md`` (raw). Resolved exactly like :data:`SKILL_PATH`. Read
+#: fresh from disk on every request rather than cached at import, since it is
+#: expected to be rewritten by other tooling while this process is running.
+CHANGELOG_PATH = Path(__file__).resolve().parent.parent / "CHANGELOG.md"
+
 #: ``/a/{id}/diff/{spec}`` accepts exactly ``<older>..<newer>``.
 _DIFF_SPEC = re.compile(r"^(\d+)\.\.(\d+)$")
 
@@ -1692,6 +1698,24 @@ def context(request: Request) -> dict:
             },
             {
                 "method": "GET",
+                "path": "/changelog",
+                "auth": "none",
+                "purpose": (
+                    "rendered CHANGELOG.md, through the standard artifact "
+                    "template (HTML); read fresh from disk on every request"
+                ),
+            },
+            {
+                "method": "GET",
+                "path": "/changelog.md",
+                "auth": "none",
+                "purpose": (
+                    "raw CHANGELOG.md source (text/markdown), for machines; "
+                    "read fresh from disk on every request"
+                ),
+            },
+            {
+                "method": "GET",
                 "path": "/admin",
                 "auth": (
                     "none to load the page; the visitor's own storage token, "
@@ -2105,6 +2129,80 @@ def agent() -> Response:
         return JSONResponse(
             status_code=404, content={"error": "agent definition not available"}
         )
+    return Response(content=text, media_type="text/markdown; charset=utf-8")
+
+
+def _read_changelog() -> str | None:
+    """Read CHANGELOG.md fresh from disk; None when it cannot be read.
+
+    Deliberately not cached at import or module scope: another process may
+    rewrite the file while this one keeps running, and both /changelog and
+    /changelog.md must reflect the current content on every request.
+    """
+    try:
+        return CHANGELOG_PATH.read_text(encoding="utf-8")
+    except OSError:
+        logger.error("CHANGELOG.md not readable at %s", CHANGELOG_PATH)
+        return None
+
+
+def _changelog_not_found() -> JSONResponse:
+    return JSONResponse(
+        status_code=404, content={"error": "changelog not available"}
+    )
+
+
+@app.get(
+    "/changelog",
+    tags=["service"],
+    response_class=HTMLResponse,
+    summary="Rendered changelog",
+    description=(
+        "Serves CHANGELOG.md from the repository root, rendered through the "
+        "same Markdown template used for published artifacts (headings, "
+        "tables, dark mode). Read fresh from disk on every request, so "
+        "changes to the file appear immediately. Unauthenticated, and "
+        "identical for every caller. Use /changelog.md for the raw source."
+    ),
+    responses={
+        200: {"description": "The rendered changelog page.", "content": CONTENT_HTML},
+        404: {"description": "CHANGELOG.md is not readable on this deployment."},
+    },
+)
+def changelog() -> Response:
+    """Serve CHANGELOG.md rendered through the standard artifact template."""
+    text = _read_changelog()
+    if text is None:
+        return _changelog_not_found()
+    built = builder.build_from_markdown(text)
+    return HTMLResponse(built.html)
+
+
+@app.get(
+    "/changelog.md",
+    tags=["service"],
+    response_class=MarkdownResponse,
+    summary="Raw changelog source",
+    description=(
+        "Serves CHANGELOG.md from the repository root verbatim as "
+        "text/markdown, for machines that want the source rather than the "
+        "rendered page. Read fresh from disk on every request. "
+        "Unauthenticated, and identical for every caller. Use /changelog for "
+        "the rendered HTML page."
+    ),
+    responses={
+        200: {
+            "description": "The CHANGELOG.md document.",
+            "content": CONTENT_MARKDOWN,
+        },
+        404: {"description": "CHANGELOG.md is not readable on this deployment."},
+    },
+)
+def changelog_md() -> Response:
+    """Serve CHANGELOG.md verbatim as text/markdown."""
+    text = _read_changelog()
+    if text is None:
+        return _changelog_not_found()
     return Response(content=text, media_type="text/markdown; charset=utf-8")
 
 

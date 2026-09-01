@@ -28,6 +28,8 @@ capabilities before publishing. For interactive exploration, `GET /docs`
 serves a Swagger UI and `GET /openapi.json` the underlying OpenAPI schema.
 If anything below ever looks stale, `/skill` and `/context` are always the
 current truth — re-fetch them rather than trusting a cached copy of this file.
+For what changed in the hub service itself, see `GET /changelog` (rendered
+page) or `GET /changelog.md` (raw source).
 
 `GET /agent` serves a ready-to-install Claude Code subagent that knows this
 entire API (auth, publishing, versioning, moderation) without needing this
@@ -67,6 +69,71 @@ from the response — it never stores your token.
 
 **Never put the token in a URL, query string, or the request body.** It only
 ever belongs in the `X-StorageApi-Token` header.
+
+## Workflows
+
+Three end-to-end walkthroughs showing how the pieces below fit together in
+practice. Every endpoint and field named here is documented in full further
+down this file (*Publishing*, *Versioning*, *Inline comments*, *Export*) —
+this section is the sequence, not the reference.
+
+### 1. Share a document with the team ("project brain")
+
+1. Publish the document as Markdown with `accept_versions_mode: "allowlist"`
+   and a `contributors` list set up front (see *Project-brain settings*
+   below), so only your intended collaborators can add versions or comments.
+2. Send everyone **one link** — the artifact's `url`. There is nothing else
+   to distribute; no accounts to create.
+3. Each colleague's agent fetches `GET /skill` (or installs the ready-made
+   subagent at `GET /agent`) to learn the API, then — before contributing
+   anything — reads `GET /a/{id}/meta`, `GET /a/{id}/versions`, and
+   `GET /a/{id}/comments`, in that order, to see the current `status` and
+   what others have already proposed or said.
+4. Each contributor does their own research locally, then contributes back
+   at the right granularity: an inline comment on a quoted passage
+   (`POST /api/artifacts/{id}/comments`), or a full proposed version with an
+   explanatory `note` (`POST /api/artifacts/{id}/versions`) when the change
+   is substantive.
+5. The owner reviews proposals as diffs, either in `/admin` or
+   `/a/{id}/review`, and promotes (`POST
+   /api/artifacts/{id}/versions/{n}/promote`) or rejects (`DELETE
+   /api/artifacts/{id}/versions/{n}`) each one. Discussion continues in the
+   comment threads — replies via `POST .../comments/{tid}/replies`,
+   resolution via `POST .../comments/{tid}/resolve`.
+6. When the team reaches consensus, the owner sets `PUT
+   /api/artifacts/{id}` with `{"status": "final"}`, freezing further
+   versions and comments for everyone. Everyone then pulls `GET
+   /a/{id}/export/vault` — the archived knowledge base, including the
+   `reasoning.md` trail of who proposed and said what, and when.
+
+### 2. Peer review of a single document
+
+1. Publish the document (`POST /api/artifacts`).
+2. Send reviewers the `GET /a/{id}/review` link. Each reviewer signs in by
+   pasting their own Storage token, which stays client-side in the browser's
+   `sessionStorage` and is never sent to or stored by the hub — then
+   highlights text in the rendered document to open a comment composer
+   anchored to that passage.
+3. The author reads the threads (`GET /a/{id}/comments`), addresses the
+   feedback, and publishes a new version that resolves them (`POST
+   /api/artifacts/{id}/versions`).
+4. The author marks the addressed threads resolved (`POST
+   .../comments/{tid}/resolve`).
+5. The author exports the final head as Markdown (`GET
+   /a/{id}/export/markdown`) for use outside the hub.
+
+### 3. Machine-to-machine pipeline
+
+1. An automated job publishes a generated report on every run via `PUT
+   /api/artifacts/{id}` — each run adds a new **live** version; nothing is
+   ever overwritten.
+2. Consumers read the current output with `GET /a/{id}/raw` (the rendered
+   content) or `GET /a/{id}/meta` (status and version counts) — both are
+   public reads, no token required.
+3. `GET /a/{id}/versions` is the audit trail of every run.
+4. `GET /a/{id}/diff/{a}..{b}?format=unified` shows exactly what changed
+   between two runs — the fastest way for an agent to summarize what a given
+   run changed.
 
 ## Publishing
 

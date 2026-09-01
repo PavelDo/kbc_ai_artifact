@@ -214,6 +214,8 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("GET", "/context"),
         ("GET", "/skill"),
         ("GET", "/agent"),
+        ("GET", "/changelog"),
+        ("GET", "/changelog.md"),
         ("GET", "/admin"),
         ("GET", "/docs"),
         ("GET", "/openapi.json"),
@@ -281,6 +283,25 @@ def test_context_documents_the_agent_and_admin_endpoints(api: Api) -> None:
     admin = by_path["/admin"]
     assert admin["method"] == "GET"
     assert "sessionStorage" in admin["purpose"]
+
+
+def test_changelog_renders_the_repository_file_as_html(api: Api) -> None:
+    resp = api.client.get("/changelog")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "<h1" in resp.text
+    assert "Changelog" in resp.text
+
+
+def test_changelog_md_serves_the_raw_file(api: Api) -> None:
+    """Echoes the file's own first line so this survives a rewritten placeholder."""
+    expected_first_line = main.CHANGELOG_PATH.read_text(
+        encoding="utf-8"
+    ).splitlines()[0]
+    resp = api.client.get("/changelog.md")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/markdown")
+    assert resp.text.splitlines()[0] == expected_first_line
 
 
 # --------------------------------------------------------------------------
