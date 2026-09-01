@@ -613,6 +613,15 @@ over the wikilinks is the knowledge graph — nothing else to run. Both export
 endpoints are password-gated like other reads. Offer this to the user once an
 artifact is marked `final`, as the permanent archived record of the review.
 
+Building a vault is the heaviest request this service serves, so it is
+budgeted. An artifact whose visible history and comments exceed the hub's
+`HUB_EXPORT_MAX_BYTES` answers **413** without building anything — fall back
+to `GET /a/{id}/export/markdown` for the served version, and tell the user the
+full history is too large to package. One client address may build a bounded
+number of vaults of one artifact per hour (`HUB_MAX_EXPORTS_PER_HOUR`); past
+that the answer is **429**, so do not loop over this endpoint or re-download a
+vault you already have.
+
 ### Reading endpoints (public, no token — good for machine/agent consumption)
 
 | Endpoint | Returns |
@@ -628,7 +637,7 @@ artifact is marked `final`, as the permanent archived record of the review.
 | `GET /a/{id}/guest` | Resolve an `X-Artifact-Guest` credential to its display name |
 | `GET /a/{id}/review` | Browser review UI (select text to comment, sandboxed artifact; also the guest entry point) |
 | `GET /a/{id}/export/markdown` | Head version as Markdown — the author's own, else converted from the HTML; `X-Artifact-Markdown-Source: original\|converted` says which |
-| `GET /a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault |
+| `GET /a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault; 413 when the history is over `HUB_EXPORT_MAX_BYTES`, 429 over `HUB_MAX_EXPORTS_PER_HOUR` builds per hour |
 | `GET /changelog` | Rendered changelog, hub's own design |
 
 If password-protected, send `X-Artifact-Password: <password>` on these; a

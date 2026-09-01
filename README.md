@@ -55,7 +55,12 @@ content, source, or metadata over a small JSON API.
 - **Obsidian vault export** (`GET /a/{id}/export/vault`): a ZIP containing a
   ready-to-open vault — an `INDEX.md` hub, one note per version with its diff,
   one note per comment thread, and a chronological `reasoning.md` timeline —
-  so Obsidian's own graph view becomes the artifact's knowledge graph
+  so Obsidian's own graph view becomes the artifact's knowledge graph. It is
+  the most expensive request this service serves, so it is budgeted: an
+  artifact whose visible history exceeds `HUB_EXPORT_MAX_BYTES` is refused
+  with 413, one client may build `HUB_MAX_EXPORTS_PER_HOUR` vaults of one
+  artifact per hour, and the archive is streamed through an owner-only
+  temporary file rather than assembled in memory
 - **Contributor allowlist**: `accept_versions_mode` and `comments_mode` can
   each be `off` / `anyone` / `allowlist`, restricting who may submit versions
   or comment to a `contributors` list of Keboola projects
@@ -192,7 +197,7 @@ Public (no auth):
 | GET | `/a/{id}/guest` | Resolve an `X-Artifact-Guest` credential to its display name |
 | GET | `/a/{id}/review` | Browser review UI: select text to comment, sandboxed artifact iframe; also the guest entry point via a `#invite=` fragment |
 | GET | `/a/{id}/export/markdown` | Head version as Markdown: the author's own source when there is one, otherwise converted from the HTML document (lossy for charts and images). `X-Artifact-Markdown-Source: original\|converted` reports which |
-| GET | `/a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, reasoning timeline) |
+| GET | `/a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, reasoning timeline), streamed rather than held in memory; 413 above `HUB_EXPORT_MAX_BYTES`, 429 above `HUB_MAX_EXPORTS_PER_HOUR` |
 | GET | `/changelog` / `/changelog.md` | Rendered changelog (hub's own design) / raw source |
 | GET | `/health` | Liveness check + service version + index stats |
 
@@ -452,6 +457,8 @@ are missing. Everything else has a documented default, overridable via env.
 | `HUB_WEBHOOK_QUEUE_MAX` | `1000` | Queued-but-undelivered webhook deliveries kept at once; past this the newest is dropped with a log line rather than blocking the request that produced it |
 | `HUB_MAX_WEBHOOKS_PER_ARTIFACT` | `5` | How many webhook URLs one artifact may register |
 | `HUB_MAX_INVITATIONS_PER_ARTIFACT` | `20` | How many live guest invitations one artifact may hold at once (revoked ones are reclaimed automatically to make room) |
+| `HUB_EXPORT_MAX_BYTES` | `67108864` (64 MB) | Ceiling on the source material one vault export may render, and on the archive it writes; a larger artifact answers 413 before anything is built (`0` disables the bound) |
+| `HUB_MAX_EXPORTS_PER_HOUR` | `20` | Vault exports of one artifact one client address may build per UTC hour before the export answers 429 |
 
 ## Deployment to Keboola
 

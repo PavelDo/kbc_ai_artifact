@@ -46,6 +46,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import (
+    FileResponse,
     HTMLResponse,
     JSONResponse,
     PlainTextResponse,
@@ -53,6 +54,7 @@ from fastapi.responses import (
     Response,
 )
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from src import builder, export
 from src.auth import (
@@ -3274,7 +3276,9 @@ def context(request: Request) -> dict:
                 "purpose": (
                     "the whole artifact as a ready-to-open Obsidian vault "
                     "(application/zip): INDEX.md, document.md, versions/, "
-                    "comments/ and reasoning.md"
+                    "comments/ and reasoning.md. Budgeted: 413 above "
+                    "HUB_EXPORT_MAX_BYTES of history, 429 above "
+                    "HUB_MAX_EXPORTS_PER_HOUR builds per client per hour"
                 ),
             },
             {
@@ -3755,6 +3759,8 @@ def context(request: Request) -> dict:
             "webhook_max_attempts": settings.webhook_max_attempts,
             "max_invitations_per_artifact": settings.max_invitations_per_artifact,
             "max_invitation_name_chars": MAX_INVITATION_NAME_CHARS,
+            "export_max_bytes": settings.export_max_bytes,
+            "max_exports_per_hour": settings.max_exports_per_hour,
         },
         "notes": [
             "GET /a/{id} and /a/{id}/v/{n} return a wrapper page whose "
@@ -3775,6 +3781,13 @@ def context(request: Request) -> dict:
             "per artifact per client address per hour the answer is 429. "
             "Verifying an invitation secret costs a full PBKDF2, so an "
             "unthrottled public probe would be a CPU-exhaustion primitive.",
+            "GET /a/{id}/export/vault is the most expensive read here: it "
+            "diffs every visible version and converts every HTML document. It "
+            f"refuses an artifact whose history exceeds {settings.export_max_bytes} "
+            "bytes with 413 before building anything, and allows "
+            f"{settings.max_exports_per_hour} builds of one artifact per "
+            "client address per hour before answering 429. Pull a vault once "
+            "and keep it; do not poll it.",
             "A version published from a private repository (one that needed "
             "git_token) reports git.private true in public metadata and "
             "history, and its git.url is withheld.",
@@ -4447,9 +4460,10 @@ def read_meta(
     )
 
 
-#: The snapshot fields ``GET /a/{id}/live`` hashes into its ETag. Kept as an
-#: explicit tuple so the ETag can never start depending on something that is
-#: not in the body a client would receive.
+#: The fields ``GET /a/{id}/live`` reports. Kept as an explicit tuple because
+#: :func:`_live_etag` has to stay a *complete* summary of them: every one of
+#: these must be reachable only through a mutation that bumps an artifact's
+#: revision, or the ETag would go stale while the body moved.
 _LIVE_FIELDS = (
     "id",
     "head_version",
@@ -4463,11 +4477,17 @@ _LIVE_FIELDS = (
 
 
 def _live_snapshot(request: Request, meta: ArtifactMeta) -> dict:
-    """The tiny change-detection payload behind ``GET /a/{id}/live``."""
+    """The tiny change-detection payload behind ``GET /a/{id}/live``.
+
+    Built only when the ETag did *not* match, since this is the expensive
+    half: it enumerates versions and comment threads. The result is projected
+    through :data:`_LIVE_FIELDS` so the body can never quietly grow a field
+    the revision-derived ETag does not summarise.
+    """
     store = request.app.state.store
     head = store.get_head(meta.id)
     versions = store.list_versions(meta.id)
-    return {
+    snapshot = {
         # The public identifier, exactly as /a/{id}/meta reports it: a
         # capability-URL holder is not entitled to the internal id.
         "id": meta.share_id,
@@ -4481,19 +4501,44 @@ def _live_snapshot(request: Request, meta: ArtifactMeta) -> dict:
         "document_status": meta.status,
         "contributions_frozen": meta.is_frozen(),
     }
+    return {key: snapshot[key] for key in _LIVE_FIELDS}
 
 
-def _live_etag(snapshot: dict) -> str:
-    """A strong ETag over a canonical serialisation of the snapshot.
+def _live_etag(request: Request, meta: ArtifactMeta) -> str:
+    """A strong ETag for ``GET /a/{id}/live``, derived without reading anything.
 
-    Canonical (sorted keys, no incidental whitespace) so every replica of this
-    app derives the same tag from the same state — which is exactly why
-    polling was chosen over a per-process subscription. Truncated to 32 hex
-    characters: still 128 bits, and short enough to keep the request header
-    small when a browser echoes it back on every poll.
+    Closes REL-100-003. This used to hash the finished snapshot, which meant a
+    poll had to enumerate every version and every comment thread *before* it
+    could discover that the answer was 304 — so the conditional request saved
+    response bytes but none of the work, and a page left open in a tab (or a
+    capability-URL holder in a loop) could amplify a trivial request into
+    repeated Storage listings and envelope parsing. Now the tag comes from two
+    in-memory counters, so an unchanged artifact costs one dictionary lookup
+    each.
+
+    The tag is a complete summary of :data:`_LIVE_FIELDS` because every one of
+    those fields is reachable only through a store mutation that bumps a
+    revision: ``head_version``, ``versions_count`` and ``proposed_count``
+    through the version writes and deletes, ``id`` (the share id),
+    ``updated_at``, ``document_status`` and ``contributions_frozen`` through
+    the meta save every artifact-level change goes through, and
+    ``comment_threads`` through the comment store's own ledger. That the two
+    counters are in memory rather than persisted is exact, not approximate,
+    under this service's single-writer deployment — see
+    :class:`~src.store.RevisionLedger` for the argument, and for why a boot
+    nonce makes a restart re-issue fresh tags instead of stale ones.
+
+    Truncated to 32 hex characters: still 128 bits, and short enough to keep
+    the request header small when a browser echoes it back on every poll.
     """
-    payload = {key: snapshot.get(key) for key in _LIVE_FIELDS}
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    parts = [
+        # The share id, so a rotated link never inherits the old link's tag
+        # even at the same revision.
+        meta.share_id,
+        request.app.state.store.revision(meta.id),
+        request.app.state.comments.revision(meta.id),
+    ]
+    canonical = json.dumps(parts, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
     return f'"{digest}"'
 
@@ -4534,11 +4579,16 @@ def _etag_matches(header: str | None, etag: str) -> bool:
         "studio poll, roughly every ten seconds while their tab is visible, "
         "to update a reader's screen without a reload. Polling — rather than "
         "server-sent events or a websocket — because this service runs behind "
-        "a buffering platform proxy and may run more than one replica; a "
-        "conditional GET survives both.\n\n"
-        "The response carries a strong `ETag` computed from those fields. "
-        "Send it back as `If-None-Match` and an unchanged artifact answers "
-        "**304 with no body**, which is what makes polling this cheap. "
+        "a buffering platform proxy that would hold a long-lived stream; a "
+        "conditional GET survives it.\n\n"
+        "The response carries a strong `ETag`. Send it back as "
+        "`If-None-Match` and an unchanged artifact answers **304 with no "
+        "body** — and without the server enumerating anything either: the "
+        "tag is derived from a per-artifact revision counter that "
+        "every mutation bumps, so an unchanged poll is answered from memory. "
+        "The tag is opaque and process-local; after a restart the same "
+        "artifact answers with a *new* tag and one extra refresh, which is "
+        "the safe direction to be wrong in. "
         "`Cache-Control: no-store` keeps any intermediary from ever serving a "
         "stale snapshot in place of a fresh one.\n\n"
         "Like GET /a/{id}/meta — and unlike every content endpoint — this is "
@@ -4579,12 +4629,14 @@ def read_live(
     meta = _public_meta_of(request, public_id)
     if meta is None:
         return _not_found(public_id)
-    snapshot = _live_snapshot(request, meta)
-    etag = _live_etag(snapshot)
+    # The ETag first, and the snapshot only if it does not match: enumerating
+    # versions and threads to build a body nobody will receive is exactly the
+    # amplification REL-100-003 describes.
+    etag = _live_etag(request, meta)
     headers = {"ETag": etag, "Cache-Control": "no-store"}
     if _etag_matches(request.headers.get("if-none-match"), etag):
         return Response(status_code=304, headers=headers)
-    return JSONResponse(snapshot, headers=headers)
+    return JSONResponse(_live_snapshot(request, meta), headers=headers)
 
 @app.get(
     "/a/{artifact_id}/v/{version}",
@@ -5109,12 +5161,80 @@ def export_markdown(
     )
 
 
+# --------------------------------------------------------------------------
+# Vault export budgets (REL-100-002)
+#
+# Building a vault is the most expensive thing an unauthenticated caller can
+# ask this service to do: it diffs every visible version against its
+# predecessor and converts every HTML-authored one to Markdown. Two bounds sit
+# in front of it, using the same counter machinery as every other limit here —
+# a size ceiling on what a single build may chew through, and an hourly budget
+# on how often one client may ask for a build of one artifact.
+# --------------------------------------------------------------------------
+
+#: Counter scope for vault builds; keyed ``{artifact_id}:{client_ip}``, bucketed
+#: by UTC hour, exactly like the unlock throttle.
+COUNTER_EXPORTS = "exports"
+
+
+def _claim_export_slot(
+    app_obj: FastAPI | None, artifact_id: str, client_ip: str
+) -> bool:
+    """Count one vault build; False once the hourly budget is spent.
+
+    Bumped whether or not the budget was still open, like every other
+    ``_claim_*`` here: a caller who keeps hammering a spent budget keeps being
+    counted, so the window is self-limiting rather than a retry loop.
+    """
+    used = _bump_counter(
+        app_obj,
+        COUNTER_EXPORTS,
+        _counter_key(artifact_id, client_ip),
+        _utc_hour(),
+    )
+    return used <= settings.max_exports_per_hour
+
+
+def _export_rate_limited() -> JSONResponse:
+    """429 for a spent vault-export budget, in the shape the other limits use."""
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "too many exports this hour",
+            "detail": (
+                f"At most {settings.max_exports_per_hour} vault exports of "
+                "one artifact may be built per client address per hour "
+                "(HUB_MAX_EXPORTS_PER_HOUR)."
+            ),
+            "limit": settings.max_exports_per_hour,
+        },
+    )
+
+
+def _export_too_large(size: int, limit: int) -> JSONResponse:
+    """413 for an artifact whose history is too large to export at all."""
+    return JSONResponse(
+        status_code=413,
+        content={
+            "error": "export too large",
+            "detail": (
+                f"This artifact's visible history and comments come to about "
+                f"{size} characters, over this hub's {limit}-byte export "
+                "ceiling (HUB_EXPORT_MAX_BYTES). Ask the owner to delete "
+                "older versions, or export a single version with "
+                "GET /a/{id}/export/markdown."
+            ),
+            "limit": limit,
+        },
+    )
+
+
 @app.get(
     "/a/{artifact_id}/export/vault",
     tags=["public"],
     summary="Download an Obsidian vault of the whole artifact",
     description=(
-        "Builds an in-memory ZIP holding a ready-to-open Obsidian vault: "
+        "Builds a ZIP holding a ready-to-open Obsidian vault: "
         "INDEX.md (a wikilink hub), document.md (the served version), "
         "versions/v{n}.md (one note per version — proposals included — with "
         "author, date, status, note and a diff against its predecessor), "
@@ -5122,7 +5242,14 @@ def export_markdown(
         "and the resolution) and reasoning.md, a chronological trail of how "
         "the document ended up this way.\n\n"
         "The archive is deterministic: the same artifact state always "
-        "produces byte-identical bytes.\n\n" + PASSWORD_GATE_NOTE
+        "produces byte-identical bytes.\n\n"
+        "Two bounds guard the build, because it is the most expensive thing "
+        "an unauthenticated caller can ask for. An artifact whose visible "
+        "history and comments exceed HUB_EXPORT_MAX_BYTES is refused with "
+        "**413** before anything is rendered; export a single version with "
+        "GET /a/{id}/export/markdown instead. And one client address may "
+        "build HUB_MAX_EXPORTS_PER_HOUR vaults of one artifact per hour, "
+        "after which the answer is **429**.\n\n" + PASSWORD_GATE_NOTE
     ),
     responses={
         200: {
@@ -5136,7 +5263,20 @@ def export_markdown(
             )
         },
         404: RESP_NOT_FOUND,
-        429: RESP_UNLOCK_429,
+        413: {
+            "description": (
+                "This artifact's visible history and comments are larger than "
+                "HUB_EXPORT_MAX_BYTES; no archive was built."
+            )
+        },
+        429: {
+            "description": (
+                "Either this client address built HUB_MAX_EXPORTS_PER_HOUR "
+                "vaults of this artifact in the current hour, or it made "
+                "HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR failed password attempts "
+                "on it."
+            )
+        },
         502: RESP_HUB_502,
     },
 )
@@ -5152,6 +5292,13 @@ def export_vault(
     if not reader_allowed(meta, request):
         return _password_required()
 
+    # Budgets are claimed after the password gate, so a protected artifact's
+    # export budget cannot be spent by somebody who never got past it, and
+    # keyed by the *internal* id, so rotating the link does not hand a caller
+    # a fresh allowance.
+    if not _claim_export_slot(request.app, meta.id, _client_ip(request)):
+        return _export_rate_limited()
+
     store = request.app.state.store
     # Proposals are moderated content: the public vault must not leak them.
     # Only the owner or a proposal's author (authenticated via the standard
@@ -5164,12 +5311,61 @@ def export_vault(
             envelopes.append(envelope)
     threads = request.app.state.comments.list_for(meta.id)
 
-    filename, payload = export.build_vault(meta, envelopes, threads)
-    return Response(
-        content=payload,
+    # Refuse an oversized artifact *before* rendering: the estimate is a cheap
+    # sum over material already in hand, while the build that follows diffs
+    # and converts all of it (REL-100-002).
+    limit = settings.export_max_bytes
+    estimate = export.vault_source_chars(envelopes, threads)
+    if 0 < limit < estimate:
+        logger.info(
+            "Refusing a vault export of artifact %s: about %d characters "
+            "of source, over the %d limit",
+            meta.id, estimate, limit,
+        )
+        return _export_too_large(estimate, limit)
+
+    # Streamed into an owner-only scratch file rather than a BytesIO: the peak
+    # memory of an anonymous request must not be the caller's to choose.
+    try:
+        filename, path, size = export.build_vault_file(
+            meta, envelopes, threads, settings.cache_dir, max_bytes=limit
+        )
+    except export.ExportTooLarge as exc:
+        # The write-time backstop fired, so the estimate under-counted. The
+        # partial file is already gone; report the same 413 as the estimate.
+        logger.warning(
+            "Vault export of artifact %s overran the %d byte ceiling while "
+            "being written (estimate said %d)",
+            meta.id, exc.limit, estimate,
+        )
+        return _export_too_large(exc.size, exc.limit)
+    except OSError as exc:
+        logger.error("Cannot write a vault export of artifact %s: %s", meta.id, exc)
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "export unavailable",
+                "detail": "The vault could not be written on the server.",
+            },
+        )
+
+    logger.info("Built a %d byte vault export of artifact %s", size, meta.id)
+    return FileResponse(
+        path,
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        # The scratch file holds a full copy of an artifact that may be
+        # password-protected; it lives exactly as long as the response does.
+        background=BackgroundTask(_unlink_export, path),
     )
+
+
+def _unlink_export(path: Path) -> None:
+    """Remove a finished export's scratch file. Never raises into serving."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:  # noqa: BLE001 - cleanup must not break a response
+        logger.warning("Could not remove the export scratch file %s: %s", path, exc)
 
 
 @app.get(
