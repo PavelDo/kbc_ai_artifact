@@ -824,6 +824,17 @@ When you generate the content to publish yourself:
   502 body says how many threads still have files in Storage. Do not treat a
   502 as "already gone" -- the artifact is deliberately still there so the
   retry can authenticate.
+- **A `PUT` that answers 502 tells you what is in force — read the
+  `detail` before retrying.** An update carrying both new content and new
+  settings commits the settings that *narrow* access (a password, closing
+  submissions, `"status": "final"`) before the version, and the ones that
+  *widen* it (`clear_password`, reopening submissions, `"status": "draft"`)
+  after. So a partial failure is never looser than what was there before, and
+  the 502 detail says which of three states you are in: nothing applied (retry
+  the whole call), the narrowing settings applied without the version (check
+  the settings, then retry), or the version live under the previous narrower
+  settings (resend just the settings). Never assume a 502 here means "nothing
+  happened".
 - **Always warn before `rotate-link`.** State plainly, before calling it,
   that the *current* link will stop working for absolutely everyone the
   instant the call succeeds, with no grace period and no way back — including
