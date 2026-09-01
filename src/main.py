@@ -4570,10 +4570,13 @@ def read_review(
     meta = _public_meta_of(request, public_id)
     if meta is None:
         return _not_found(public_id)
-    if not reader_allowed(meta, request):
-        # Unlocking here sets the same path-scoped cookie the page's own
-        # same-origin fetches then ride on.
-        return HTMLResponse(unlock_page(public_id, None), status_code=401)
+    # A protected artifact is deliberately NOT answered with the standalone
+    # unlock form here. This shell carries no artifact content and no
+    # credential — everything it displays comes from /raw, /versions and
+    # /comments, which stay gated — so serving it while locked reveals
+    # nothing. Redirecting to the standalone form instead would navigate away
+    # and drop the URL fragment, which is exactly where an invited guest's
+    # credential lives; the page's own unlock panel keeps the guest in place.
     # The page's own fetches are all /a/{...} reads, so it gets the *public*
     # identifier — the one those URLs have to carry.
     return HTMLResponse(

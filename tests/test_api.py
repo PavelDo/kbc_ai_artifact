@@ -2629,16 +2629,36 @@ def test_review_page_of_unknown_artifact_is_404(api: Api) -> None:
     assert api.client.get("/a/nope/review").status_code == 404
 
 
-def test_review_page_of_a_protected_artifact_shows_the_unlock_form(api: Api) -> None:
+def test_review_shell_is_served_locked_while_its_data_stays_gated(api: Api) -> None:
+    """The review shell is served even for a protected artifact.
+
+    Answering with the standalone unlock form instead would navigate away and
+    drop the URL fragment, which is where an invited guest's credential lives.
+    The shell carries no artifact content and no credential, so serving it
+    while locked reveals nothing; the data endpoints stay gated and the page's
+    own unlock panel asks for the password in place.
+    """
     artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
-    locked = api.client.get(f"/a/{artifact_id}/review")
-    assert locked.status_code == 401
-    assert "Password required" in locked.text
+
+    shell = api.client.get(f"/a/{artifact_id}/review")
+    assert shell.status_code == 200
+    # The review shell, not the standalone unlock page: the standalone form
+    # navigates (it posts through a real <form action>), which is what would
+    # discard a guest's URL fragment. The shell asks in place instead.
+    assert 'action="/a/' not in shell.text
+    assert "rv-lock-password" in shell.text
+    assert "rv-doc" in shell.text
+    assert "Secret" not in shell.text
+
+    # The content itself is still refused until the password is supplied.
+    assert api.client.get(f"/a/{artifact_id}/raw").status_code == 401
+    assert api.client.get(f"/a/{artifact_id}/comments").status_code == 401
 
     unlocked = api.client.post(
         f"/a/{artifact_id}/unlock", data={"password": "hunter2"}, follow_redirects=False
     )
     assert unlocked.status_code == 303
+    assert api.client.get(f"/a/{artifact_id}/raw").status_code == 200
     assert api.client.get(f"/a/{artifact_id}/review").status_code == 200
 
 
