@@ -56,6 +56,7 @@ the irreversible purge.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 import logging
 import os
 import threading
@@ -210,15 +211,33 @@ def _stack_host(stack_url: str) -> str:
     return urlsplit(stack_url).hostname or ""
 
 
+def _clean_revoked(entry: dict) -> bool:
+    """Read one invitation's ``revoked`` flag, failing closed on anything odd.
+
+    ``True``/``False`` are honoured, an absent key means "not revoked", and
+    every other value -- a string, a number, a container -- is treated as
+    revoked, because a revocation flag we cannot read must not keep granting
+    access.
+    """
+    if "revoked" not in entry:
+        return False
+    return entry["revoked"] is not False
+
+
 def _clean_invitations(raw: object) -> list[dict]:
     """Normalize a guest-invitation list read from an untrusted meta record.
 
     An entry survives only when it carries a non-empty string ``id`` and a
     ``secret`` that is at least shaped like a hash record (a dict) — anything
     else could never authenticate a guest, so keeping it would only grow the
-    meta file. The remaining fields are coerced rather than dropped, so a
-    half-written entry degrades to an unnamed, non-revoked invitation instead
-    of taking the whole artifact down.
+    meta file. The remaining descriptive fields are coerced rather than
+    dropped, so a half-written entry degrades to an unnamed invitation
+    instead of taking the whole artifact down. ``revoked`` is the exception:
+    it is a security decision, so it is read strictly and fails closed (see
+    :func:`_clean_revoked`).
+
+    This is the single place invitation records are normalized -- every
+    reader downstream may therefore assume ``revoked`` is a real bool.
     """
     if not isinstance(raw, list):
         return []
@@ -242,7 +261,13 @@ def _clean_invitations(raw: object) -> list[dict]:
                 "name": str(entry.get("name") or ""),
                 "secret": secret,
                 "created_at": str(entry.get("created_at") or ""),
-                "revoked": bool(entry.get("revoked")),
+                # A revocation flag fails closed. Strict identity, not
+                # truthiness: bool("false") is True while bool(0) is False,
+                # so coercion lets the value's *type* decide whether a guest
+                # still has a voice. A missing key is the one benign case --
+                # that is simply an invitation written before this field --
+                # so it keeps meaning "not revoked".
+                "revoked": _clean_revoked(entry),
             }
         )
     return cleaned
@@ -342,6 +367,13 @@ class ArtifactMeta:
     # Declared last so every positional argument keeps the meaning it had
     # before 0.7.0.
     invitations: list[dict] = field(default_factory=list)
+    # Highest version number ever allocated, kept so a number outlives the
+    # version that held it: links, comment anchors and diffs all name versions
+    # by number, and the newest one being deleted must not hand its number to
+    # whatever is submitted next. Only ever written when the newest version is
+    # deleted; 0 (or absent, for every older meta file) means "nothing beyond
+    # what exists", which is exactly what max(existing) already gives.
+    version_high_water: int = 0
 
     def __post_init__(self) -> None:
         """Normalize the enum-ish fields so an unknown value can never leak in."""
@@ -450,6 +482,7 @@ class ArtifactMeta:
             "updated_at": self.updated_at,
             "schema": self.schema,
             "invitations": self.invitations,
+            "version_high_water": self.version_high_water,
         }
         return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -535,6 +568,13 @@ class ArtifactMeta:
             updated_at=data.get("updated_at") or "",
             schema=schema if isinstance(schema, int) else SCHEMA_VERSION,
             invitations=invitations if isinstance(invitations, list) else [],
+            version_high_water=(
+                high_water
+                if isinstance(high_water := data.get("version_high_water"), int)
+                and not isinstance(high_water, bool)
+                and high_water > 0
+                else 0
+            ),
         )
 
 
@@ -801,6 +841,13 @@ class _ArtEntry:
     # allocation picks a distinct number without a half-written slot ever being
     # served. See :meth:`ArtifactStore.add_version_next`.
     reserving: set[int] = field(default_factory=set)
+    # Highest version number ever allocated for this artifact, including ones
+    # since deleted. Seeded from ``ArtifactMeta.version_high_water`` when the
+    # meta record is loaded or saved, raised in memory on every allocation, and
+    # persisted (via the meta record) when the newest version is deleted --
+    # the one event that can make ``max(existing) + 1`` hand an old number to
+    # new content. See :meth:`ArtifactStore.delete_version`.
+    high_water: int = 0
 
     def version_numbers(self) -> list[int]:
         """All known version numbers, ascending; a legacy file counts as v1.
@@ -815,10 +862,10 @@ class _ArtEntry:
 
     def next_free_number(self) -> int:
         """Lowest unused version number, counting reservations and legacy v1."""
-        numbers = set(self.versions) | self.reserving
+        numbers = set(self.versions) | self.reserving | {self.high_water}
         if self.legacy_file_id is not None:
             numbers.add(1)
-        return (max(numbers) + 1) if numbers else 1
+        return max(numbers) + 1 if max(numbers) > 0 else 1
 
 
 class ArtifactStore:
@@ -837,6 +884,7 @@ class ArtifactStore:
         max_versions: int,
         max_envelope_bytes: int = 20 * 1024 * 1024,
         max_proposed_versions: int = 50,
+        reap_aborted_after_s: int = 0,
     ) -> None:
         self._backend = backend
         self._cache_dir = Path(cache_dir)
@@ -847,6 +895,9 @@ class ArtifactStore:
         self._max_envelope_bytes = int(max_envelope_bytes)
         # <= 0 means "no cap".
         self._max_proposed_versions = max(0, int(max_proposed_versions))
+        # Seconds a meta record with no version may exist before hydrate
+        # treats it as an aborted publish and deletes it; 0 disables.
+        self._reap_aborted_after_s = max(0, int(reap_aborted_after_s))
         self._index: dict[str, _ArtEntry] = {}
         # Public share id -> artifact id, and its inverse. Share ids live inside
         # the meta *payload*, not in a Storage tag, so hydrate() cannot fill
@@ -886,6 +937,8 @@ class ArtifactStore:
             entry = index.setdefault(artifact_id, _ArtEntry())
             _absorb_file(entry, info)
 
+        self._reap_aborted_publishes(index, {info.id: info for info in files})
+
         with self._lock:
             self._index = index
             # Share ids are not derivable from tags, so a full rebuild starts
@@ -894,6 +947,54 @@ class ArtifactStore:
             self._share_of = {}
         logger.info("Hydrated index with %d artifact(s)", len(index))
         return len(index)
+
+    def _reap_aborted_publishes(
+        self, index: dict[str, _ArtEntry], files: dict[int, FileInfo]
+    ) -> None:
+        """Delete meta records that have no version and are too old to be in flight.
+
+        Publish writes the meta record first, so that a failed canonical
+        upload can be rolled back by deleting it; if the process dies between
+        that write and the version write, the record stays. It is inert --
+        every read answers 404 for it, because there is no head -- but it is
+        also invisible to every API and accumulates forever. Nothing else can
+        have this shape: a purge removes everything, the last live version
+        cannot be deleted, and a legacy envelope counts as a version.
+
+        Age is the whole safety argument. Right after a restart this very
+        shape is also what a publish looks like between its two writes, so
+        only a record older than ``reap_aborted_after_s`` is touched -- an
+        hour by default, against a request that takes seconds. A timestamp
+        that cannot be read is treated as young. Runs only from
+        :meth:`hydrate`, never from the lazy per-artifact fallback.
+        """
+        if self._reap_aborted_after_s <= 0:
+            return
+        for artifact_id, entry in list(index.items()):
+            if entry.meta_file_id is None or entry.versions or entry.legacy_file_id is not None:
+                continue
+            info = files.get(entry.meta_file_id)
+            age = _age_seconds(info.created) if info is not None else None
+            if age is None or age < self._reap_aborted_after_s:
+                logger.info(
+                    "Artifact %s has a meta record but no version; leaving it "
+                    "(age %s s, reaped after %d s)",
+                    artifact_id, "unknown" if age is None else int(age), self._reap_aborted_after_s,
+                )
+                continue
+            try:
+                self._backend.delete(entry.meta_file_id)
+            except Exception as exc:  # noqa: BLE001 - reaping is best effort
+                logger.warning(
+                    "Could not reap the aborted publish %s (meta file %s): %s",
+                    artifact_id, entry.meta_file_id, exc,
+                )
+                continue
+            del index[artifact_id]
+            logger.warning(
+                "Reaped aborted publish %s: meta file %s had no version for %d s",
+                artifact_id, entry.meta_file_id, int(age),
+            )
 
     def count(self) -> int:
         """Number of artifacts currently indexed."""
@@ -1001,6 +1102,7 @@ class ArtifactStore:
             entry.meta_file_id = file_id
             self._forget_meta_locked(artifact_id)
             self._remember_meta_locked(artifact_id, file_id, meta)
+            self._seed_high_water_locked(artifact_id, meta)
             # Keep the share index in step with what we just persisted; a
             # rotation drops the previous share id here (that revocation is the
             # whole point of rotating).
@@ -1254,6 +1356,10 @@ class ArtifactStore:
         needs shared state and is out of scope here.
         """
         artifact_id = env.id
+        # Loading the meta record seeds the high-water mark into the index, so
+        # a process that has not read this artifact yet cannot reuse a number
+        # a previous process retired. Cached after the first read.
+        self.get_meta(artifact_id)
         with self._lock:
             entry = self._index.setdefault(artifact_id, _ArtEntry())
             version = entry.next_free_number()
@@ -1276,6 +1382,7 @@ class ArtifactStore:
         with self._lock:
             entry = self._index.setdefault(artifact_id, _ArtEntry())
             entry.reserving.discard(version)
+            entry.high_water = max(entry.high_water, version)
             previous = entry.versions.get(version)
             entry.versions[version] = _VerEntry(
                 file_id=file_id, status=assigned.status, size_bytes=len(raw)
@@ -1417,6 +1524,10 @@ class ArtifactStore:
         allocating with it and a separate :meth:`add_version` is still racy —
         prefer :meth:`add_version_next` for the actual write.
         """
+        # Same seeding as add_version_next: without the meta record loaded, a
+        # fresh process would show max(existing) + 1 and contradict what the
+        # allocation is about to do.
+        self.get_meta(artifact_id)
         entry = self._resolve(artifact_id)
         if entry is None:
             return 1
@@ -1475,6 +1586,19 @@ class ArtifactStore:
                     artifact_id,
                 )
                 return False
+
+        if version == max(numbers):
+            # Deleting the newest version is the one event after which
+            # ``max(existing) + 1`` would hand this number to new content --
+            # and every link, comment anchor and diff that named it would
+            # silently point at something else. Persist the mark *before* the
+            # file goes: if this write fails the version simply stays, whereas
+            # the other order could lose the number across a restart.
+            meta = self.get_meta(artifact_id)
+            if meta is not None and meta.version_high_water < version:
+                self.save_meta(replace(meta, version_high_water=version))
+            with self._lock:
+                entry.high_water = max(entry.high_water, version)
 
         with self._lock:
             ver_entry = entry.versions.get(version)
@@ -1981,7 +2105,14 @@ class ArtifactStore:
             return None
         with self._lock:
             self._remember_meta_locked(artifact_id, file_id, meta)
+            self._seed_high_water_locked(artifact_id, meta)
         return meta
+
+    def _seed_high_water_locked(self, artifact_id: str, meta: ArtifactMeta) -> None:
+        """Carry the persisted high-water mark into the index. Caller holds the lock."""
+        entry = self._index.get(artifact_id)
+        if entry is not None and meta.version_high_water > entry.high_water:
+            entry.high_water = meta.version_high_water
 
     def _too_large(self, size: int | None) -> bool:
         """True when ``size`` exceeds the configured envelope byte bound."""
@@ -2158,6 +2289,21 @@ class ArtifactStore:
                 path.unlink(missing_ok=True)
             except OSError as exc:
                 logger.warning("Cannot prune disk cache %s: %s", path, exc)
+
+
+def _age_seconds(created: str) -> float | None:
+    """Seconds since an ISO timestamp as Storage reports it; None if unreadable.
+
+    Storage answers with an offset; a naive value is read as UTC. Unreadable
+    means "do not know", which the reaper treats as "too young to touch".
+    """
+    try:
+        stamp = datetime.fromisoformat((created or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - stamp).total_seconds()
 
 
 def _absorb_file(entry: _ArtEntry, info: FileInfo) -> None:

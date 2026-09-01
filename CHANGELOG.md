@@ -4,6 +4,118 @@ KBC Artifact Hub is one web address where you publish a document and
 collaborate on it with your team, secured by the Keboola account you already
 have.
 
+## 0.10.0 — Security review follow-up (2026-09-01)
+
+**If you run a webhook receiver, read the first item — it needs a change on
+your side.**
+
+- **Each webhook receiver is now signed with its own key.** Previously every
+  receiver verified deliveries with one key shared across the whole service,
+  so anyone running a single webhook could forge a delivery that looked
+  genuine for any other receiver and any document. Keys are now bound to the
+  document and the receiver URL. **Existing receivers will stop verifying:**
+  read your new key from `GET /api/artifacts/{id}/webhooks` (owner only) and
+  configure the receiver with it.
+- Verifying a password now refuses a stored record that asks for an
+  implausible amount of work, so a corrupted or tampered record can neither
+  tie up the service nor quietly weaken the check.
+- A comment thread's "resolved" mark and a guest invitation's "revoked" mark
+  are now read strictly. A malformed record can no longer close a thread that
+  is open, and an invitation whose revocation cannot be read is treated as
+  revoked rather than still valid.
+- Comparing two versions now requires the older one first. Asking for 5..3
+  used to answer with additions and removals swapped under labels claiming
+  the opposite; it is a clear error now.
+- Pages no longer pass their address on to anywhere they link or load from,
+  so a document's link cannot leak through a font request or an outbound
+  click.
+- The API reference now describes what the review page really does for a
+  password-protected document — it serves the page and asks for the password
+  in place, rather than the redirect it used to promise.
+- Documentation now says plainly that pending proposals are subject to their
+  own retention cap, instead of claiming they are kept forever.
+- The deployed image no longer ships a networking library with five known
+  vulnerabilities. Every release now fails automatically if a dependency with
+  a published advisory reaches the production dependency list.
+- A push notification is no longer sent to a destination the service could not
+  check. A name that fails to resolve at delivery time now stops the delivery
+  instead of being sent anyway, closing a way to redirect a notification to an
+  internal address.
+- Push notifications now carry an event id and a delivery id, so a receiver can
+  tell a retry from something new and avoid acting twice.
+- A receiver that stops answering can no longer make the service accumulate
+  pending notifications without limit; past a configurable ceiling
+  (`HUB_WEBHOOK_QUEUE_MAX`) the newest is dropped, and publishing is never held
+  up waiting for one.
+- An update that fails no longer leaves its settings behind. Changing a
+  password, policy or status together with new content used to apply the
+  settings first, so a failed upload answered with an error while the
+  security-relevant half had already taken effect. Content lands first now
+  and settings are written last, or not at all.
+- A failed publish or update no longer strands a copy of the document in the
+  author's own Keboola project. That copy could only ever be reached with the
+  caller's token during the request, so it is removed right there when the
+  version it was for fails to land; a publish that fails at its last step now
+  cleans up its own record as well.
+- A publish interrupted between its two writes used to leave an invisible,
+  unreachable record behind forever. Startup now reaps such records once they
+  are old enough that they cannot be a publish still in progress
+  (`HUB_REAP_ABORTED_PUBLISH_AFTER_S`).
+- Installing the AI agent definition is now a verified step. Each release
+  publishes `AGENT.md`, `SKILL.md` and their checksums as attested assets, and
+  the documented install downloads that copy, checks it and proves with
+  `gh attestation verify` that this project's release process produced it —
+  instead of copying whatever the live server happens to serve. `/agent` and
+  `/skill` now report their own digest and version, and `/context` points at
+  the matching release, so a server not running its own release can be
+  spotted before anything is installed.
+- Every documented API example now calls the service through a small shell
+  function instead of passing the token as a command-line argument, where it
+  was visible to anyone who could list processes on the machine for as long
+  as the call ran.
+- Two requests changing the same document at the same moment can no longer
+  act on a state that has just stopped being true. Every change to a document
+  now waits for the previous one to finish: two promotions of one proposal
+  fire once, two deletions cannot remove the last live version between them,
+  a document cannot be finalised underneath a submission already in flight,
+  and nothing can land in a document while it is being erased. Comments are
+  covered too, even though they address the document by its public link
+  rather than its id.
+- A deleted version's number is retired with it. Deleting the newest version
+  used to hand its number to whatever was submitted next, so every link,
+  comment and comparison that named it silently pointed at different content
+  — including after a restart.
+- The service now states its deployment shape plainly and watches for it
+  being broken: one hub is one container, serving one organisation. Its index,
+  locks and state snapshots are built for exactly one writer, so if a second
+  instance ever writes state, the log says so in as many words instead of the
+  two instances quietly overwriting each other.
+- Authorization is documented as it was always meant: any token from the
+  owning Keboola project has full owner authority, because the project is the
+  team. The security review had flagged this as a gap; it is the design.
+- Finalising a document now freezes its discussion too. Resolving, reopening
+  and withdrawing a comment used to keep working on a document marked final or
+  moved to the trash, so a "finished" record kept changing. The owner can still
+  delete a comment thread — a comment that has to come off a finished document
+  must stay removable.
+- A comment thread now has a size ceiling of its own: 500 replies and 2 MB.
+  Individual comments were capped, but nothing capped the thread they pile up
+  in, and a thread is rewritten whole on every reply and re-read on every
+  listing.
+- A comment, a resolve or a guest-invitation revocation that is refused no
+  longer shows up as if it had been accepted. A revocation that failed to save
+  used to read as revoked on the server that handled it while the guest kept
+  working everywhere else, and came back entirely after a restart.
+- Publishing from git now says plainly that `git_ref` takes a branch or a tag.
+  A commit id was documented as accepted but always failed inside git; it is
+  now refused with a message that says to tag the commit instead.
+- Permanently erasing a document can now actually be retried when it fails
+  partway. It previously removed the document before its comments, so a
+  failure left comments behind that nothing could reach or erase, and the
+  retry the error asked for reported the document as already gone. Comments
+  go first now, and the document stays until everything else is confirmed
+  erased.
+
 ## 0.9.0 — Documents you can hand to another tool (this release) (2026-09-01)
 
 - **Asking for a document in Markdown now actually gets you Markdown**,

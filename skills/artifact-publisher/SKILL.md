@@ -31,24 +31,27 @@ current truth — re-fetch them rather than trusting a cached copy of this file.
 For what changed in the hub service itself, see `GET /changelog` (rendered
 page) or `GET /changelog.md` (raw source).
 
-`GET /agent` serves a ready-to-install Claude Code subagent that knows this
-entire API (auth, publishing, versioning, moderation) without needing this
-skill loaded at all. Install it with:
+`GET /agent` serves the Claude Code subagent that knows this entire API
+(auth, publishing, versioning, moderation) without needing this skill loaded
+at all — the copy this hub runs, with `ETag`, `X-Content-SHA256` and
+`X-Hub-Version` so you can tell which. That endpoint is for *reading*. To
+**install** it, take the attested copy from the GitHub release of the version
+the hub reports; the installed file grants Bash/Read/WebFetch authority, and
+only the release copy can prove where it came from:
 
 ```bash
-install -d ~/.claude/agents && curl -fsSL "$HUB/agent" -o ~/.claude/agents/artifact-hub.md
+V=$(curl -fsSL "$HUB/health" | jq -r .version)
+D=$(mktemp -d)
+gh release download "v$V" --repo padak/kbc_ai_artifact -p AGENT.md -p SHA256SUMS -D "$D"
+( cd "$D" && grep ' AGENT.md$' SHA256SUMS | shasum -a 256 -c )   # integrity against the release
+gh attestation verify "$D/AGENT.md" --repo padak/kbc_ai_artifact  # built by this repo's release workflow
+install -d ~/.claude/agents && install -m 0644 "$D/AGENT.md" ~/.claude/agents/artifact-hub.md
 ```
 
-**Before you install: this file is fetched over TLS from the same hub you
-already trust with your data, but it is a mutable, unsigned, unpinned
-document** — there is no version pin, digest, or signature on this endpoint,
-and it can change between one download and the next. Review the downloaded
-file before your agent runner first loads it, and re-review it any time you
-re-run the install command, the same way you would review any other code you
-install. Where possible, pin to a released version — fetch a specific tagged
-copy from the project's GitHub releases instead of the always-current `/agent`
-endpoint, and keep that copy under your own version control so a change
-upstream doesn't silently change what your agent does.
+If the hub's `X-Content-SHA256` differs from the digest in `SHA256SUMS`, the
+hub is not serving its own release — do not install from it either way.
+Review the file before its first load; verification proves origin, not
+intent.
 
 ## Authentication
 
@@ -77,6 +80,26 @@ need to know the alias table if you already know your stack's hostname.
 The hub verifies the token against your stack's own
 `GET /v2/storage/tokens/verify` endpoint and derives your project identity
 from the response — it never stores your token.
+
+### Calling it from a shell
+
+Every curl example in this document goes through one small function, so the
+token is never a command-line argument (the shell would expand
+`-H "X-StorageApi-Token: $KBC_TOKEN"` before curl runs, and for the process's
+lifetime anyone who can list processes on the host could read it). Define it
+once, in bash or zsh, with the token and stack alias in the environment:
+
+```bash
+export KBC_TOKEN="…"   # your Keboola Storage API token
+export KBC_STACK=eu    # an alias from the table above, or a full https URL
+hub() {
+  curl -s -K <(printf 'header = "X-StorageApi-Token: %s"\nheader = "X-Storage-Stack: %s"\n' "$KBC_TOKEN" "$KBC_STACK") "$@"
+}
+```
+
+`printf` is a shell builtin and the config reaches curl as `/dev/fd/N`, so no
+process ever carries the token in its arguments. To act as another identity
+for one call, prefix the environment: `KBC_TOKEN="$CONTRIBUTOR_TOKEN" hub …`.
 
 **Never put the token in a URL, query string, or the request body.** It only
 ever belongs in the `X-StorageApi-Token` header.
@@ -218,9 +241,7 @@ examples below.
 ### Publish HTML
 
 ```bash
-curl -s -X POST "$HUB/api/artifacts" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{
     "html": "<!doctype html><html><body><h1>Hello</h1></body></html>",
@@ -258,9 +279,7 @@ Response:
 ### Publish Markdown
 
 ```bash
-curl -s -X POST "$HUB/api/artifacts" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{
     "markdown": "# Title\n\nSome **content** with a table:\n\n| a | b |\n|---|---|\n| 1 | 2 |\n"
@@ -275,9 +294,7 @@ writing any CSS.
 ### Publish from a git repository
 
 ```bash
-curl -s -X POST "$HUB/api/artifacts" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{
     "git_url": "https://github.com/org/repo",
@@ -298,9 +315,7 @@ Add `git_token` — a personal access token for the git host (GitHub PAT, GitLab
 token, …) — to clone a repository that is not public:
 
 ```bash
-curl -s -X POST "$HUB/api/artifacts" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{
     "git_url": "https://github.com/org/private-repo",
@@ -342,31 +357,21 @@ below. The default is `false`: only the owning project may add versions.
 
 ```bash
 # Update (must use a token from the owning project)
-curl -s -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx" \
   -H "Content-Type: application/json" \
   -d '{"markdown": "# Updated title\n\nNew content."}'
 
 # Move to the trash — soft delete, reversible
-curl -s -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu"
+hub -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx"
 
 # Bring it back, on the same share id
-curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/restore" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu"
+hub -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/restore"
 
 # Erase it for good — no undo
-curl -s -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/purge" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu"
+hub -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/purge"
 
 # List your own project's artifacts (trashed ones included, status "trashed")
-curl -s "$HUB/api/artifacts" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu"
+hub "$HUB/api/artifacts"
 ```
 
 `PUT` and both `DELETE` routes require a token from the project that
@@ -404,9 +409,7 @@ document is still open at all:
 | `status` | `"draft"` \| `"final"` | `"final"` freezes new versions **and** new comments for everyone, the owner included, and shows a banner on the page. Reopen by `PUT`-ing `{"status": "draft"}` (owner only). |
 
 ```bash
-curl -s -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx" \
   -H "Content-Type: application/json" \
   -d '{
     "accept_versions_mode": "allowlist",
@@ -425,9 +428,7 @@ document is settled" — see *Collaborative review workflow* in the
 ### Rotate the public link (revoke a shared URL)
 
 ```bash
-curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/rotate-link" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu"
+hub -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/rotate-link"
 ```
 
 Owner-only. Mints a fresh share id and returns every public URL rebuilt from
@@ -451,9 +452,7 @@ latest response rather than hand-assembling `/a/{id}`.
 ### View statistics (owner only)
 
 ```bash
-curl -s "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/stats" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu"
+hub "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/stats"
 ```
 
 Reports how often the artifact was read: `total` across all recorded history,
@@ -492,9 +491,7 @@ source of truth.
 ### Submit a version
 
 ```bash
-curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/versions" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/versions" \
   -H "Content-Type: application/json" \
   -d '{
     "markdown": "# Q3 review\n\nCorrected the revenue table.",
@@ -533,7 +530,7 @@ version (e.g. a from-scratch rewrite).
 ### List versions
 
 ```bash
-curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/versions"
+hub "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/versions"
 ```
 
 Returns `{"id", "head_version", "accept_versions", "accept_versions_mode",
@@ -554,7 +551,7 @@ base.
 ### Read one version
 
 ```bash
-curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/v/2"
+hub "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/v/2"
 ```
 
 For a **proposed** version, send your management headers
@@ -566,16 +563,16 @@ everyone else.
 
 ```bash
 # Side-by-side HTML page (default)
-curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2"
+hub "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2"
 
 # Unified diff, text/plain — the best format for an agent to read
-curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2?format=unified"
+hub "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2?format=unified"
 
 # JSON: the unified diff plus added/removed line counts
-curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2?format=json"
+hub "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2?format=json"
 
 # Visual: the two rendered documents side by side, scrolling in step
-curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2?format=visual"
+hub "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2?format=visual"
 ```
 
 The spec is always `{older}..{newer}`. Markdown is compared when both versions
@@ -594,9 +591,7 @@ what the page has to carry, rather than to the source.
 ### Promote a proposal (owner only)
 
 ```bash
-curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/versions/2/promote" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu"
+hub -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/versions/2/promote"
 ```
 
 The version becomes live, and — with the default head mode — immediately
@@ -605,9 +600,7 @@ becomes what `/a/{id}` serves. Promoting an already-live version is a 409.
 ### Delete a version
 
 ```bash
-curl -s -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/versions/2" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu"
+hub -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/versions/2"
 ```
 
 The owner may delete any version except the last live one (409 — an artifact
@@ -618,16 +611,12 @@ you withdraw a submission.
 
 ```bash
 # Always serve the newest live version (the default)
-curl -s -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/head" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/head" \
   -H "Content-Type: application/json" \
   -d '{"mode": "latest"}'
 
 # Freeze the artifact on one live version
-curl -s -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/head" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/head" \
   -H "Content-Type: application/json" \
   -d '{"mode": "pinned", "version": 1}'
 ```
@@ -640,7 +629,10 @@ is protected from retention pruning. The response reports
 
 - **Retention** — at most `HUB_MAX_VERSIONS` (default 50) live versions per
   artifact. The oldest live versions that are neither the head nor pinned are
-  pruned. Proposals are never pruned.
+  pruned; this rule never counts or removes a proposal.
+- **Proposal retention** — proposals have their own cap:
+  `HUB_MAX_PROPOSED_VERSIONS` (default 50) retained per artifact, oldest
+  pruned above that. A pending proposal does not wait forever.
 - **Rate limit** — `HUB_MAX_VERSIONS_PER_DAY` (default 20) submitted versions
   per contributing project, per artifact, per UTC day. Past that, 429.
 
@@ -675,7 +667,7 @@ pointing at v2's text even after v3 is published.
 ### Read all threads (public)
 
 ```bash
-curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/comments"
+hub "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/comments"
 ```
 
 Public JSON, password-gated exactly like the other read endpoints. Returns
@@ -688,9 +680,7 @@ always carry the same value.
 ### Open a thread
 
 ```bash
-curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments" \
   -H "Content-Type: application/json" \
   -d '{
     "version": 2,
@@ -709,9 +699,7 @@ thread's `id`.
 ### Reply to a thread
 
 ```bash
-curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments/<tid>/replies" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments/<tid>/replies" \
   -H "Content-Type: application/json" \
   -d '{"body": "Fixed in v3 — see the diff for the corrected totals."}'
 ```
@@ -723,16 +711,12 @@ thread, not only its original author.
 
 ```bash
 # Mark resolved
-curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments/<tid>/resolve" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments/<tid>/resolve" \
   -H "Content-Type: application/json" \
   -d '{"resolved": true}'
 
 # Reopen
-curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments/<tid>/resolve" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments/<tid>/resolve" \
   -H "Content-Type: application/json" \
   -d '{"resolved": false}'
 ```
@@ -742,9 +726,7 @@ Only the artifact owner or the thread's own author may resolve or reopen it.
 ### Delete a thread
 
 ```bash
-curl -s -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments/<tid>" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu"
+hub -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments/<tid>"
 ```
 
 Only the artifact owner or the thread's own author may delete it. Deletion is
@@ -786,9 +768,7 @@ on one artifact — for the reviewer who has no Storage token and never will
 ### Invite a guest (owner only)
 
 ```bash
-curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/invitations" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/invitations" \
   -H "Content-Type: application/json" \
   -d '{"name": "Jana (legal)"}'
 ```
@@ -827,7 +807,7 @@ Keboola project. Their comments are published as `{"kind": "guest", "name":
 ### Comment as a guest (what the review page does under the hood)
 
 ```bash
-curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments" \
+hub -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments" \
   -H "X-Artifact-Guest: <invitation_id>.<secret>" \
   -H "Content-Type: application/json" \
   -d '{"version": 4, "exact": "the Q3 revenue total", "prefix": "...as shown in ", "suffix": " on the summary page...", "body": "This looks off vs. the source table."}'
@@ -844,12 +824,10 @@ showing a composer.
 
 ```bash
 # List invitations — no secrets, they cannot be recovered
-curl -s "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/invitations" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu"
+hub "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/invitations"
 
 # Revoke one person's access — everyone else's link keeps working
-curl -s -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/invitations/<invitation_id>" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu"
+hub -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/invitations/<invitation_id>"
 ```
 
 Revoking is per person and idempotent; comments the guest already wrote stay
@@ -866,9 +844,7 @@ polling `/versions` and `/comments`.
 ### Register webhooks
 
 ```bash
-curl -s -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx" \
-  -H "X-StorageApi-Token: $KBC_TOKEN" \
-  -H "X-Storage-Stack: eu" \
+hub -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx" \
   -H "Content-Type: application/json" \
   -d '{"webhooks": ["https://hooks.slack.com/services/T000/B000/XXXX", "https://example.com/hooks/artifact-hub"]}'
 ```
@@ -914,36 +890,48 @@ project's **name** (or a guest's display name plus " (guest)"), and the
 public `url` built from the current share id — never a token, an owner key, or
 a password record.
 
+### Recognise a retry
+
+Every delivery carries `X-Hub-Event-Id` and `X-Hub-Delivery-Id` as headers, and
+non-Slack bodies repeat them as `event_id` and `delivery_id`. The event id is
+the same across every receiver and every retry; the delivery id is the same
+across retries to one receiver. Record the delivery id and skip a repeat — the
+hub retries on any non-2xx, so a receiver that acted but answered slowly will
+see the same delivery again.
+
 ### Verify the signature
 
-Every non-Slack delivery carries `X-Hub-Signature-256: sha256=<hex>` — an
-HMAC-SHA256 of the *exact bytes* of the request body, keyed with a webhook
-signing key **derived** from the hub's `HUB_SECRET_KEY` (HMAC-SHA256 of the
-master secret, labeled `"webhook-signature"`), not the master secret itself.
-Recompute it and compare before trusting a delivery (Slack deliveries carry no
-signature — Slack's own webhook format has no header for one, so verify a
-Slack integration by the URL's own secrecy instead):
+Every delivery carries `X-Hub-Signature-256: sha256=<hex>` — an HMAC-SHA256 of
+the *exact bytes* of the request body. Slack ignores the header, so a Slack
+integration is still secured by its URL's own secrecy, but it is signed like
+any other delivery.
+
+**Each receiver is signed with its own key.** Read the keys with the
+owner-only `GET /api/artifacts/{id}/webhooks`, which lists every registered
+URL alongside the `signing_key` its deliveries use, and configure that
+receiver with that value:
+
+```bash
+hub "$HUB/api/artifacts/$ID/webhooks"
+```
+
+Recompute and compare before trusting a delivery:
 
 ```python
 import hashlib
 import hmac
 
-def derive_webhook_key(master_secret: str) -> str:
-    # Same derivation the hub uses: HMAC-SHA256(master_secret, label), as hex.
-    return hmac.new(
-        master_secret.encode(), b"webhook-signature", hashlib.sha256
-    ).hexdigest()
-
-def verify(body: bytes, header_value: str, master_secret: str) -> bool:
-    webhook_key = derive_webhook_key(master_secret)
-    expected = "sha256=" + hmac.new(webhook_key.encode(), body, hashlib.sha256).hexdigest()
+def verify(body: bytes, header_value: str, signing_key: str) -> bool:
+    # signing_key is this receiver's value from GET /api/artifacts/{id}/webhooks.
+    expected = "sha256=" + hmac.new(signing_key.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, header_value)
 ```
 
-The derived key is the one an operator actually hands to a webhook receiver,
-so disclosing it (which every receiver necessarily must learn, to verify
-deliveries) no longer exposes the same secret that signs unlock cookies —
-previously a single leaked `HUB_SECRET_KEY` compromised both.
+The key is bound to the artifact and to the receiver URL, so what a receiver
+necessarily learns is worth exactly its own feed: it exposes neither the
+secret that signs unlock cookies nor the key any other receiver verifies
+with. Do not derive a key yourself, and never reuse one receiver's key for
+another.
 
 Compare with `hmac.compare_digest` (or an equivalent constant-time compare in
 your language), never `==` — a naive comparison leaks timing information an
@@ -995,7 +983,7 @@ your `html`: it is the difference between `original` and `converted` here.
 ### Obsidian vault
 
 ```bash
-curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/export/vault" -o vault.zip
+hub "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/export/vault" -o vault.zip
 ```
 
 Returns an in-memory ZIP that is a ready-to-open Obsidian vault:

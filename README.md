@@ -38,9 +38,9 @@ content, source, or metadata over a small JSON API.
   never sent to or stored by the server) to review proposal diffs, promote or
   reject them, pin the head version, and toggle `accept_versions` — all by
   clicking
-- **Installable agent** (`/agent`): serves a ready-to-use Claude Code subagent
-  definition, distilled from `/skill`, that a user can drop straight into
-  `~/.claude/agents/`
+- **Installable agent** (`/agent`): serves the Claude Code subagent
+  definition this hub runs, distilled from `/skill`; install the attested
+  copy from the matching GitHub release (see *Install the agent / skill*)
 - **Inline comments and a review UI**: anyone with a Keboola token can leave
   threaded comments anchored to a quoted passage of a specific version
   (`GET/POST /a/{id}/comments`), and `GET /a/{id}/review` is a browser page
@@ -176,7 +176,7 @@ Public (no auth):
 | POST | `/` | Returns 200 (platform health check) |
 | GET | `/context` | Machine-readable manifest |
 | GET | `/skill` | SKILL.md (`text/markdown`) teaching agents how to publish |
-| GET | `/agent` | Ready-to-install Claude Code subagent definition (`text/markdown`) |
+| GET | `/agent` | The Claude Code subagent definition this hub runs (`text/markdown`, with `ETag`/`X-Content-SHA256`/`X-Hub-Version`); install the attested release copy instead |
 | GET | `/admin` | Browser moderation studio (owner pastes their Storage token client-side; never stored server-side) |
 | GET | `/docs` | Interactive Swagger UI for this API |
 | GET | `/openapi.json` | Machine-readable OpenAPI schema for this API |
@@ -195,6 +195,14 @@ Public (no auth):
 | GET | `/a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, reasoning timeline) |
 | GET | `/changelog` / `/changelog.md` | Rendered changelog (hub's own design) / raw source |
 | GET | `/health` | Liveness check + service version + index stats |
+
+**Authorization is per project, by design.** Ownership is `(stack, project)`:
+any valid Storage token from the owning project carries full owner authority
+— update, trash, restore, purge, rotate-link, promote — regardless of that
+token's own scope. A Keboola project *is* the team, and one hub is one
+organisation, so project membership is the intended boundary; the hub does
+not layer roles of its own on top. Keep destructive tokens as safe as you
+keep the project itself.
 
 Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 
@@ -222,58 +230,59 @@ Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 
 Every version, comment/reply, finalize, trash/restore and link-rotation event
 also fires any webhooks the artifact has registered (`X-Hub-Signature-256`
-HMAC-signed JSON, or Slack's `{"text": ...}` shape for a `hooks.slack.com`
-URL) — see *Outbound webhooks* above.
+HMAC-signed JSON, keyed per receiver, or Slack's `{"text": ...}` shape for a
+`hooks.slack.com` URL) — see *Outbound webhooks* above.
 
 ## Quick start (curl)
 
-Set `$HUB` to the deployed base URL, `your-token` to a real Keboola Storage
-API token, and pick the `X-Storage-Stack` alias for your stack (`us`, `gcp-us`,
-`eu`, `azure-eu`, `gcp-eu`, or any full `https://*.keboola.com` URL).
+Set `$HUB` to the deployed base URL, put your Keboola Storage API token and
+your stack alias (`us`, `gcp-us`, `eu`, `azure-eu`, `gcp-eu`, or any full
+`https://*.keboola.com` URL) in the environment, and define `hub` — a
+one-line wrapper that hands curl the two auth headers through a process
+substitution, so the token is never a command-line argument visible in `ps`:
+
+```bash
+export KBC_TOKEN="…"
+export KBC_STACK=eu
+hub() {
+  curl -s -K <(printf 'header = "X-StorageApi-Token: %s"\nheader = "X-Storage-Stack: %s"\n' "$KBC_TOKEN" "$KBC_STACK") "$@"
+}
+```
+
+A second identity (a contributing project) is just a different token for one
+call: `KBC_TOKEN="$CONTRIBUTOR_TOKEN" hub …`.
 
 ```bash
 # Publish HTML
-curl -s -X POST "$HUB/api/artifacts" \
-  -H "X-StorageApi-Token: your-token" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{"html": "<!doctype html><html><body><h1>Hello</h1></body></html>", "title": "My report"}'
 
 # Publish Markdown
-curl -s -X POST "$HUB/api/artifacts" \
-  -H "X-StorageApi-Token: your-token" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{"markdown": "# Title\n\nSome content."}'
 
 # Publish from a public git repo
-curl -s -X POST "$HUB/api/artifacts" \
-  -H "X-StorageApi-Token: your-token" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{"git_url": "https://github.com/org/repo", "git_ref": "main", "git_path": "docs/report.md"}'
 
 # Publish from a private git repo (git_token is transient — see below)
-curl -s -X POST "$HUB/api/artifacts" \
-  -H "X-StorageApi-Token: your-token" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{"git_url": "https://github.com/org/private-repo", "git_path": "docs/report.md", "git_token": "your-github-pat"}'
 
 # Read (public, no token)
-curl -s "$HUB/a/<id>/raw"
+hub "$HUB/a/<id>/raw"
 
 # Update (owner project only)
-curl -s -X PUT "$HUB/api/artifacts/<id>" \
-  -H "X-StorageApi-Token: your-token" \
-  -H "X-Storage-Stack: eu" \
+hub -X PUT "$HUB/api/artifacts/<id>" \
   -H "Content-Type: application/json" \
   -d '{"markdown": "# Updated"}'
 
 # Delete (owner project only)
-curl -s -X DELETE "$HUB/api/artifacts/<id>" \
-  -H "X-StorageApi-Token: your-token" \
-  -H "X-Storage-Stack: eu"
+hub -X DELETE "$HUB/api/artifacts/<id>"
 ```
 
 Add `"password": "secret"` to any publish/update body to protect the
@@ -284,35 +293,30 @@ web unlock form (browsers).
 
 ```bash
 # Open an artifact to submissions from other projects
-curl -s -X PUT "$HUB/api/artifacts/<id>" \
-  -H "X-StorageApi-Token: your-token" -H "X-Storage-Stack: eu" \
+hub -X PUT "$HUB/api/artifacts/<id>" \
   -H "Content-Type: application/json" \
   -d '{"accept_versions": true}'
 
 # Submit a version (any project; live for the owner, proposed for others)
-curl -s -X POST "$HUB/api/artifacts/<id>/versions" \
-  -H "X-StorageApi-Token: contributor-token" -H "X-Storage-Stack: eu" \
+KBC_TOKEN="$CONTRIBUTOR_TOKEN" hub -X POST "$HUB/api/artifacts/<id>/versions" \
   -H "Content-Type: application/json" \
   -d '{"markdown": "# Updated", "note": "fix the totals table"}'
 
 # Review: history, one version, and the diff
-curl -s "$HUB/a/<id>/versions"
-curl -s "$HUB/a/<id>/v/2" -H "X-StorageApi-Token: your-token" -H "X-Storage-Stack: eu"
-curl -s "$HUB/a/<id>/diff/1..2?format=unified"
+hub "$HUB/a/<id>/versions"
+hub "$HUB/a/<id>/v/2"
+hub "$HUB/a/<id>/diff/1..2?format=unified"
 
 # Promote a proposal (owner project only)
-curl -s -X POST "$HUB/api/artifacts/<id>/versions/2/promote" \
-  -H "X-StorageApi-Token: your-token" -H "X-Storage-Stack: eu"
+hub -X POST "$HUB/api/artifacts/<id>/versions/2/promote"
 
 # Pin the head to one live version, or go back to "latest"
-curl -s -X PUT "$HUB/api/artifacts/<id>/head" \
-  -H "X-StorageApi-Token: your-token" -H "X-Storage-Stack: eu" \
+hub -X PUT "$HUB/api/artifacts/<id>/head" \
   -H "Content-Type: application/json" \
   -d '{"mode": "pinned", "version": 1}'
 
 # Withdraw your own proposal (contributor project)
-curl -s -X DELETE "$HUB/api/artifacts/<id>/versions/2" \
-  -H "X-StorageApi-Token: contributor-token" -H "X-Storage-Stack: eu"
+KBC_TOKEN="$CONTRIBUTOR_TOKEN" hub -X DELETE "$HUB/api/artifacts/<id>/versions/2"
 ```
 
 `GET /a/{id}/versions?format=html` renders the same history as a styled page
@@ -337,25 +341,39 @@ still served from a public URL: the token protects the clone, not the result.
 
 ## Install the agent / skill
 
-Two ways to teach an AI agent this API, both served directly by the hub:
+Two files teach an AI agent this API: the Claude Code subagent (`AGENT.md`,
+self-contained) and the skill (`SKILL.md`). The hub serves the copies it runs
+at `/agent` and `/skill` — those are for *reading*. **Install from the
+release**, whose copies are attested: `gh attestation verify` proves a file
+was built by this repository's release workflow from the tagged commit, which
+no download from the hub itself can prove. The installed subagent grants
+Bash/Read/WebFetch authority, so that proof is the point.
 
 ```bash
-# Claude Code subagent — fully self-contained, no other skill needs to load
-install -d ~/.claude/agents && curl -fsSL "$HUB/agent" -o ~/.claude/agents/artifact-hub.md
-
-# SKILL.md — for a skills-based setup (e.g. skills/artifact-publisher/)
-install -d ~/.claude/skills/artifact-publisher && curl -fsSL "$HUB/skill" -o ~/.claude/skills/artifact-publisher/SKILL.md
+V=$(curl -fsSL "$HUB/health" | jq -r .version)          # the release this hub runs
+D=$(mktemp -d)
+gh release download "v$V" --repo padak/kbc_ai_artifact -p AGENT.md -p SKILL.md -p SHA256SUMS -D "$D"
+( cd "$D" && shasum -a 256 -c SHA256SUMS )                                 # integrity against the release
+gh attestation verify "$D/AGENT.md" --repo padak/kbc_ai_artifact           # provenance: this repo's release workflow
+gh attestation verify "$D/SKILL.md" --repo padak/kbc_ai_artifact
+install -d ~/.claude/agents && install -m 0644 "$D/AGENT.md" ~/.claude/agents/artifact-hub.md
+install -d ~/.claude/skills/artifact-publisher && install -m 0644 "$D/SKILL.md" ~/.claude/skills/artifact-publisher/SKILL.md
 ```
 
-**Before you install:** both files are fetched over TLS from the same hub you
-already trust with your data, but neither endpoint is version-pinned, signed,
-or digest-checked — each is a mutable document that can change between one
-download and the next. Review the downloaded file before your agent loads it
-(the `/agent` file in particular grants Bash/Read/WebFetch tool access once
-installed), and re-review it any time you re-run either command. Treat it
-like any other code you install: where possible, pin to a released version
-from the project's GitHub releases and keep that copy under your own version
-control, rather than always tracking the live endpoint.
+What each line proves: the sums check catches a corrupted or swapped
+download; the attestation check catches a release asset that was not
+produced by this repository's workflow (a compromised account uploading a
+"fixed" file, say); installing from `$D` rather than from `$HUB` means the
+hub's own state never decides what your agent is allowed to do. Review the
+file before the first load and whenever you upgrade — verification proves
+origin, not intent.
+
+To also catch a hub that is not serving its own release, compare
+`X-Content-SHA256` on `GET $HUB/agent` (also listed under `documents` in
+`GET $HUB/context`) with the digest in `SHA256SUMS`: they must match. Without
+`gh`, download the same assets from
+`https://github.com/padak/kbc_ai_artifact/releases/download/v$V/` and run the
+sums check — integrity only, no provenance.
 
 ## Local development
 
@@ -400,12 +418,13 @@ are missing. Everything else has a documented default, overridable via env.
 | `HUB_CACHE_MAX_ENTRIES` | `200` | Max number of envelopes kept in the disk LRU cache |
 | `HUB_UNLOCK_COOKIE_MAX_AGE_S` | `43200` (12 h) | Lifetime of a signed password-unlock cookie |
 | `HUB_TOKEN_VERIFY_TIMEOUT_S` | `15` | Timeout for the `token verify` call to a caller's stack |
-| `HUB_MAX_VERSIONS` | `50` | Live versions kept per artifact; older non-head, non-pinned ones are pruned (proposals are never pruned) |
+| `HUB_MAX_VERSIONS` | `50` | Live versions kept per artifact; older non-head, non-pinned ones are pruned (this rule never counts or removes a proposal — proposals have their own cap, `HUB_MAX_PROPOSED_VERSIONS`) |
 | `HUB_MAX_VERSIONS_PER_DAY` | `20` | Versions one project may submit for one artifact per UTC day |
 | `HUB_MAX_COMMENTS_PER_DAY` | `100` | Comment threads plus replies one project (or one guest invitation) may submit for one artifact per UTC day |
 | `HUB_DIFF_MAX_BYTES` | `2097152` (2 MB) | Largest per-side payload the diff renderer (including `format=visual`'s rendered HTML) will process (413 above it) |
 | `HUB_EXTRA_STACKS` | empty | Comma-separated extra stack URLs allowed beyond the `*.keboola.com` rule |
 | `HUB_MAX_ENVELOPE_BYTES` | `20971520` (20 MB) | Largest persisted envelope/meta record the store will download or read from cache before refusing it as a DoS guard; `0` disables the bound |
+| `HUB_REAP_ABORTED_PUBLISH_AFTER_S` | `3600` | A meta record with no version is a publish that died between its two writes; startup deletes such records once older than this, so they cannot be a publish still in flight (`0` disables) |
 | `HUB_MAX_PROPOSED_VERSIONS` | `50` | Per-artifact cap on retained proposed versions; the oldest proposals above this are pruned (proposals are never served as head, so this is always safe) |
 | `HUB_TRUST_FORWARDED_HEADERS` | `false` | Trust `X-Forwarded-Host`/`X-Forwarded-Proto` to name the public origin when `HUB_PUBLIC_BASE_URL` is unset — only for local development behind a proxy; a direct client can forge these headers |
 | `HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR` | `30` | Failed password-unlock attempts allowed per (artifact, client IP) per UTC hour before the gate answers 429 (each attempt costs a full PBKDF2 verification) |
@@ -414,33 +433,50 @@ are missing. Everything else has a documented default, overridable via env.
 | `HUB_STATE_DB_FILENAME` | `state.sqlite3` | File name of the SQLite sidecar holding rate-limit counters and view analytics, under `HUB_CACHE_DIR` |
 | `HUB_WEBHOOK_TIMEOUT_S` | `10` | Per-request HTTP timeout for one webhook delivery attempt |
 | `HUB_WEBHOOK_MAX_ATTEMPTS` | `3` | Total POST attempts per (URL, event) before giving up; retries back off `2**n` seconds, capped at 60 |
+| `HUB_WEBHOOK_QUEUE_MAX` | `1000` | Queued-but-undelivered webhook deliveries kept at once; past this the newest is dropped with a log line rather than blocking the request that produced it |
 | `HUB_MAX_WEBHOOKS_PER_ARTIFACT` | `5` | How many webhook URLs one artifact may register |
 | `HUB_MAX_INVITATIONS_PER_ARTIFACT` | `20` | How many live guest invitations one artifact may hold at once (revoked ones are reclaimed automatically to make room) |
 
 ## Deployment to Keboola
 
 The app is deployed from the public GitHub repository
-`padak/kbc_ai_artifact` as a Keboola Data App:
+`padak/kbc_ai_artifact` as a Keboola Data App. For production, name the
+release tag explicitly — `--git-branch` defaults to
+`main`, which is a moving target:
 
 ```bash
 kbagent data-app create \
   --project artifacts \
   --git-repo https://github.com/padak/kbc_ai_artifact \
+  --git-branch v0.9.0 \
   --git-public
 ```
 
-**Pin production to an immutable ref, not a moving branch.** The command
-above (and the platform's default git integration) tracks a branch —
-typically `main` — and the runner re-clones that branch on every container
-start (a fresh deploy, a restart, or a wake from auto-suspend). That means a
-push to `main` after review, or simply a container restart picking up a newer
-commit than the one last verified, can change what is actually running
-without a corresponding, deliberate deploy action. For production, deploy
-from an immutable ref instead: cut a tagged release (CLAUDE.md's deploy flow
+**Why the tag is not optional in production.** The runner re-clones the
+configured ref on every container start — a fresh deploy, a restart, or a
+wake from auto-suspend — not only when you deploy. Left on a branch, a push
+to `main` after review, or simply a restart landing on a newer commit than
+the one last verified, changes what is actually running with no deliberate
+deploy action behind it. A tag makes a given deployment stay tied to the
+exact commit that was reviewed and versioned. CLAUDE.md's deploy flow
 already tags the commit and cuts a GitHub release for every user-visible
-change — see *Contributing* below) and point the git ref at that tag or its
-commit SHA rather than at `main`, so a given deployment stays reproducibly
-tied to the exact commit that was reviewed and versioned.
+change (see *Contributing* below), so the tag to pass always exists.
+
+Pass the tag itself, not a commit SHA: this is a clone ref, and git's
+`--branch` resolves a branch or a tag only — the same constraint the
+service's own `git_ref` has. To pin a specific commit, tag it first.
+
+Omitting `--git-branch` (tracking `main`) is fine for a development or
+staging app where following the branch is the point.
+
+**One hub is one container.** A Data App runs as a single container that
+suspends when idle and restarts on demand — never two instances side by
+side — and one hub serves one organisation. The service relies on that: its
+artifact index, its locks and its state snapshots are designed for exactly
+one writer, and Storage Files cannot coordinate two (they are immutable, with
+no create-if-absent). Do not put replicas or extra worker processes in front
+of it; each organisation runs its own app instead. If a second writer ever
+does appear, the state sidecar logs an ERROR saying so.
 
 Secrets are set with `kbagent data-app secrets-set` and never committed to
 the repository:
@@ -522,8 +558,11 @@ browsers never send to a server, and only ever reaches the API in the
 never a query string, path segment, or cookie. Outbound webhook URLs are
 treated as equally sensitive: they are only ever echoed back in the `PUT`
 response that set them, never in `GET /api/artifacts` (which reports a count
-instead), and every non-Slack delivery is HMAC-signed
-(`X-Hub-Signature-256`) so a receiver can reject a forged POST.
+instead), and every delivery is HMAC-signed (`X-Hub-Signature-256`) so a
+receiver can reject a forged POST. Each receiver is signed with its **own**
+key, bound to the artifact and the receiver URL, so a receiver cannot forge a
+delivery for a different receiver or a different document; owners read those
+keys from `GET /api/artifacts/{id}/webhooks`.
 
 ## Contributing
 

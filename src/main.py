@@ -24,6 +24,8 @@ transient Storage outage cannot put the app into a crash loop.
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import hashlib
 import json
 import logging
@@ -64,6 +66,8 @@ from src.auth import (
 )
 from src.builder import BuildError, BuiltArtifact
 from src.comments import (
+    MAX_REPLIES_PER_THREAD,
+    MAX_THREAD_BYTES,
     CommentStore,
     CommentThread,
     Reply,
@@ -226,8 +230,9 @@ INVITATION_ID_DESC = (
 
 #: Description of the ``spec`` path parameter of the diff endpoint.
 SPEC_DESC = (
-    "Two version numbers in the form OLD..NEW, for example 1..2. Anything "
-    "else is a 400."
+    "Two version numbers in the form OLD..NEW, for example 1..2. OLD must be "
+    "strictly smaller than NEW -- every rendering labels the two sides that "
+    "way, so a reversed or repeated spec is a 400, as is anything else."
 )
 
 #: Sentence appended to the description of reads that honour the password gate.
@@ -238,6 +243,26 @@ PASSWORD_GATE_NOTE = (
     "which sets a signed cookie scoped to the artifact path and to the "
     "current password. Failed attempts are rate-limited per artifact and "
     "client address, so a wrong password may answer 429 instead of 401."
+)
+
+#: Password paragraph for GET /a/{id}/review only.
+#:
+#: The shared PASSWORD_GATE_NOTE promises browsers the standalone unlock form.
+#: The review route deliberately does the opposite (see read_review): it serves
+#: its credential-free shell with 200 and lets the page ask for the password in
+#: place, so that navigating away cannot drop the URL fragment carrying an
+#: invited guest's credential.
+REVIEW_PASSWORD_NOTE = (
+    "When the artifact is password-protected this route still answers 200. "
+    "The shell it returns carries no artifact content and no credential of "
+    "its own -- everything it displays comes from /raw, /versions and "
+    "/comments, which stay gated -- so the page renders locked and asks for "
+    "the password in its own panel rather than navigating to the standalone "
+    "unlock form, which would drop the '#invite=...' fragment an invited "
+    "guest arrives with. Machine clients send the password in the "
+    "X-Artifact-Password header on the gated endpoints. Failed attempts are "
+    "rate-limited per artifact and client address, so a wrong password may "
+    "answer 429."
 )
 
 #: Paragraph appended to every public route that describes an artifact.
@@ -455,6 +480,73 @@ settings: Settings = load_settings()
 #: Guards the lazy re-hydration retry so concurrent requests do not all hammer
 #: Storage at once after a failed startup hydration.
 _hydrate_lock = threading.Lock()
+
+#: One lock per artifact, created on first use and kept for the life of the
+#: process. Every mutating ``/api/artifacts/{id}...`` route reads the artifact,
+#: decides, then writes -- through *separate* store locks -- so two requests
+#: on one artifact could interleave between the decision and the write and
+#: both act on a state that was no longer true: two promotions of one
+#: proposal both firing, two deletes jointly removing the last live version,
+#: a submission landing on a document finalized a moment earlier. This
+#: serializes whole routes per artifact instead. Sound because this process
+#: is the only writer (see CLAUDE.md, "Exactly one instance"); with a second
+#: instance it would be no protection at all. The registry never shrinks --
+#: it is bounded by the artifacts this process ever mutates, a few dozen
+#: bytes each.
+_artifact_locks: dict[str, threading.Lock] = {}
+_artifact_locks_guard = threading.Lock()
+
+
+def _artifact_lock(artifact_id: str) -> threading.Lock:
+    """The lock serializing mutations of one artifact."""
+    with _artifact_locks_guard:
+        lock = _artifact_locks.get(artifact_id)
+        if lock is None:
+            lock = _artifact_locks[artifact_id] = threading.Lock()
+        return lock
+
+
+def _serialized_per_artifact(route):
+    """Route decorator: hold the artifact's lock for the whole handler.
+
+    Applied directly above ``def``, so it is the innermost wrapper and the
+    one FastAPI registers; ``functools.wraps`` keeps the signature, which is
+    what FastAPI reads to resolve path, body and dependency parameters.
+    Dependencies (``require_owner`` and its token-verify HTTP call) run
+    before the handler is invoked, so they stay outside the lock; only the
+    read-decide-write body is inside it.
+    """
+    @functools.wraps(route)
+    def serialized(*args, **kwargs):
+        with _artifact_lock(kwargs["artifact_id"]):
+            return route(*args, **kwargs)
+    return serialized
+
+
+def _serialized_per_comment_target(route):
+    """Like :func:`_serialized_per_artifact`, for routes addressed by share id.
+
+    The comment routes take either half of an artifact's identity pair in
+    their path -- the public share id, or the internal id as an owner
+    fallback (see :func:`_comment_target_of`). Keying the lock on the path
+    parameter would therefore not serialize a comment with the owner routes,
+    which always use the internal id, and a comment could land on a document
+    being finalized in the same instant. The key is resolved first, without
+    authentication: ``resolve_share`` maps a live share id to the internal id
+    and answers None for anything else -- a rotated-away link, or the bare
+    internal id of a rotated artifact -- in which case the path id *is* the
+    internal id if it is anything at all, so it is used as the key as-is. A
+    made-up id locks a key nobody else holds and then 404s inside the route.
+    """
+    @functools.wraps(route)
+    def serialized(*args, **kwargs):
+        request = kwargs["request"]
+        path_id = kwargs["artifact_id"]
+        ensure_hydrated(request.app)
+        internal_id = request.app.state.store.resolve_share(path_id) or path_id
+        with _artifact_lock(internal_id):
+            return route(*args, **kwargs)
+    return serialized
 
 # --------------------------------------------------------------------------
 # Rate-limit counters
@@ -731,6 +823,7 @@ async def lifespan(app: FastAPI):
         settings.max_versions,
         settings.max_envelope_bytes,
         settings.max_proposed_versions,
+        reap_aborted_after_s=settings.reap_aborted_publish_after_s,
     )
     app.state.comments = CommentStore(
         backend,
@@ -758,6 +851,7 @@ async def lifespan(app: FastAPI):
         settings.webhook_timeout_s,
         settings.webhook_max_attempts,
         derive_key(settings.secret_key, KEY_LABEL_WEBHOOK),
+        queue_max=settings.webhook_queue_max,
     )
     app.state.webhooks = webhooks
     try:
@@ -1084,8 +1178,16 @@ async def public_origin(request: Request, call_next):
 
 @app.middleware("http")
 async def artifact_headers(request: Request, call_next):
-    """Keep artifact responses out of search indexes and shared caches."""
+    """Keep artifact responses out of search indexes, shared caches and referrers."""
     response = await call_next(request)
+    # Every response, not just /a/: a capability URL *is* the credential, and
+    # the hub's pages pull their fonts from a third-party origin. Under a
+    # browser's default policy that stylesheet request carries the referring
+    # page's origin, and a link a reader follows out of a document carries the
+    # full URL -- share id included. "no-referrer" is affordable here because
+    # nothing this service does needs a Referer: its own fetches are
+    # same-origin and authenticate with headers, not with where they came from.
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
     if request.url.path.startswith("/a/"):
         response.headers["X-Robots-Tag"] = "noindex, nofollow"
         # setdefault, not assignment: a handler that has already asked for
@@ -1829,7 +1931,13 @@ class PublishBody(BaseModel):
         ),
     )
     git_ref: str | None = Field(
-        None, description="Optional branch, tag or commit to check out for 'git_url'."
+        None,
+        description=(
+            "Optional branch or tag to check out for 'git_url'. Not a commit "
+            "id: the clone resolves this with git's --branch, which takes a "
+            "branch or a tag only, and a commit id is refused with 422. Tag "
+            "the commit to pin an immutable source."
+        ),
     )
     git_path: str | None = Field(
         None,
@@ -1933,7 +2041,13 @@ class UpdateBody(BaseModel):
         ),
     )
     git_ref: str | None = Field(
-        None, description="Optional branch, tag or commit to check out for 'git_url'."
+        None,
+        description=(
+            "Optional branch or tag to check out for 'git_url'. Not a commit "
+            "id: the clone resolves this with git's --branch, which takes a "
+            "branch or a tag only, and a commit id is refused with 422. Tag "
+            "the commit to pin an immutable source."
+        ),
     )
     git_path: str | None = Field(
         None,
@@ -2024,7 +2138,9 @@ class UpdateBody(BaseModel):
             "https URLs notified when something happens to this artifact "
             "(version published or proposed, proposal promoted, comment or "
             "reply, finalized, trashed, restored, link rotated). Each delivery "
-            "is a small JSON envelope signed with X-Hub-Signature-256; a "
+            "is a small JSON envelope signed with X-Hub-Signature-256, keyed "
+            "per receiver (read the keys from GET "
+            "/api/artifacts/{id}/webhooks); a "
             "hooks.slack.com URL gets Slack's {\"text\": ...} shape instead. "
             "Replaces the whole list; [] clears it; omit to leave unchanged. "
             "URLs must be https and must not resolve to a private, loopback, "
@@ -2167,7 +2283,9 @@ class VersionBody(BaseModel):
         None, description="Markdown source, rendered by the built-in template."
     )
     git_url: str | None = Field(None, description="HTTPS git repository to clone.")
-    git_ref: str | None = Field(None, description="Optional branch, tag or commit.")
+    git_ref: str | None = Field(
+        None, description="Optional branch or tag (not a commit id)."
+    )
     git_path: str | None = Field(
         None, description="Optional entry file or directory inside the repository."
     )
@@ -2522,6 +2640,27 @@ def _store_canonical(owner: Owner, token: str, artifact_id: str, html: str) -> i
         ) from exc
 
 
+def _discard_canonical(owner: Owner, token: str, artifact_id: str, file_id: int) -> None:
+    """Best-effort delete of a canonical copy whose version never landed.
+
+    The copy lives in the *author's* project, which the hub can only reach
+    with the caller's token during this request -- there is no later cleanup
+    handle, no tag search across projects, no reconciler that could ever find
+    it. So it is removed here, on the failure path, while the token is still
+    in hand. A failure to remove it is logged with everything an operator
+    needs to reap it by hand; it never masks the error that got us here.
+    """
+    try:
+        KbcFilesBackend(owner.stack_url, token).delete(file_id)
+    except Exception as exc:  # noqa: BLE001 - the original failure must win
+        logger.error(
+            "Could not discard canonical file %s of artifact %s in project %s "
+            "after its version write failed; it is an orphan in that project "
+            "and needs reaping by hand: %s",
+            file_id, artifact_id, owner.project_id, exc,
+        )
+
+
 def _identity(owner: Owner) -> dict[str, Any]:
     """The project identity recorded on a meta record or a version envelope."""
     return {
@@ -2699,7 +2838,9 @@ def health(request: Request) -> dict:
     responses={
         200: {
             "description": (
-                "The manifest: 'service', 'version', 'base_url', 'auth', "
+                "The manifest: 'service', 'version', 'base_url', 'documents' "
+                "(the /agent and /skill files with their SHA-256 and the "
+                "attested release asset to install from), 'auth', "
                 "'endpoints', 'publish_body', 'versioning', 'limits', 'notes'."
             )
         }
@@ -2713,6 +2854,7 @@ def context(request: Request) -> dict:
         "version": SERVICE_VERSION,
         "base_url": base,
         "repository": GITHUB_REPO_URL,
+        "documents": _documents_manifest(base),
         "description": (
             "Public hosting for self-contained HTML artifacts, backed by "
             "Keboola Storage. Any Keboola Storage API token from any stack can "
@@ -3017,6 +3159,15 @@ def context(request: Request) -> dict:
                 ),
             },
             {
+                "method": "GET",
+                "path": "/api/artifacts/{id}/webhooks",
+                "auth": "storage token (owner project)",
+                "purpose": (
+                    "list each registered webhook receiver with the signing "
+                    "key its deliveries use"
+                ),
+            },
+            {
                 "method": "POST",
                 "path": "/api/artifacts/{id}/rotate-link",
                 "auth": "storage token (owner project)",
@@ -3131,7 +3282,10 @@ def context(request: Request) -> dict:
                 "served document stays exactly the html you submitted"
             ),
             "git_url": "string, https git repository to clone (public, or private with git_token)",
-            "git_ref": "string, optional branch/tag/commit for git_url",
+            "git_ref": (
+                "string, optional branch or tag for git_url; a commit id is "
+                "refused -- tag it to pin an immutable source"
+            ),
             "git_path": (
                 "string, optional entry file or directory inside the repository; "
                 "defaults to index.html, then README.md, then a single root *.html"
@@ -3275,6 +3429,13 @@ def context(request: Request) -> dict:
                 f"{settings.max_comments_per_day} comments and replies per "
                 "project per artifact per UTC day (429 afterwards)"
             ),
+            "comment_thread_budget": (
+                f"one thread holds at most {MAX_REPLIES_PER_THREAD} replies "
+                f"and {MAX_THREAD_BYTES} serialized bytes (422 past either). "
+                "The per-day limit bounds the rate; these bound the object, "
+                "which is rewritten whole on every reply and re-read on "
+                "every listing."
+            ),
             "export": (
                 "GET /a/{id}/export/markdown downloads the served version as "
                 "Markdown — the author's own source when the version has one "
@@ -3368,12 +3529,24 @@ def context(request: Request) -> dict:
                 "initial publish (v1) emits nothing — the owner just did it."
             ),
             "delivery": (
-                "POST of {'event', 'artifact_id', 'payload', 'created_at'} "
-                "signed with X-Hub-Signature-256: sha256=<hmac>; a "
-                "hooks.slack.com URL gets Slack's {'text': ...} shape "
-                f"instead. Up to {settings.webhook_max_attempts} attempts with "
-                "backoff, best effort: the queue is in memory and a restart "
-                "drops what was pending."
+                "POST of {'event', 'event_id', 'delivery_id', 'artifact_id', "
+                "'payload', 'created_at'} signed with X-Hub-Signature-256: "
+                "sha256=<hmac>; a hooks.slack.com URL gets Slack's "
+                "{'text': ...} shape instead, with the ids in the "
+                "X-Hub-Event-Id and X-Hub-Delivery-Id headers every delivery "
+                f"carries. Up to {settings.webhook_max_attempts} attempts "
+                "with backoff, best effort: the queue is in memory, bounded "
+                f"at {settings.webhook_queue_max}, and a restart drops what "
+                "was pending. The delivery id is stable across retries, so a "
+                "receiver can recognise one instead of acting twice."
+            ),
+            "signing": (
+                "Every receiver has its own signing key, derived from the "
+                "hub's webhook key, the artifact and the receiver URL. GET "
+                "/api/artifacts/{id}/webhooks (owner only) reports each URL "
+                "with its key. A receiver therefore cannot forge a delivery "
+                "for another receiver or another artifact, and its key "
+                "reveals nothing about the hub's own."
             ),
             "secrecy": (
                 "A webhook URL is itself a capability, so it is returned only "
@@ -3409,6 +3582,8 @@ def context(request: Request) -> dict:
             "diff_max_bytes": settings.diff_max_bytes,
             "max_note_chars": MAX_NOTE_CHARS,
             "max_comments_per_day": settings.max_comments_per_day,
+            "max_replies_per_thread": MAX_REPLIES_PER_THREAD,
+            "max_thread_bytes": MAX_THREAD_BYTES,
             "max_contributors": MAX_CONTRIBUTORS,
             "max_unlock_attempts_per_hour": settings.max_unlock_attempts_per_hour,
             "max_webhooks_per_artifact": settings.max_webhooks_per_artifact,
@@ -3484,16 +3659,83 @@ def context(request: Request) -> dict:
         404: {"description": "SKILL.md is not readable on this deployment."},
     },
 )
-def skill() -> Response:
+def skill(request: Request) -> Response:
     """Serve the agent-facing SKILL.md."""
+    return _serve_document(request, SKILL_PATH, "skill document")
+
+
+def _read_document(path: Path) -> tuple[bytes, str] | None:
+    """The document's bytes and their SHA-256, fresh from disk; None if unreadable.
+
+    Read on every request, like the changelog: the hash has to describe what
+    is actually sent, and a copy cached at import time could not promise that.
+    """
     try:
-        text = SKILL_PATH.read_text(encoding="utf-8")
+        raw = path.read_bytes()
     except OSError:
-        logger.error("SKILL.md not readable at %s", SKILL_PATH)
-        return JSONResponse(
-            status_code=404, content={"error": "skill document not available"}
-        )
-    return Response(content=text, media_type="text/markdown; charset=utf-8")
+        logger.error("%s not readable", path)
+        return None
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
+def _serve_document(request: Request, path: Path, what: str) -> Response:
+    """Serve one of the instruction documents with its digest attached.
+
+    The digest headers exist so an installer can compare what a hub serves
+    with what the project released -- and refuse to install if they differ.
+    They are a consistency check, not a trust anchor: a digest from the same
+    origin as the content proves nothing about who wrote it. Provenance comes
+    from the release assets and their attestation, which /context points at.
+    """
+    document = _read_document(path)
+    if document is None:
+        return JSONResponse(status_code=404, content={"error": f"{what} not available"})
+    raw, digest = document
+    etag = f'"sha256:{digest}"'
+    headers = {
+        "ETag": etag,
+        "X-Content-SHA256": digest,
+        "X-Hub-Version": SERVICE_VERSION,
+    }
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+    return Response(
+        content=raw, media_type="text/markdown; charset=utf-8", headers=headers
+    )
+
+
+def _release_asset_url(filename: str) -> str:
+    """Where the attested copy of a document lives for the running version."""
+    return f"{GITHUB_REPO_URL}/releases/download/v{SERVICE_VERSION}/{filename}"
+
+
+def _documents_manifest(base: str) -> dict[str, Any]:
+    """The /context entry describing the instruction documents this hub serves."""
+    manifest: dict[str, Any] = {}
+    for key, route, path, filename in (
+        ("agent", "/agent", AGENT_PATH, "AGENT.md"),
+        ("skill", "/skill", SKILL_PATH, "SKILL.md"),
+    ):
+        document = _read_document(path)
+        entry: dict[str, Any] = {
+            "url": f"{base.rstrip('/')}{route}",
+            "version": SERVICE_VERSION,
+            "release_asset": _release_asset_url(filename),
+        }
+        if document is not None:
+            raw, digest = document
+            entry["sha256"] = digest
+            entry["bytes"] = len(raw)
+        manifest[key] = entry
+    manifest["sums"] = _release_asset_url("SHA256SUMS")
+    manifest["verify"] = (
+        "Install from the release asset, not from the live endpoint: download "
+        "the asset and SHA256SUMS for this version, check the sum, and run "
+        f"'gh attestation verify <file> --repo padak/kbc_ai_artifact'. The "
+        "sha256 here is what this hub serves; if it differs from the release, "
+        "the hub is not running its own release."
+    )
+    return manifest
 
 
 @app.get(
@@ -3518,16 +3760,9 @@ def skill() -> Response:
         404: {"description": "AGENT.md is not readable on this deployment."},
     },
 )
-def agent() -> Response:
-    """Serve the ready-to-install Claude Code subagent definition."""
-    try:
-        text = AGENT_PATH.read_text(encoding="utf-8")
-    except OSError:
-        logger.error("AGENT.md not readable at %s", AGENT_PATH)
-        return JSONResponse(
-            status_code=404, content={"error": "agent definition not available"}
-        )
-    return Response(content=text, media_type="text/markdown; charset=utf-8")
+def agent(request: Request) -> Response:
+    """Serve the Claude Code subagent definition this hub runs."""
+    return _serve_document(request, AGENT_PATH, "agent definition")
 
 
 def _read_changelog() -> str | None:
@@ -4365,7 +4600,8 @@ def read_versions(
     summary="Diff two versions",
     description=(
         "Compares two versions of one artifact, given in the path as "
-        "'{older}..{newer}' (for example 3..5). Markdown is compared when "
+        "'{older}..{newer}' (for example 3..5); the older number must come "
+        "first. Markdown is compared when "
         "both versions carry Markdown source, otherwise the built HTML is.\n\n"
         "The 'format' query parameter selects the rendering: 'html' (the "
         "default) is a side-by-side page for humans, 'unified' is a "
@@ -4393,7 +4629,8 @@ def read_versions(
         },
         400: {
             "description": (
-                "Malformed diff spec (not OLD..NEW) or an unknown 'format'."
+                "Malformed diff spec (not OLD..NEW, or OLD not strictly "
+                "smaller than NEW) or an unknown 'format'."
             )
         },
         401: {
@@ -4447,6 +4684,25 @@ def read_diff(
             },
         )
     older, newer = int(match.group(1)), int(match.group(2))
+    if older >= newer:
+        # The operands are *named* older and newer, and every rendering
+        # labels them that way: the side-by-side page, the unified diff's
+        # -/+ signs and the JSON "added"/"removed" counts. Accepting 2..1
+        # would answer with additions labelled as removals, so a reader --
+        # or an agent summarising the stats -- concludes the reverse of what
+        # happened. Answered before any lookup, since ordering is a property
+        # of the spec, not of the artifact.
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "malformed diff spec",
+                "detail": (
+                    "The older version must come first and the two must "
+                    "differ. Use {older}..{newer}, for example 3..5"
+                ),
+                "spec": spec,
+            },
+        )
 
     public_id = artifact_id
     meta = _public_meta_of(request, public_id)
@@ -4850,13 +5106,14 @@ def guest_identity(
         "with no Keboola account at all, sending the credential in the "
         "X-Artifact-Guest header. Browsers never send a fragment to a server, "
         "and the page never puts it in a URL, so the secret stays out of the "
-        "hub's logs.\n\n" + PASSWORD_GATE_NOTE
+        "hub's logs.\n\n" + REVIEW_PASSWORD_NOTE
     ),
     responses={
-        200: {"description": "The review page.", "content": CONTENT_HTML},
-        401: {
+        200: {
             "description": (
-                "Password-protected artifact; the HTML unlock form is returned."
+                "The review page. For a password-protected artifact this is "
+                "the same credential-free shell, which renders locked and "
+                "asks for the password in place -- this route has no 401."
             ),
             "content": CONTENT_HTML,
         },
@@ -5002,7 +5259,26 @@ def publish_artifact(
         canonical_file_id=canonical_file_id,
         created_at=now,
     )
-    store.add_version(envelope)
+    try:
+        store.add_version(envelope)
+    except Exception:
+        # Step 3 failed after steps 1 and 2 succeeded: undo both, in the
+        # order that matters -- the canonical copy first, while the caller's
+        # token is still usable, then the meta record. Either undo failing is
+        # logged and the original failure still propagates as the 502.
+        _discard_canonical(owner, token, artifact_id, canonical_file_id)
+        try:
+            rolled_back = store.delete(artifact_id)
+        except Exception:  # noqa: BLE001 - the original failure must win
+            rolled_back = False
+        if not rolled_back:
+            logger.error(
+                "Rollback of artifact %s failed after its version write "
+                "failed; a meta record with no version may remain and will "
+                "be reaped at the next hydrate once old enough",
+                artifact_id,
+            )
+        raise
     logger.info(
         "Published artifact %s (owner project %s, source %s, %d bytes, "
         "protected=%s, accept_versions=%s, canonical file %s)",
@@ -5071,6 +5347,7 @@ def publish_artifact(
         },
     },
 )
+@_serialized_per_artifact
 def update_artifact(
     body: UpdateBody,
     request: Request,
@@ -5134,20 +5411,24 @@ def update_artifact(
     if present:
         built, source = _build(body)
 
+    # Content first, settings last. The settings used to be saved before the
+    # content, so a failed canonical upload or version write answered 502
+    # with a new password, policy or status already in force -- the caller
+    # was told nothing happened while the security-relevant half had. Now
+    # the version lands (or fails, with nothing changed) before any setting
+    # is written. The settings are applied to a *copy*: store.get_meta
+    # answers from cache, so mutating ``meta`` in place would let a failed
+    # save_meta leave every later read on this process showing settings
+    # Storage never received.
+    candidate = dataclasses.replace(meta)
     if body.clear_password:
-        meta.password = None
+        candidate.password = None
     elif body.password:
-        meta.password = hash_password(body.password)
-    _apply_policy(meta, body)
-    meta.updated_at = now
-    store.save_meta(meta)
+        candidate.password = hash_password(body.password)
+    _apply_policy(candidate, body)
+    candidate.updated_at = now
 
     if built is not None:
-        # Residual risk (documented, not fixed here): the settings above are
-        # already committed, so a failure in the canonical upload or the
-        # version write leaves them applied while the content update did not
-        # land. The call answers 502, and the artifact stays readable at its
-        # previous version — no half-written version is ever served.
         canonical_file_id = _store_canonical(owner, token, artifact_id, built.html)
         envelope = Envelope(
             id=artifact_id,
@@ -5162,7 +5443,14 @@ def update_artifact(
             canonical_file_id=canonical_file_id,
             created_at=now,
         )
-        envelope.version = store.add_version_next(envelope)
+        try:
+            envelope.version = store.add_version_next(envelope)
+        except Exception:
+            # The copy in the caller's project has no version pointing at it
+            # and no other way to ever be found; discard it now, while the
+            # caller's token still works. The failure itself still propagates.
+            _discard_canonical(owner, token, artifact_id, canonical_file_id)
+            raise
         # v1 is the publish itself, which the owner just did by hand and does
         # not need a notification about; every later live version is news.
         if envelope.version > 1:
@@ -5177,6 +5465,9 @@ def update_artifact(
         envelope = store.get_head(artifact_id)
         if envelope is None:
             return _not_found(artifact_id)
+
+    store.save_meta(candidate)
+    meta = candidate
 
     if meta.status == ARTIFACT_FINAL and not was_final:
         _emit_webhook(
@@ -5316,6 +5607,7 @@ def list_artifacts(
         },
     },
 )
+@_serialized_per_artifact
 def delete_artifact(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -5388,6 +5680,7 @@ def delete_artifact(
         },
     },
 )
+@_serialized_per_artifact
 def restore_artifact(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -5446,10 +5739,14 @@ def restore_artifact(
     summary="Permanently erase an artifact",
     description=(
         "Owner-only, and **irreversible** — there is no undo and no trash to "
-        "fall back on. Deletes every version file, every comment thread and "
-        "the meta record from the hub's project, and forgets the artifact's "
-        "view statistics and rate-limit counters. All of its URLs stop "
-        "resolving for good.\n\n"
+        "fall back on. Deletes every comment thread, then every version file "
+        "and the meta record from the hub's project, and forgets the "
+        "artifact's view statistics and rate-limit counters. All of its URLs "
+        "stop resolving for good.\n\n"
+        "The call is idempotent and resumable: each step is safe to repeat, "
+        "and the record that authorizes the operation is erased last, so a "
+        "call that fails partway can simply be retried with the same "
+        "credentials.\n\n"
         "An artifact does not have to be in the trash first, but the gentler "
         "path is DELETE /api/artifacts/{id} (soft, reversible) followed by "
         "this once you are sure. The canonical copies in the authors' own "
@@ -5470,16 +5767,19 @@ def restore_artifact(
             "description": (
                 "The caller's Keboola stack could not be reached to verify "
                 "the token, the hub's own Storage is unavailable, or the "
-                "delete only partially succeeded — some stored files could "
+                "erasure only partially succeeded — some stored files could "
                 "not be removed, so the artifact is still readable and the "
-                "call must be retried. The same 502 covers a partial comment "
-                "erasure: the artifact went, but at least one comment thread "
-                "still has files in Storage ('comment_threads_failed' says "
-                "how many); retry the purge to finish the job."
+                "call must be retried. Comment threads are erased before the "
+                "artifact itself, so a partial comment erasure "
+                "('comment_threads_failed' says how many threads still have "
+                "files in Storage) leaves the artifact deliberately in place: "
+                "retrying the purge with the same credentials resumes it and "
+                "finishes the job."
             )
         },
     },
 )
+@_serialized_per_artifact
 def purge_artifact(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -5494,6 +5794,47 @@ def purge_artifact(
     if meta is None:
         return _not_found(artifact_id)
     _owner_only(meta, owner)
+
+    # Children first, the authorizing record last. The order is the whole
+    # design of this route: the meta record is what _owner_only reads, so
+    # erasing it before the comments meant a partial comment failure answered
+    # 502 "retry the purge" and the retry 404ed -- leaving comment files in
+    # Storage that nothing could ever reach or erase again. Every step below
+    # is idempotent, so a retry resumes rather than restarts: deleting
+    # already-deleted comments reports zero, and store.delete keeps the index
+    # whenever a file survives.
+    #
+    # Not a full tombstone: nothing here fences a concurrent write against an
+    # artifact being purged. That needs shared, revisioned state (see the
+    # v0.7.5 review) rather than ordering, so the race remains open.
+    threads, failed_threads = request.app.state.comments.delete_all_for(artifact_id)
+    if failed_threads:
+        # Some comment files are still in Storage, so the erasure the owner
+        # asked for did not fully happen. Reporting success would tell them a
+        # discussion is gone while it is still readable by anything that can
+        # reach those files. The artifact is deliberately left intact so the
+        # retry this asks for can authenticate and finish.
+        logger.error(
+            "Partial purge of artifact %s: %d comment thread(s) still have "
+            "Storage files; artifact kept so the purge can be retried",
+            artifact_id,
+            failed_threads,
+        )
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "comment threads not fully deleted",
+                "detail": (
+                    f"{failed_threads} of the artifact's comment threads "
+                    "could not be erased: some stored comment files remain. "
+                    "The artifact itself was left in place so this call can "
+                    "be retried; retry the purge to finish erasing it."
+                ),
+                "id": artifact_id,
+                "comment_threads_deleted": threads,
+                "comment_threads_failed": failed_threads,
+            },
+        )
 
     if not store.delete(artifact_id):
         # store.delete only reports success when *every* authoritative file is
@@ -5513,34 +5854,7 @@ def purge_artifact(
                     "still readable. Retry the delete."
                 ),
                 "id": artifact_id,
-            },
-        )
-    # Comment threads live in their own files; without this they would outlive
-    # the artifact as orphaned Storage files nothing can ever reach again.
-    threads, failed_threads = request.app.state.comments.delete_all_for(artifact_id)
-    if failed_threads:
-        # Same honesty rule as the artifact files above: some comment files are
-        # still in Storage, so the erasure the owner asked for did not fully
-        # happen. Reporting success would tell them a discussion is gone while
-        # it is still readable by anything that can reach those files.
-        logger.error(
-            "Partial purge of artifact %s: %d comment thread(s) still have "
-            "Storage files",
-            artifact_id,
-            failed_threads,
-        )
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error": "comment threads not fully deleted",
-                "detail": (
-                    f"The artifact was erased, but {failed_threads} of its "
-                    "comment threads could not be: some stored comment files "
-                    "remain. Retry the purge to finish erasing them."
-                ),
-                "id": artifact_id,
                 "comment_threads_deleted": threads,
-                "comment_threads_failed": failed_threads,
             },
         )
     # Same reasoning for the state sidecar: view rows and rate-limit counters
@@ -5568,6 +5882,63 @@ def purge_artifact(
             "purged": True,
             "comment_threads_deleted": threads,
             "note": "canonical copies in the authors' projects were not touched",
+        }
+    )
+
+
+@app.get(
+    "/api/artifacts/{artifact_id}/webhooks",
+    tags=["artifacts"],
+    summary="Read each webhook receiver's signing key",
+    description=(
+        "Owner-only. Lists the artifact's registered webhook URLs together "
+        "with the key each one's deliveries are signed with, so you can "
+        "configure the receiver to verify them.\n\n"
+        "**Every receiver has its own key**, derived from the hub's webhook "
+        "key, the artifact and the receiver URL. A receiver necessarily "
+        "learns the key it verifies with, so a single shared key would let "
+        "any receiver forge a delivery for any other receiver and any "
+        "artifact; a per-receiver key is worth exactly its own feed and "
+        "reveals nothing about the hub's key or another receiver's.\n\n"
+        "The keys are on their own endpoint rather than in the general owner "
+        "view because they are credentials: fetch one when you configure a "
+        "receiver, store it where that receiver keeps its secrets, and do "
+        "not log it. Registering the same URL again yields the same key; "
+        "removing a URL and its receiver ends its use."
+    ),
+    responses={
+        200: {
+            "description": (
+                "The registered receivers, each with its own signing key."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: RESP_OWNER_403,
+        404: RESP_NOT_FOUND,
+    },
+)
+def read_webhook_keys(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Report the per-receiver signing keys to the artifact's owner."""
+    owner, _token = auth
+    ensure_hydrated(request.app)
+    meta = request.app.state.store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    _owner_only(meta, owner)
+
+    dispatcher = request.app.state.webhooks
+    return JSONResponse(
+        {
+            "id": meta.id,
+            "webhooks": [
+                {"url": url, "signing_key": dispatcher.signing_key_for(meta.id, url)}
+                for url in list(meta.webhooks or [])
+            ],
         }
     )
 
@@ -5613,6 +5984,7 @@ def purge_artifact(
         },
     },
 )
+@_serialized_per_artifact
 def rotate_link(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -5794,6 +6166,7 @@ def artifact_stats(
         },
     },
 )
+@_serialized_per_artifact
 def create_invitation(
     body: InvitationBody,
     request: Request,
@@ -5945,6 +6318,7 @@ def list_invitations(
         },
     },
 )
+@_serialized_per_artifact
 def revoke_invitation(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -5977,9 +6351,24 @@ def revoke_invitation(
         )
 
     if not target.get("revoked"):
-        target["revoked"] = True
-        meta.updated_at = _now()
-        store.save_meta(meta)
+        # A copy, not an in-place flag. store.get_meta answers from cache, so
+        # ``meta`` is the object every later read on this replica gets:
+        # marking the invitation revoked before the save succeeds means a
+        # failed revocation still reads as revoked here, while Storage --
+        # and every other replica -- still honours the guest. The owner is
+        # told 502 and retries, but a restart rehydrates from Storage and
+        # quietly brings the guest back. save_meta uploads before it caches,
+        # so handing it a copy leaves the original untouched on failure.
+        revoked = [
+            {**invitation, "revoked": True}
+            if invitation.get("id") == invitation_id
+            else invitation
+            for invitation in meta.invitations
+        ]
+        candidate = dataclasses.replace(
+            meta, invitations=revoked, updated_at=_now()
+        )
+        store.save_meta(candidate)
         logger.info(
             "Artifact %s revoked guest invitation %s (owner project %s)",
             artifact_id,
@@ -6051,6 +6440,7 @@ def revoke_invitation(
         },
     },
 )
+@_serialized_per_artifact
 def submit_version(
     body: VersionBody,
     request: Request,
@@ -6205,6 +6595,7 @@ def submit_version(
         },
     },
 )
+@_serialized_per_artifact
 def promote_version(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -6303,6 +6694,7 @@ def promote_version(
         },
     },
 )
+@_serialized_per_artifact
 def delete_version(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -6423,6 +6815,7 @@ def delete_version(
         },
     },
 )
+@_serialized_per_artifact
 def set_head(
     body: HeadBody,
     request: Request,
@@ -6657,6 +7050,7 @@ def _may_moderate_thread(
         },
     },
 )
+@_serialized_per_comment_target
 def create_comment(
     body: CommentBody,
     request: Request,
@@ -6765,6 +7159,7 @@ def create_comment(
         },
     },
 )
+@_serialized_per_comment_target
 def reply_to_comment(
     body: ReplyBody,
     request: Request,
@@ -6797,13 +7192,19 @@ def reply_to_comment(
     if not _claim_comment_slot(request.app, meta.id, writer_key):
         return _comment_rate_limited(guest=caller is None)
 
-    thread.replies.append(
-        Reply(author=author, body=body.body, created_at=_now())
+    # A copy, not an append. CommentStore.get answers from its in-memory LRU,
+    # so the object here is the very one every later read on this replica
+    # gets: mutating it before the write succeeds means a refused reply is
+    # still shown, and is persisted by whatever writes the thread next.
+    candidate = dataclasses.replace(
+        thread,
+        replies=[*thread.replies, Reply(author=author, body=body.body, created_at=_now())],
     )
     try:
-        comments.update(thread)
+        comments.update(candidate)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    thread = candidate
 
     _emit_webhook(
         request,
@@ -6837,6 +7238,10 @@ def reply_to_comment(
         "A guest (X-Artifact-Guest) may resolve and reopen the threads they "
         "opened themselves, and only those — an invitation never carries "
         "moderation authority over anybody else's thread.\n\n"
+        "**Frozen documents refuse this.** A 'final' or trashed document "
+        "freezes the state of its discussion as well as its content, so "
+        "resolving and reopening are 409 there, exactly like a new comment "
+        "or reply.\n\n"
         + COMMENT_PASSWORD_NOTE + "\n\n" + COMMENT_TARGET_NOTE
     ),
     responses={
@@ -6858,7 +7263,8 @@ def reply_to_comment(
         409: {
             "description": (
                 "The thread is already resolved (or already open, when "
-                "reopening)."
+                "reopening), or the document is frozen — 'final' or trashed "
+                "freezes thread moderation too."
             )
         },
         429: RESP_COMMENT_MOD_429,
@@ -6870,6 +7276,7 @@ def reply_to_comment(
         },
     },
 )
+@_serialized_per_comment_target
 def resolve_comment(
     request: Request,
     artifact_id: str = PathParam(..., description=COMMENT_TARGET_ID_DESC),
@@ -6901,6 +7308,14 @@ def resolve_comment(
                 "or reopen it"
             ),
         )
+    if meta.is_frozen():
+        # Same gate as a new comment or reply. Resolving and reopening are
+        # not new content, but they change the state of the discussion a
+        # frozen document is supposed to have fixed -- leaving them open
+        # meant "final" froze what could be added and not what the record
+        # said. Checked after authorization so a caller who may not moderate
+        # at all still learns that first.
+        return _document_frozen(meta, "thread moderation")
 
     wanted = True if body is None else bool(body.resolved)
     if thread.resolved == wanted:
@@ -6916,9 +7331,18 @@ def resolve_comment(
         )
 
     author, writer_key = _comment_author(caller, invitation)
-    thread.resolved = wanted
-    thread.resolved_by = author if wanted else None
-    comments.update(thread)
+    # Copied for the same reason as a reply: the thread is the cached object,
+    # so a failed write must not leave it looking resolved to every later read.
+    candidate = dataclasses.replace(
+        thread, resolved=wanted, resolved_by=author if wanted else None
+    )
+    try:
+        comments.update(candidate)
+    except ValueError as exc:
+        # A thread that is already over an aggregate budget must still answer
+        # with a reason rather than a 500 -- resolving it adds no content.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    thread = candidate
 
     logger.info(
         "Comment thread %s of artifact %s %s by %s",
@@ -6940,6 +7364,12 @@ def resolve_comment(
         "(withdrawing a comment); anyone else gets a 403. Irreversible.\n\n"
         "A guest (X-Artifact-Guest) may withdraw the threads they opened "
         "themselves, and only those.\n\n"
+        "**On a frozen document only the owner may delete.** A 'final' or "
+        "trashed document freezes an author's withdrawal along with every "
+        "other contribution (409), but deliberately not the owner's: a "
+        "comment that has to come off a finished record — a leaked secret, "
+        "someone's personal data — must stay removable without destroying "
+        "the whole document.\n\n"
         + COMMENT_PASSWORD_NOTE + "\n\n" + COMMENT_TARGET_NOTE
     ),
     responses={
@@ -6953,6 +7383,13 @@ def resolve_comment(
             )
         },
         404: RESP_THREAD_404,
+        409: {
+            "description": (
+                "The document is frozen ('final' or trashed) and the caller "
+                "is not its owner, so this withdrawal is refused. The owner "
+                "may still delete."
+            )
+        },
         429: RESP_COMMENT_MOD_429,
         502: {
             "description": (
@@ -6965,6 +7402,7 @@ def resolve_comment(
         },
     },
 )
+@_serialized_per_comment_target
 def delete_comment(
     request: Request,
     artifact_id: str = PathParam(..., description=COMMENT_TARGET_ID_DESC),
@@ -6995,6 +7433,15 @@ def delete_comment(
                 "this comment"
             ),
         )
+    # Deliberately narrowed rather than frozen outright. Removal is the one
+    # comment mutation that has to survive a frozen document: a comment that
+    # must come off a finished record -- a leaked secret, someone's personal
+    # data -- would otherwise be unremovable short of destroying the whole
+    # artifact. An author *withdrawing* their thread is a different act,
+    # contribution-shaped like a reply, so that freezes with everything else
+    # and only the owner's moderation remains.
+    if meta.is_frozen() and (caller is None or caller.key != meta.owner_key):
+        return _document_frozen(meta, "withdrawing your own comment")
 
     if not comments.delete(meta.id, thread_id):
         # delete() reports False both when nothing matched and when a backend

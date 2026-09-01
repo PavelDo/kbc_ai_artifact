@@ -72,6 +72,11 @@ class Settings:
     # read from disk cache before serving. Records above this are skipped as a
     # denial-of-service guard (env HUB_MAX_ENVELOPE_BYTES). 0 disables the bound.
     max_envelope_bytes: int = 20 * 1024 * 1024
+    # A meta record with no version file is a publish that died between its
+    # two writes. Hydrate deletes such records once they are older than this
+    # (HUB_REAP_ABORTED_PUBLISH_AFTER_S), which is what makes them safely
+    # distinguishable from a publish still in flight; 0 disables reaping.
+    reap_aborted_publish_after_s: int = 3600
     # Per-artifact cap on retained "proposed" versions; the oldest proposals
     # above this are pruned (env HUB_MAX_PROPOSED_VERSIONS). Proposals are never
     # served as head, so pruning the oldest is always safe.
@@ -108,6 +113,12 @@ class Settings:
     # How many webhook URLs one artifact may register
     # (HUB_MAX_WEBHOOKS_PER_ARTIFACT).
     max_webhooks_per_artifact: int = 5
+    # Ceiling on queued-but-undelivered webhook deliveries
+    # (HUB_WEBHOOK_QUEUE_MAX). One thread consumes them and sleeps through
+    # retry backoff, so a stalled receiver would otherwise let the queue grow
+    # without limit; past the ceiling the newest delivery is dropped with a
+    # log line rather than blocking the request that produced it.
+    webhook_queue_max: int = 1000
     # Guest invitations (0.7.0)
     # How many invitations one artifact may hold at once
     # (HUB_MAX_INVITATIONS_PER_ARTIFACT). Each entry is a named capability
@@ -158,6 +169,7 @@ def load_settings() -> Settings:
         max_comments_per_day=_int_env("HUB_MAX_COMMENTS_PER_DAY", 100),
         extra_stacks=extra,
         max_envelope_bytes=_int_env("HUB_MAX_ENVELOPE_BYTES", 20 * 1024 * 1024),
+        reap_aborted_publish_after_s=_int_env("HUB_REAP_ABORTED_PUBLISH_AFTER_S", 3600),
         max_proposed_versions=_int_env("HUB_MAX_PROPOSED_VERSIONS", 50),
         trust_forwarded_headers=_bool_env("HUB_TRUST_FORWARDED_HEADERS", False),
         max_unlock_attempts_per_hour=_int_env(
@@ -173,6 +185,7 @@ def load_settings() -> Settings:
         webhook_timeout_s=_int_env("HUB_WEBHOOK_TIMEOUT_S", 10),
         webhook_max_attempts=_int_env("HUB_WEBHOOK_MAX_ATTEMPTS", 3),
         max_webhooks_per_artifact=_int_env("HUB_MAX_WEBHOOKS_PER_ARTIFACT", 5),
+        webhook_queue_max=_int_env("HUB_WEBHOOK_QUEUE_MAX", 1000),
         max_invitations_per_artifact=_int_env(
             "HUB_MAX_INVITATIONS_PER_ARTIFACT", 20
         ),

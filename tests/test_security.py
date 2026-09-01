@@ -6,6 +6,8 @@ import time
 
 from src.security import (
     KEY_LABEL_UNLOCK_COOKIE,
+    MAX_PBKDF2_ITERATIONS,
+    MIN_PBKDF2_ITERATIONS,
     KEY_LABEL_WEBHOOK,
     CookieSigner,
     check_password,
@@ -43,8 +45,12 @@ class TestPasswordHashing:
     def test_old_iterations_honored(self):
         # Simulate a record created under a lower, now-superseded iteration
         # count: check_password must use record["iterations"], not the
-        # module's current PBKDF2_ITERATIONS, to verify it.
-        old_iterations = 1000
+        # module's current PBKDF2_ITERATIONS, to verify it. The count stays
+        # at or above MIN_PBKDF2_ITERATIONS -- honouring a stored cost is not
+        # the same as honouring an arbitrarily downgraded one, and every
+        # record this project has ever written used PBKDF2_ITERATIONS
+        # anyway (see TestKdfCostPolicy).
+        old_iterations = MIN_PBKDF2_ITERATIONS
         salt = bytes.fromhex(hash_password("placeholder")["salt"])
         digest = hashlib.pbkdf2_hmac("sha256", b"hunter2", salt, old_iterations)
         record = {
@@ -228,3 +234,62 @@ class TestCookieSigner:
         alphabet has no ".", so the two payload spaces never overlap.
         """
         assert all("." not in new_artifact_id() for _ in range(200))
+
+
+class TestKdfCostPolicy:
+    """A persisted record must not be able to dictate the KDF cost freely.
+
+    ``check_password`` honours ``record["iterations"]`` so hashes made under
+    an older cost keep verifying. That trust has to be bounded in both
+    directions: a hostile or corrupted record could otherwise turn one unlock
+    attempt into minutes of CPU, or silently downgrade the KDF to a cost that
+    is cheap to brute-force.
+
+    Each test below builds a record whose hash is *genuinely correct* for the
+    out-of-policy count, so an implementation without the bound would answer
+    True. Asserting False therefore tests the policy, not a hash mismatch.
+    """
+
+    @staticmethod
+    def _record_at(password: str, iterations: int) -> dict:
+        """A well-formed record whose hash really was computed at ``iterations``."""
+        salt = bytes.fromhex("00112233445566778899aabbccddeeff")
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, iterations
+        )
+        return {
+            "algo": "pbkdf2-sha256",
+            "iterations": iterations,
+            "salt": salt.hex(),
+            "hash": digest.hex(),
+        }
+
+    def test_a_correct_hash_below_the_policy_minimum_is_still_refused(self):
+        record = self._record_at("hunter2", MIN_PBKDF2_ITERATIONS - 1)
+        assert check_password("hunter2", record) is False
+
+    def test_a_downgraded_record_cannot_make_verification_trivial(self):
+        record = self._record_at("hunter2", 1)
+        assert check_password("hunter2", record) is False
+
+    def test_iterations_above_the_maximum_never_reach_the_kdf(self, monkeypatch):
+        record = self._record_at("hunter2", MIN_PBKDF2_ITERATIONS)
+        record["iterations"] = MAX_PBKDF2_ITERATIONS + 1
+
+        def fail(*args, **kwargs):
+            raise AssertionError("pbkdf2_hmac ran for an out-of-policy record")
+
+        monkeypatch.setattr(hashlib, "pbkdf2_hmac", fail)
+        assert check_password("hunter2", record) is False
+
+    def test_an_absurd_iteration_count_is_rejected_quickly(self):
+        record = self._record_at("hunter2", MIN_PBKDF2_ITERATIONS)
+        record["iterations"] = 10_000_000_000
+        started = time.monotonic()
+        assert check_password("hunter2", record) is False
+        assert time.monotonic() - started < 1.0
+
+    def test_the_policy_range_admits_records_this_build_writes(self):
+        record = hash_password("hunter2")
+        assert MIN_PBKDF2_ITERATIONS <= record["iterations"] <= MAX_PBKDF2_ITERATIONS
+        assert check_password("hunter2", record) is True

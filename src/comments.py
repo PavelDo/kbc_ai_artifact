@@ -43,6 +43,8 @@ __all__ = [
     "AUTHOR_GUEST",
     "MAX_BODY_CHARS",
     "MAX_QUOTE_CHARS",
+    "MAX_REPLIES_PER_THREAD",
+    "MAX_THREAD_BYTES",
     "SCHEMA_VERSION",
     "SELECTOR_CONTEXT_CHARS",
     "TAG_CMT_ALL",
@@ -74,6 +76,15 @@ _TAG_CMT_ID_PREFIX = "cmt-id-"
 MAX_BODY_CHARS = 10_000
 #: Longest accepted quoted selection, in characters.
 MAX_QUOTE_CHARS = 2_000
+
+#: Aggregate budgets for one persisted thread. MAX_BODY_CHARS bounds a single
+#: body, but nothing bounded how many of them accumulate: a thread is rewritten
+#: whole on every reply, resolve and edit, and re-read on every hydration,
+#: listing and render, so its total size is a cost multiplier rather than a
+#: one-off. Both are checked on the way in (so no such record is ever written)
+#: and on the way out (so one that somehow exists cannot be expensive to read).
+MAX_REPLIES_PER_THREAD = 500
+MAX_THREAD_BYTES = 2_000_000
 #: How much context the UI captures on each side of the quote. Advisory only —
 #: this module accepts whatever prefix/suffix the caller recorded.
 SELECTOR_CONTEXT_CHARS = 32
@@ -211,7 +222,17 @@ def _identity_summary(identity: dict | None) -> dict:
 
 
 def _load_object(raw: bytes, what: str) -> dict:
-    """Decode UTF-8 JSON that must be an object, or raise ``ValueError``."""
+    """Decode UTF-8 JSON that must be an object, or raise ``ValueError``.
+
+    The byte budget is enforced first, on the raw buffer, because the cost
+    this bounds is the decode itself: checking after ``json.loads`` would
+    have already paid for the parse tree it is meant to prevent.
+    """
+    if len(raw) > MAX_THREAD_BYTES:
+        raise ValueError(
+            f"{what} record is too large "
+            f"({len(raw)} bytes, maximum is {MAX_THREAD_BYTES})"
+        )
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -219,6 +240,22 @@ def _load_object(raw: bytes, what: str) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"{what} JSON is not an object")
     return data
+
+
+def _replies_from(raw_replies: object) -> list["Reply"]:
+    """Materialize a persisted reply array, refusing an over-budget one first.
+
+    The count is checked against the list before any ``Reply`` is built, so an
+    oversized record costs one ``len()`` rather than one object per entry.
+    """
+    if not isinstance(raw_replies, list):
+        return []
+    if len(raw_replies) > MAX_REPLIES_PER_THREAD:
+        raise ValueError(
+            f"Comment thread has too many replies "
+            f"({len(raw_replies)}, maximum is {MAX_REPLIES_PER_THREAD})"
+        )
+    return [Reply.from_dict(item) for item in raw_replies]
 
 
 @dataclass
@@ -366,13 +403,14 @@ class CommentThread:
             body=str(data.get("body") or ""),
             author=author if isinstance(author, dict) else {},
             created_at=str(data.get("created_at") or ""),
-            resolved=bool(data.get("resolved")),
+            # Strictly bool, never truthiness: this value arrives from a
+            # persisted envelope, and bool("false") is True -- a malformed
+            # record would otherwise close a thread it says is open. Anything
+            # that is not a real bool leaves the thread open, the state that
+            # keeps the discussion visible.
+            resolved=data.get("resolved") is True,
             resolved_by=resolved_by if isinstance(resolved_by, dict) else None,
-            replies=(
-                [Reply.from_dict(item) for item in raw_replies]
-                if isinstance(raw_replies, list)
-                else []
-            ),
+            replies=_replies_from(raw_replies),
             schema=schema if isinstance(schema, int) else SCHEMA_VERSION,
         )
 
@@ -417,8 +455,22 @@ def _validate(thread: CommentThread) -> None:
             f"The quoted selection is too long "
             f"({len(exact)} characters, maximum is {MAX_QUOTE_CHARS})"
         )
+    if len(thread.replies) > MAX_REPLIES_PER_THREAD:
+        raise ValueError(
+            f"Comment thread has too many replies "
+            f"({len(thread.replies)}, maximum is {MAX_REPLIES_PER_THREAD})"
+        )
     for reply in thread.replies:
         _validate_body(reply.body, "Reply")
+    # Aggregate size last: the per-field checks above give a caller a precise
+    # reason where they apply, and this one only fires when every individual
+    # part is legal but their sum is not.
+    serialized = len(thread.to_json())
+    if serialized > MAX_THREAD_BYTES:
+        raise ValueError(
+            f"Comment thread is too large "
+            f"({serialized} bytes, maximum is {MAX_THREAD_BYTES})"
+        )
 
 
 def _validate_body(body: str, what: str) -> None:

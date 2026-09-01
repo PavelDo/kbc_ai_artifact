@@ -15,6 +15,7 @@ import pytest
 
 from src.webhooks import (
     SIGNATURE_HEADER,
+    receiver_signing_key,
     USER_AGENT,
     WebhookDispatcher,
     WebhookEvent,
@@ -42,10 +43,13 @@ class Recorder:
         return outcome
 
 
-def make_dispatcher(statuses: list, *, max_attempts: int = 3):
+def make_dispatcher(statuses: list, *, max_attempts: int = 3, queue_max: int = 1000):
     """A dispatcher wired to a Recorder, with sleeping neutered."""
     dispatcher = WebhookDispatcher(
-        timeout_s=5, max_attempts=max_attempts, sign_secret=SECRET
+        timeout_s=5,
+        max_attempts=max_attempts,
+        sign_secret=SECRET,
+        queue_max=queue_max,
     )
     recorder = Recorder(statuses)
     slept: list[float] = []
@@ -77,7 +81,13 @@ class TestDelivery:
 
         url, body, headers = recorder.posts[0]
         assert url == HOOK_URL
-        assert json.loads(body) == {
+        document = json.loads(body)
+        # The two ids are generated per event/receiver, so they are checked
+        # for identity behaviour in TestDeliveryIdentity rather than pinned
+        # to a literal here.
+        ids = {"event_id": document.pop("event_id"), "delivery_id": document.pop("delivery_id")}
+        assert all(ids.values())
+        assert document == {
             "event": "version.published",
             "artifact_id": "abc123",
             "payload": {"title": "Quarterly review", "version": 4},
@@ -93,9 +103,12 @@ class TestDelivery:
         dispatcher.drain()
 
         _, body, headers = recorder.posts[0]
-        expected = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+        # Keyed per receiver, not with the hub-wide webhook key -- see
+        # TestPerReceiverSigningKeys for why.
+        key = receiver_signing_key(SECRET, "abc123", HOOK_URL)
+        expected = hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
         assert headers[SIGNATURE_HEADER] == f"sha256={expected}"
-        assert sign_body(body, SECRET) == headers[SIGNATURE_HEADER]
+        assert sign_body(body, key) == headers[SIGNATURE_HEADER]
 
     def test_a_different_secret_does_not_verify(self) -> None:
         dispatcher, recorder, _ = make_dispatcher([200])
@@ -155,7 +168,9 @@ class TestSlackCompatibility:
         assert "petr" in document["text"]
         assert "https://hub.example.com/a/abc123" in document["text"]
         # Still signed, over the Slack-shaped bytes.
-        assert headers[SIGNATURE_HEADER] == sign_body(body, SECRET)
+        assert headers[SIGNATURE_HEADER] == sign_body(
+            body, receiver_signing_key(SECRET, "abc123", SLACK_URL)
+        )
 
     def test_slack_falls_back_to_the_artifact_id(self) -> None:
         dispatcher, recorder, _ = make_dispatcher([200])
@@ -352,6 +367,33 @@ class TestDeliveryTimeSsrfGuard:
         # First attempt posted (got 500), second attempt blocked before posting.
         assert len(recorder.posts) == 1
 
+    def test_a_resolver_error_at_delivery_drops_the_delivery(self) -> None:
+        """Failing to resolve is not proof the destination is safe.
+
+        The guard's resolver and httpx's own resolution are two separate
+        lookups. A DNS server the attacker controls can answer this probe
+        with SERVFAIL and then hand httpx 127.0.0.1 a moment later -- so
+        treating "could not resolve" as "allowed" lets a rebind through
+        without even having to win a race against a public answer.
+        """
+        def unresolvable(_hostname: str) -> list[str]:
+            raise OSError("SERVFAIL")
+
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher._resolver = unresolvable
+
+        dispatcher.emit([HOOK_URL], an_event())
+        assert dispatcher.drain() == 1
+        assert recorder.posts == []
+
+    def test_an_empty_answer_at_delivery_drops_the_delivery(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher._resolver = lambda _hostname: []
+
+        dispatcher.emit([HOOK_URL], an_event())
+        assert dispatcher.drain() == 1
+        assert recorder.posts == []
+
     def test_metadata_hostname_is_dropped_at_delivery(self) -> None:
         dispatcher, recorder, _ = make_dispatcher([200])
         dispatcher._resolver = self.public  # would be public, but host is blocked
@@ -412,3 +454,183 @@ class TestLifecycle:
     def test_stop_without_start_is_a_no_op(self) -> None:
         dispatcher, _, _ = make_dispatcher([200])
         dispatcher.stop()
+
+
+class TestDeliveryIdentity:
+    """A receiver has to be able to tell a retry from a new event.
+
+    Without an identifier that survives a retry, a receiver that answered
+    slowly -- or answered 500 after acting -- has no way to recognise the
+    second POST as the same delivery, so retries become duplicate work.
+    """
+
+    def test_the_envelope_carries_an_event_and_delivery_id(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher.emit([HOOK_URL], an_event())
+        dispatcher.drain()
+
+        body = json.loads(recorder.posts[0][1])
+        assert body["event_id"]
+        assert body["delivery_id"]
+        assert body["event_id"] != body["delivery_id"]
+
+    def test_a_retry_repeats_the_same_delivery_id(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([500, 200])
+        dispatcher.emit([HOOK_URL], an_event())
+        dispatcher.drain()
+
+        assert len(recorder.posts) == 2
+        first, second = (json.loads(post[1]) for post in recorder.posts)
+        assert first["delivery_id"] == second["delivery_id"]
+        assert first["event_id"] == second["event_id"]
+
+    def test_two_receivers_share_the_event_but_not_the_delivery(self) -> None:
+        other = "https://example.com/hooks/second"
+        dispatcher, recorder, _ = make_dispatcher([200, 200])
+        dispatcher.emit([HOOK_URL, other], an_event())
+        dispatcher.drain()
+
+        first, second = (json.loads(post[1]) for post in recorder.posts)
+        assert first["event_id"] == second["event_id"]
+        assert first["delivery_id"] != second["delivery_id"]
+
+    def test_two_events_get_different_event_ids(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([200, 200])
+        dispatcher.emit([HOOK_URL], an_event())
+        dispatcher.emit([HOOK_URL], an_event())
+        dispatcher.drain()
+
+        first, second = (json.loads(post[1]) for post in recorder.posts)
+        assert first["event_id"] != second["event_id"]
+
+    def test_slack_deliveries_carry_the_ids_in_headers(self) -> None:
+        """Slack gets a different body, so the ids have to travel in headers.
+
+        They are sent on every delivery, not just Slack's, so a receiver can
+        dedupe without parsing the body at all.
+        """
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher.emit([SLACK_URL], an_event())
+        dispatcher.drain()
+
+        _url, body, headers = recorder.posts[0]
+        assert "text" in json.loads(body)
+        assert headers["X-Hub-Event-Id"]
+        assert headers["X-Hub-Delivery-Id"]
+
+
+class TestQueueIsBounded:
+    """A queue with no ceiling turns a stalled receiver into a memory leak.
+
+    Deliveries are produced in the request path and consumed by one thread
+    that sleeps through retries, so production can outrun consumption
+    indefinitely.
+    """
+
+    def test_emitting_past_the_ceiling_drops_rather_than_grows(self) -> None:
+        dispatcher, _recorder, _ = make_dispatcher([], queue_max=3)
+        for _ in range(10):
+            dispatcher.emit([HOOK_URL], an_event())
+
+        assert dispatcher.pending() == 3
+
+    def test_emit_never_blocks_the_caller(self) -> None:
+        dispatcher, _recorder, _ = make_dispatcher([], queue_max=1)
+        started = time.monotonic()
+        for _ in range(50):
+            dispatcher.emit([HOOK_URL], an_event())
+        assert time.monotonic() - started < 1.0
+
+    def test_room_frees_up_once_deliveries_are_consumed(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([200, 200], queue_max=2)
+        for _ in range(5):
+            dispatcher.emit([HOOK_URL], an_event())
+        assert dispatcher.pending() == 2
+
+        assert dispatcher.drain() == 2
+        dispatcher.emit([HOOK_URL], an_event())
+        assert dispatcher.pending() == 1
+
+
+class TestPerReceiverSigningKeys:
+    """One shared signing key makes every receiver a forger.
+
+    A receiver necessarily learns the key its deliveries are signed with. If
+    that key is the same for everyone, any receiver can mint a delivery that
+    verifies for any other receiver and any artifact -- so a webhook on one
+    document confers authority over notifications about every document.
+    """
+
+    def test_each_receiver_gets_its_own_key(self) -> None:
+        other = "https://example.com/hooks/second"
+        dispatcher, recorder, _ = make_dispatcher([200, 200])
+        dispatcher.emit([HOOK_URL, other], an_event())
+        dispatcher.drain()
+
+        (_u1, body1, headers1), (_u2, body2, headers2) = recorder.posts
+        # Each verifies under its own key...
+        assert headers1[SIGNATURE_HEADER] == sign_body(
+            body1, receiver_signing_key(SECRET, "abc123", HOOK_URL)
+        )
+        assert headers2[SIGNATURE_HEADER] == sign_body(
+            body2, receiver_signing_key(SECRET, "abc123", other)
+        )
+        # ...and not under the other's.
+        assert headers1[SIGNATURE_HEADER] != sign_body(
+            body1, receiver_signing_key(SECRET, "abc123", other)
+        )
+
+    def test_the_same_receiver_gets_a_different_key_per_artifact(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([200, 200])
+        dispatcher.emit([HOOK_URL], an_event(artifact_id="first"))
+        dispatcher.emit([HOOK_URL], an_event(artifact_id="second"))
+        dispatcher.drain()
+
+        (_u1, body1, headers1), (_u2, body2, headers2) = recorder.posts
+        assert headers1[SIGNATURE_HEADER] == sign_body(
+            body1, receiver_signing_key(SECRET, "first", HOOK_URL)
+        )
+        assert headers2[SIGNATURE_HEADER] != sign_body(
+            body2, receiver_signing_key(SECRET, "first", HOOK_URL)
+        )
+
+    def test_the_shared_key_alone_no_longer_verifies(self) -> None:
+        """The whole point: knowing the hub's webhook key is not enough."""
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher.emit([HOOK_URL], an_event())
+        dispatcher.drain()
+
+        _url, body, headers = recorder.posts[0]
+        assert headers[SIGNATURE_HEADER] != sign_body(body, SECRET)
+
+    def test_a_receiver_key_does_not_reveal_the_shared_key(self) -> None:
+        key = receiver_signing_key(SECRET, "abc123", HOOK_URL)
+        assert SECRET not in key
+        assert key != SECRET
+
+    def test_retries_keep_the_same_key(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([500, 200])
+        dispatcher.emit([HOOK_URL], an_event())
+        dispatcher.drain()
+
+        assert len(recorder.posts) == 2
+        assert recorder.posts[0][2][SIGNATURE_HEADER] == recorder.posts[1][2][
+            SIGNATURE_HEADER
+        ]
+
+    def test_slack_is_signed_under_its_own_receiver_key(self) -> None:
+        """Slack ignores the header, but the key must still be receiver-bound.
+
+        Otherwise a Slack webhook -- the easiest kind to obtain, since the
+        URL is all there is to it -- would hand its holder the key every
+        other receiver's deliveries are signed with.
+        """
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher.emit([SLACK_URL], an_event())
+        dispatcher.drain()
+
+        _url, body, headers = recorder.posts[0]
+        assert headers[SIGNATURE_HEADER] == sign_body(
+            body, receiver_signing_key(SECRET, "abc123", SLACK_URL)
+        )
+        assert headers[SIGNATURE_HEADER] != sign_body(body, SECRET)

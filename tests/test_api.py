@@ -32,6 +32,7 @@ import html
 import io
 import json
 import logging
+import pathlib
 import re
 import zipfile
 from typing import Any, NamedTuple
@@ -43,6 +44,7 @@ import src.main as main
 import src.pages as pages
 from src.auth import STACK_ALIASES, AuthError, Owner
 from src.builder import BuiltArtifact
+import src.comments as comments_module
 from src.comments import CommentStore
 from src.config import load_settings
 from src.kbc import BackendError, InMemoryFilesBackend
@@ -53,6 +55,7 @@ from src.security import (
     derive_key,
 )
 from src.statedb import StateDB
+from src.webhooks import receiver_signing_key
 from src.store import ArtifactStore
 
 AUTH_HEADERS = {"X-StorageApi-Token": "good-token", "X-Kbc-Stack": "us"}
@@ -110,6 +113,11 @@ def api(tmp_path, settings, monkeypatch):
                 }
             )
             return file_id
+
+        def delete(self, file_id: int) -> None:
+            canonical_calls.append(
+                {"stack_url": self.stack_url, "token": self.token, "deleted": file_id}
+            )
 
     def fake_kbc_files_backend(stack_url: str, token: str):
         """Route hub-project calls to the shared in-memory backend, else fake."""
@@ -263,6 +271,7 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("DELETE", "/api/artifacts/{id}"),
         ("POST", "/api/artifacts/{id}/restore"),
         ("DELETE", "/api/artifacts/{id}/purge"),
+        ("GET", "/api/artifacts/{id}/webhooks"),
         ("POST", "/api/artifacts/{id}/rotate-link"),
         ("GET", "/api/artifacts/{id}/stats"),
         ("POST", "/api/artifacts/{id}/invitations"),
@@ -967,6 +976,274 @@ def test_publish_git_username_with_markdown_is_422(api: Api) -> None:
     assert "git_url" in resp.json()["detail"]
 
 
+def test_a_failed_revocation_does_not_look_revoked(api: Api, monkeypatch) -> None:
+    """A revocation that could not be persisted must not appear to have taken.
+
+    store.get_meta answers from cache, so setting revoked on the invitation
+    before save_meta succeeds marks it revoked on this replica only. The
+    owner is told 502, so they know to retry -- but a later list on this
+    same replica shows it revoked, and a restart rehydrates from Storage and
+    brings the guest back. A revocation that silently undoes itself is worse
+    than one that plainly failed.
+    """
+    artifact_id = _publish_markdown(api, "# One")
+    minted = api.client.post(
+        f"/api/artifacts/{artifact_id}/invitations",
+        json={"name": "Jana"},
+        headers=AUTH_HEADERS,
+    )
+    assert minted.status_code == 201, minted.text
+    invitation_id = minted.json()["invitation_id"]
+
+    store = main.app.state.store
+    working_save = store.save_meta
+
+    def failing_save(_meta):
+        raise BackendError("storage is down")
+
+    # Restored by hand rather than with monkeypatch.undo(), which would also
+    # roll back the api fixture's own patches (verify_token among them).
+    store.save_meta = failing_save
+    try:
+        refused = api.client.delete(
+            f"/api/artifacts/{artifact_id}/invitations/{invitation_id}",
+            headers=AUTH_HEADERS,
+        )
+        assert refused.status_code == 502, refused.text
+    finally:
+        store.save_meta = working_save
+
+    listed = api.client.get(
+        f"/api/artifacts/{artifact_id}/invitations", headers=AUTH_HEADERS
+    ).json()["invitations"]
+    assert listed[0]["revoked"] is False
+
+
+def test_a_successful_revocation_is_visible_immediately(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    invitation_id = api.client.post(
+        f"/api/artifacts/{artifact_id}/invitations",
+        json={"name": "Jana"},
+        headers=AUTH_HEADERS,
+    ).json()["invitation_id"]
+
+    assert (
+        api.client.delete(
+            f"/api/artifacts/{artifact_id}/invitations/{invitation_id}",
+            headers=AUTH_HEADERS,
+        ).status_code
+        == 200
+    )
+    listed = api.client.get(
+        f"/api/artifacts/{artifact_id}/invitations", headers=AUTH_HEADERS
+    ).json()["invitations"]
+    assert listed[0]["revoked"] is True
+
+
+class TestFrozenDocumentsFreezeModeration:
+    """A frozen document blocked new comments but not the state of old ones.
+
+    "Final" and "trashed" are advertised as freezing contributions, yet
+    resolve, reopen and an author's withdrawal all still rewrote the
+    discussion afterwards -- so the frozen record was not actually fixed.
+    """
+
+    def test_resolving_a_thread_on_a_final_document_is_409(self, api: Api) -> None:
+        artifact_id = _publish_markdown(api, "# One")
+        thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+        assert _policy(api, artifact_id, status="final").status_code == 200
+
+        resp = api.client.post(
+            f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+            json={"resolved": True},
+            headers=AUTH_HEADERS,
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"] == "document is final"
+
+    def test_reopening_a_thread_on_a_final_document_is_409(self, api: Api) -> None:
+        artifact_id = _publish_markdown(api, "# One")
+        thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+        assert (
+            api.client.post(
+                f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+                json={"resolved": True},
+                headers=AUTH_HEADERS,
+            ).status_code
+            == 200
+        )
+        assert _policy(api, artifact_id, status="final").status_code == 200
+
+        resp = api.client.post(
+            f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+            json={"resolved": False},
+            headers=AUTH_HEADERS,
+        )
+        assert resp.status_code == 409, resp.text
+
+    def test_resolving_on_a_trashed_document_says_trashed(self, api: Api) -> None:
+        artifact_id = _publish_markdown(api, "# One")
+        thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+        assert (
+            api.client.delete(
+                f"/api/artifacts/{artifact_id}", headers=AUTH_HEADERS
+            ).status_code
+            == 200
+        )
+
+        resp = api.client.post(
+            f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+            json={"resolved": True},
+            headers=AUTH_HEADERS,
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"] == "document is trashed"
+
+    def test_the_owner_can_still_delete_a_thread_on_a_final_document(
+        self, api: Api
+    ) -> None:
+        """Deliberately not frozen: removal must stay possible.
+
+        Freezing this would mean a comment that has to come off a finished
+        document -- a leaked secret, someone's personal data -- never could,
+        short of destroying the whole document.
+        """
+        artifact_id = _publish_markdown(api, "# One")
+        thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+        assert _policy(api, artifact_id, status="final").status_code == 200
+
+        resp = api.client.delete(
+            f"/api/artifacts/{artifact_id}/comments/{thread_id}",
+            headers=AUTH_HEADERS,
+        )
+        assert resp.status_code == 200, resp.text
+
+    def test_an_author_cannot_withdraw_their_thread_once_frozen(
+        self, api: Api
+    ) -> None:
+        """Withdrawal is a contribution-shaped change; owner moderation is not."""
+        artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+        authored = _comment(api, artifact_id, exact="One", headers=OTHER_AUTH_HEADERS)
+        assert authored.status_code == 201, authored.text
+        thread_id = authored.json()["id"]
+        assert _policy(api, artifact_id, status="final").status_code == 200
+
+        resp = api.client.delete(
+            f"/api/artifacts/{artifact_id}/comments/{thread_id}",
+            headers=OTHER_AUTH_HEADERS,
+        )
+        assert resp.status_code == 409, resp.text
+
+    def test_a_draft_document_still_allows_all_of_it(self, api: Api) -> None:
+        artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+        authored = _comment(api, artifact_id, exact="One", headers=OTHER_AUTH_HEADERS)
+        thread_id = authored.json()["id"]
+        assert (
+            api.client.post(
+                f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+                json={"resolved": True},
+                headers=AUTH_HEADERS,
+            ).status_code
+            == 200
+        )
+        assert (
+            api.client.delete(
+                f"/api/artifacts/{artifact_id}/comments/{thread_id}",
+                headers=OTHER_AUTH_HEADERS,
+            ).status_code
+            == 200
+        )
+
+
+def test_a_rejected_reply_does_not_linger_in_the_thread(
+    api: Api, monkeypatch
+) -> None:
+    """A write that was refused must leave no trace in what readers see.
+
+    CommentStore.get returns the *cached* thread object, so appending a reply
+    to it before the write succeeds mutates what every later read on this
+    replica returns -- a reply that was refused would still be shown, and
+    would be persisted by whatever wrote the thread next.
+    """
+    monkeypatch.setattr(comments_module, "MAX_REPLIES_PER_THREAD", 1)
+    artifact_id = _publish_markdown(api, "# One")
+    created = _comment(api, artifact_id, exact="One")
+    assert created.status_code == 201
+    thread_id = created.json()["id"]
+
+    accepted = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}/replies",
+        json={"body": "first reply"},
+        headers=AUTH_HEADERS,
+    )
+    assert accepted.status_code == 201, accepted.text
+
+    refused = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}/replies",
+        json={"body": "one too many"},
+        headers=AUTH_HEADERS,
+    )
+    assert refused.status_code == 422, refused.text
+
+    threads = api.client.get(f"/a/{artifact_id}/comments").json()["threads"]
+    bodies = [reply["body"] for reply in threads[0]["replies"]]
+    assert bodies == ["first reply"]
+
+
+def test_a_rejected_resolve_leaves_the_thread_open(api: Api, monkeypatch) -> None:
+    """Same rule for resolve: a refused write must not change what readers see."""
+    artifact_id = _publish_markdown(api, "# One")
+    created = _comment(api, artifact_id, exact="One")
+    assert created.status_code == 201
+    thread_id = created.json()["id"]
+
+    # Any write is over budget now, so the resolve is refused at the store.
+    monkeypatch.setattr(comments_module, "MAX_THREAD_BYTES", 1)
+    refused = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+        json={"resolved": True},
+        headers=AUTH_HEADERS,
+    )
+    assert refused.status_code == 422, refused.text
+
+    monkeypatch.undo()
+    threads = api.client.get(f"/a/{artifact_id}/comments").json()["threads"]
+    assert threads[0]["resolved"] is False
+
+
+def test_publish_with_a_commit_id_git_ref_is_422_with_a_usable_message(
+    api: Api,
+) -> None:
+    """The contract says branch or tag, so a commit id gets a clear refusal.
+
+    Checked before the clone -- and before any DNS -- so the caller learns
+    what was wrong with its request instead of an opaque git failure.
+    """
+    resp = api.client.post(
+        "/api/artifacts",
+        json={
+            "git_url": "https://github.com/org/repo",
+            "git_ref": "0" * 40,
+        },
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert "commit id" in detail
+    assert "branch or a tag" in detail
+
+
+def test_openapi_does_not_promise_commit_ids_for_git_ref(api: Api) -> None:
+    schema = api.client.get("/openapi.json").json()
+    for name in ("PublishBody", "UpdateBody"):
+        body = schema["components"]["schemas"].get(name)
+        if body is None or "git_ref" not in body.get("properties", {}):
+            continue
+        description = body["properties"]["git_ref"]["description"]
+        assert "branch or tag" in description or "branch or a tag" in description
+        assert "tag or commit" not in description
+
+
 def test_put_git_token_without_git_url_is_422(api: Api) -> None:
     artifact_id = _publish_markdown(api, "# Original")
     resp = api.client.put(
@@ -1614,6 +1891,118 @@ def test_diff_malformed_spec_is_400_and_missing_version_is_404(api: Api) -> None
     assert api.client.get(f"/a/{artifact_id}/diff/1..9").status_code == 404
 
 
+def test_changelog_documents_every_released_version(api: Api) -> None:
+    """The changelog is how a reader learns what changed, security included.
+
+    A gap in it is invisible: nothing else in the service reports that a
+    release happened. Requiring the newest section to name the running
+    version turns "we forgot to write the entry" into a failing test rather
+    than a silent omission.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    # A heading may cover a range of patch releases ("0.7.4–0.7.5"); every
+    # version it names counts as documented.
+    documented: list[str] = []
+    for heading in re.findall(r"^## ([0-9][0-9.–-]*)", text, flags=re.MULTILINE):
+        documented.extend(re.findall(r"\d+\.\d+\.\d+", heading))
+
+    assert documented, "the changelog has no version sections at all"
+    assert documented[0] == main.SERVICE_VERSION, (
+        f"newest changelog section is {documented[0]}, "
+        f"but this build reports {main.SERVICE_VERSION}"
+    )
+    for released in ("0.7.2", "0.7.3", "0.7.4", "0.7.5", "0.8.0", "0.9.0"):
+        assert released in documented, released
+    assert len(documented) == len(set(documented)), "a version is documented twice"
+
+
+def test_served_docs_do_not_claim_proposals_are_never_pruned(api: Api) -> None:
+    """Retention text has to match ArtifactStore._prune_proposals.
+
+    "Proposals are never pruned" was true while HUB_MAX_VERSIONS was the only
+    retention rule. HUB_MAX_PROPOSED_VERSIONS added a second one, and an agent
+    that believes the old sentence will assume a pending proposal waits
+    forever.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    served = {
+        "/agent": api.client.get("/agent").text,
+        "/skill": api.client.get("/skill").text,
+        "README.md": (root / "README.md").read_text(encoding="utf-8"),
+    }
+    for name, text in served.items():
+        assert "roposals are never pruned" not in text, name
+        assert "HUB_MAX_PROPOSED_VERSIONS" in text, name
+
+
+def test_openapi_documents_the_locked_review_shell_as_200(api: Api) -> None:
+    """The review route deliberately serves a credential-free shell while locked.
+
+    Declaring a 401 unlock form there makes generated clients and operators
+    expect a status and a flow the route never produces.
+    """
+    schema = api.client.get("/openapi.json").json()
+    review = schema["paths"]["/a/{artifact_id}/review"]["get"]
+    assert "401" not in review["responses"]
+    description = review["description"]
+    # It must say what the route does -- answer 200 while locked -- rather
+    # than inherit the shared note that promises a redirect to the standalone
+    # unlock form.
+    assert "still answers 200" in description
+    assert "browsers use the unlock form at POST" not in description
+    assert "shell" in review["responses"]["200"]["description"].lower()
+
+
+def test_locked_review_really_answers_200(api: Api) -> None:
+    """The behaviour the OpenAPI above is describing."""
+    artifact_id = _publish_markdown(api, "# Report\n")
+    resp = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"password": "hunter2"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert api.client.get(f"/a/{artifact_id}/review").status_code == 200
+    assert api.client.get(f"/a/{artifact_id}").status_code == 401
+
+
+def test_every_response_carries_a_no_referrer_policy(api: Api) -> None:
+    """Hub pages load Google Fonts, so the URL must not travel with the request.
+
+    A capability URL *is* the credential. Under a browser's default policy a
+    cross-origin stylesheet request carries the referring page's origin, and
+    a same-origin navigation carries the full URL -- neither of which a
+    third party or a linked-to site is entitled to learn.
+    """
+    artifact_id = _publish_markdown(api, "# Report\n")
+    for path in ("/", "/admin", f"/a/{artifact_id}", f"/a/{artifact_id}/review"):
+        resp = api.client.get(path)
+        assert resp.status_code == 200, path
+        assert resp.headers.get("referrer-policy") == "no-referrer", path
+
+
+def test_diff_spec_must_name_an_older_and_a_newer_version(api: Api) -> None:
+    """The operands are named older..newer, so the route has to enforce it.
+
+    2..1 would otherwise render additions as removals under labels claiming
+    the opposite, and a review reading those stats draws the reverse
+    conclusion about what changed.
+    """
+    artifact_id = _publish_and_update(api)
+
+    reversed_spec = api.client.get(f"/a/{artifact_id}/diff/2..1")
+    assert reversed_spec.status_code == 400
+    assert "older" in reversed_spec.json()["detail"].lower()
+
+    same = api.client.get(f"/a/{artifact_id}/diff/2..2")
+    assert same.status_code == 400
+
+    # The check must not depend on the versions existing: ordering is a
+    # property of the spec itself, so it is answered before any lookup.
+    assert api.client.get(f"/a/{artifact_id}/diff/9..8").status_code == 400
+
+
 # --------------------------------------------------------------------------
 # Head pointer
 # --------------------------------------------------------------------------
@@ -2215,6 +2604,66 @@ def _break_comment_deletes(api: Api, monkeypatch, tmp_path) -> None:
             tmp_path / "broken-comment-cache",
             api.settings.cache_max_entries,
         ),
+    )
+
+
+def test_a_partially_failed_purge_can_be_retried_to_completion(
+    api: Api, monkeypatch, tmp_path
+) -> None:
+    """The 502 says "retry the purge", so a retry has to be possible.
+
+    Erasing the artifact's own metadata first destroys what _owner_only
+    needs, so the advertised retry answered 404 and the comment files it was
+    supposed to finish erasing stayed in Storage for good. Children go first
+    now, and the record that authorizes the operation survives until the
+    whole thing is done.
+    """
+    artifact_id = _publish_markdown(api, "# One")
+    assert _comment(api, artifact_id, exact="One").status_code == 201
+    working_comments = main.app.state.comments
+
+    _break_comment_deletes(api, monkeypatch, tmp_path)
+    first = api.client.delete(
+        f"/api/artifacts/{artifact_id}/purge", headers=AUTH_HEADERS
+    )
+    assert first.status_code == 502, first.text
+
+    # The artifact must still be there to authorize the retry the 502 asked
+    # for -- a purge that erased it first could never be resumed.
+    assert main.app.state.store.get_meta(artifact_id) is not None
+
+    # Storage recovers; the retry finishes the job instead of 404ing.
+    monkeypatch.setattr(main.app.state, "comments", working_comments)
+    second = api.client.delete(
+        f"/api/artifacts/{artifact_id}/purge", headers=AUTH_HEADERS
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["purged"] is True
+
+    assert main.app.state.store.get_meta(artifact_id) is None
+    assert main.app.state.comments.list_for(artifact_id) == []
+    assert api.client.get(f"/a/{artifact_id}").status_code == 404
+
+
+def test_a_retry_after_a_partial_purge_still_refuses_a_foreign_owner(
+    api: Api, monkeypatch, tmp_path
+) -> None:
+    """Keeping the meta record for the retry must not widen who may retry."""
+    artifact_id = _publish_markdown(api, "# One")
+    assert _comment(api, artifact_id, exact="One").status_code == 201
+    _break_comment_deletes(api, monkeypatch, tmp_path)
+
+    assert (
+        api.client.delete(
+            f"/api/artifacts/{artifact_id}/purge", headers=AUTH_HEADERS
+        ).status_code
+        == 502
+    )
+    assert (
+        api.client.delete(
+            f"/api/artifacts/{artifact_id}/purge", headers=OTHER_AUTH_HEADERS
+        ).status_code
+        == 403
     )
 
 
@@ -3429,6 +3878,68 @@ def test_public_git_url_is_still_reported(api: Api, monkeypatch) -> None:
     assert row["git"]["url"] == "https://github.com/org/public-repo"
 
 
+def test_owner_can_read_each_receivers_signing_key(hooked) -> None:
+    """A receiver has to be configured with its own key, so the owner needs it.
+
+    Delivered on its own endpoint rather than in every artifact response:
+    the key is a credential, and the general owner view is returned on every
+    publish and update, where it would end up in far more logs and
+    transcripts than necessary.
+    """
+    api, posts, dispatcher = hooked
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+    other_hook = "https://hooks.test/second"
+    assert _register_hook(api, artifact_id, [HOOK, other_hook]).status_code == 200
+
+    listed = api.client.get(
+        f"/api/artifacts/{artifact_id}/webhooks", headers=AUTH_HEADERS
+    )
+    assert listed.status_code == 200, listed.text
+    receivers = {row["url"]: row["signing_key"] for row in listed.json()["webhooks"]}
+    assert set(receivers) == {HOOK, other_hook}
+    assert receivers[HOOK] != receivers[other_hook]
+    # The hub-wide webhook key must not be what a receiver is handed.
+    assert derive_key(api.settings.secret_key, KEY_LABEL_WEBHOOK) not in receivers.values()
+
+    # The reported key is the one a delivery actually verifies under.
+    assert (
+        _submit_version(api, artifact_id, "# Two", headers=OTHER_AUTH_HEADERS).status_code
+        == 201
+    )
+    assert dispatcher.drain() == 2
+    for url, body, headers in posts:
+        expected = hmac.new(
+            receivers[url].encode("utf-8"), body, hashlib.sha256
+        ).hexdigest()
+        assert headers["X-Hub-Signature-256"] == f"sha256={expected}", url
+
+
+def test_webhook_signing_keys_are_owner_only(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    assert (
+        api.client.get(
+            f"/api/artifacts/{artifact_id}/webhooks", headers=OTHER_AUTH_HEADERS
+        ).status_code
+        == 403
+    )
+    # No headers at all is a 400 here, not a 401: resolve_stack runs before
+    # the token is verified, the same way it does on every owner-only route.
+    assert api.client.get(f"/api/artifacts/{artifact_id}/webhooks").status_code == 400
+    assert (
+        api.client.get(
+            f"/api/artifacts/{artifact_id}/webhooks",
+            headers={"X-StorageApi-Token": "nope", "X-Kbc-Stack": "us"},
+        ).status_code
+        == 401
+    )
+    assert (
+        api.client.get(
+            "/api/artifacts/does-not-exist/webhooks", headers=AUTH_HEADERS
+        ).status_code
+        == 404
+    )
+
+
 @pytest.mark.parametrize("field", ["git_ref", "git_path"])
 def test_publish_rejects_git_fields_without_a_git_url(api: Api, field: str) -> None:
     resp = api.client.post(
@@ -4284,6 +4795,10 @@ def hooked(api: Api, monkeypatch):
 
     dispatcher = main.app.state.webhooks
     monkeypatch.setattr(dispatcher, "_post", record)
+    # The delivery-time SSRF guard fails closed, and "hooks.test" does not
+    # resolve, so it needs the same injected public answer tests/test_webhooks.py
+    # uses. Without this the deliveries are (correctly) dropped before the POST.
+    monkeypatch.setattr(dispatcher, "_resolver", lambda _hostname: ["93.184.216.34"])
     # The dispatcher's own thread would race drain(); stop it and drive
     # delivery from the test thread instead.
     dispatcher.stop()
@@ -4328,13 +4843,20 @@ def test_webhook_delivers_a_signed_event_for_a_submitted_version(hooked) -> None
     assert payload["version"] == 2
     assert payload["actor"] == "Other"
     assert payload["url"] == f"https://testserver/a/{artifact_id}"
-    # Signed with the webhook-specific derived key — never the raw master
-    # secret, which also backs the unlock cookies (see security.derive_key).
+    # Signed with a key derived per receiver from the webhook-specific key —
+    # never the raw master secret, which also backs the unlock cookies (see
+    # security.derive_key), and never the hub-wide webhook key either, which
+    # every receiver would then share (see test_owner_can_read_each_receivers
+    # _signing_key).
     webhook_key = derive_key(api.settings.secret_key, KEY_LABEL_WEBHOOK)
+    receiver_key = receiver_signing_key(webhook_key, artifact_id, HOOK)
     expected = hmac.new(
-        webhook_key.encode("utf-8"), body, hashlib.sha256
+        receiver_key.encode("utf-8"), body, hashlib.sha256
     ).hexdigest()
     assert headers["X-Hub-Signature-256"] == f"sha256={expected}"
+    assert headers["X-Hub-Signature-256"] != f"sha256=" + hmac.new(
+        webhook_key.encode("utf-8"), body, hashlib.sha256
+    ).hexdigest()
     # And nothing secret rode along.
     assert "token" not in body.decode("utf-8").lower()
     _assert_no_sensitive_keys(envelope)
@@ -5695,3 +6217,457 @@ def test_every_live_surface_shares_one_copy_of_the_poller(api: Api) -> None:
         body = api.client.get(path).text
         assert body.count(marker) == 1, path
         assert pages._LIVE_JS in body, path
+
+
+# --------------------------------------------------------------------------
+# Check-then-act races between concurrent requests on one artifact
+# --------------------------------------------------------------------------
+
+
+def _pause_inside(target, name: str):
+    """Make the first call of ``target.<name>`` block until told to go on.
+
+    Returns ``(entered, release)`` events. The first caller sets ``entered``
+    just before the real method would run and waits for ``release``; every
+    later call goes straight through. This freezes one request *between* its
+    check and its act, which is exactly where a second request must not be
+    allowed to slip in.
+    """
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+    real = getattr(target, name)
+    first = threading.Lock()
+    armed = [True]
+
+    def paused(*args, **kwargs):
+        with first:
+            fire = armed[0]
+            armed[0] = False
+        if fire:
+            entered.set()
+            release.wait(timeout=5)
+        return real(*args, **kwargs)
+
+    setattr(target, name, paused)
+    return entered, release
+
+
+def _in_thread(fn):
+    """Run ``fn`` in a thread; returns (thread, box) where box[0] is the result."""
+    import threading
+
+    box: list = []
+    thread = threading.Thread(target=lambda: box.append(fn()))
+    thread.start()
+    return thread, box
+
+
+class TestConcurrentMutationsAreSerializedPerArtifact:
+    """Every mutating route reads, decides, then writes -- across separate
+    locks. Two requests on one artifact can interleave between the decision
+    and the write, so both act on a state that is no longer true. These
+    tests freeze one request at that seam and let the other run.
+    """
+
+    def test_two_updates_do_not_lose_each_others_fields(self, api: Api) -> None:
+        """REL-075-005: whole-object rewrites overwrite unrelated newer fields."""
+        artifact_id = _publish_markdown(api, "# One")
+        store = main.app.state.store
+        entered, release = _pause_inside(store, "save_meta")
+
+        first, box1 = _in_thread(
+            lambda: _policy(api, artifact_id, password="hunter2").status_code
+        )
+        assert entered.wait(timeout=5)
+        second, box2 = _in_thread(
+            lambda: _policy(api, artifact_id, accept_versions_mode="anyone").status_code
+        )
+        # Give the second request its chance to slip in before releasing.
+        second.join(timeout=0.5)
+        release.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        assert box1 == [200] and box2 == [200], (box1, box2)
+
+        meta = store.get_meta(artifact_id)
+        assert meta.password is not None, "the password update was lost"
+        assert meta.accept_versions_mode == "anyone", "the accept-mode update was lost"
+
+    def test_two_promotions_of_one_proposal_act_once(self, hooked) -> None:
+        """COR-075-007: both promotions observe 'proposed' and both fire."""
+        api, posts, dispatcher = hooked
+        artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+        assert _register_hook(api, artifact_id, [HOOK]).status_code == 200
+        assert _submit_version(api, artifact_id, "# Two", headers=OTHER_AUTH_HEADERS).status_code == 201
+        dispatcher.drain()
+        posts.clear()
+        store = main.app.state.store
+        entered, release = _pause_inside(store, "set_status")
+
+        def promote():
+            return api.client.post(
+                f"/api/artifacts/{artifact_id}/versions/2/promote", headers=AUTH_HEADERS
+            ).status_code
+
+        first, box1 = _in_thread(promote)
+        assert entered.wait(timeout=5)
+        second, box2 = _in_thread(promote)
+        second.join(timeout=0.5)
+        release.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert sorted(box1 + box2) == [200, 409], (box1, box2)
+        dispatcher.drain()
+        assert len(posts) == 1, "the promotion side effect fired twice"
+
+    def test_concurrent_deletes_cannot_remove_the_last_live_version(self, api: Api) -> None:
+        """COR-075-008: each delete sees the *other* version as still live."""
+        artifact_id = _publish_markdown(api, "# One")
+        assert _submit_version(api, artifact_id, "# Two").status_code == 201
+        store = main.app.state.store
+        # Past the store's own last-live check, before the file goes.
+        entered, release = _pause_inside(store, "_delete_file_confirmed")
+
+        def delete(version: int):
+            return api.client.delete(
+                f"/api/artifacts/{artifact_id}/versions/{version}", headers=AUTH_HEADERS
+            ).status_code
+
+        first, box1 = _in_thread(lambda: delete(1))
+        assert entered.wait(timeout=5)
+        second, box2 = _in_thread(lambda: delete(2))
+        second.join(timeout=0.5)
+        release.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        live = [
+            row["version"] for row in store.list_versions(artifact_id)
+            if row.get("status") == "live"
+        ]
+        assert live, f"both deletes succeeded ({box1}, {box2}); no live version is left"
+        assert 200 in box1 + box2 and 409 in box1 + box2, (box1, box2)
+
+    def test_finalizing_waits_for_an_in_flight_submission(self, api: Api) -> None:
+        """COR-075-002: the policy check and the upload are not one step."""
+        artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+        store = main.app.state.store
+        # After the frozen/contributor checks passed, before the version lands.
+        entered, release = _pause_inside(store, "add_version_next")
+
+        submit, box_submit = _in_thread(
+            lambda: _submit_version(api, artifact_id, "# Two", headers=OTHER_AUTH_HEADERS).status_code
+        )
+        assert entered.wait(timeout=5)
+        finalize, box_final = _in_thread(
+            lambda: _policy(api, artifact_id, status="final").status_code
+        )
+        # The finalize must not complete while a submission it has to be
+        # ordered against is between its check and its write.
+        finalize.join(timeout=0.5)
+        assert box_final == [], "the document was finalized under an in-flight submission"
+        release.set()
+        submit.join(timeout=5)
+        finalize.join(timeout=5)
+        assert box_submit == [201] and box_final == [200], (box_submit, box_final)
+
+    def test_a_submission_cannot_land_in_an_artifact_being_purged(self, api: Api) -> None:
+        """COR-075-009: nothing fences writes against an in-progress purge."""
+        artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+        store = main.app.state.store
+        entered, release = _pause_inside(store, "delete")
+
+        purge, box_purge = _in_thread(
+            lambda: api.client.delete(f"/api/artifacts/{artifact_id}/purge", headers=AUTH_HEADERS).status_code
+        )
+        assert entered.wait(timeout=5)
+        submit, box_submit = _in_thread(
+            lambda: _submit_version(api, artifact_id, "# Two", headers=OTHER_AUTH_HEADERS).status_code
+        )
+        submit.join(timeout=0.5)
+        release.set()
+        purge.join(timeout=5)
+        submit.join(timeout=5)
+
+        assert box_purge == [200], box_purge
+        assert box_submit == [404], f"a version landed in a purged artifact: {box_submit}"
+        assert api.backend.search_by_tag(f"artifact-id-{artifact_id}") == [], (
+            "the purge left a version file behind"
+        )
+
+    def test_pinning_and_deleting_the_same_version_stay_consistent(self, api: Api) -> None:
+        """COR-075-006: the head can be pinned to a version being deleted."""
+        artifact_id = _publish_markdown(api, "# One")
+        assert _submit_version(api, artifact_id, "# Two").status_code == 201
+        store = main.app.state.store
+        entered, release = _pause_inside(store, "_delete_file_confirmed")
+
+        delete, box_delete = _in_thread(
+            lambda: api.client.delete(f"/api/artifacts/{artifact_id}/versions/2", headers=AUTH_HEADERS).status_code
+        )
+        assert entered.wait(timeout=5)
+        pin, box_pin = _in_thread(
+            lambda: api.client.put(
+                f"/api/artifacts/{artifact_id}/head",
+                json={"mode": "pinned", "version": 2},
+                headers=AUTH_HEADERS,
+            ).status_code
+        )
+        pin.join(timeout=0.5)
+        release.set()
+        delete.join(timeout=5)
+        pin.join(timeout=5)
+
+        meta = store.get_meta(artifact_id)
+        existing = {row["version"] for row in store.list_versions(artifact_id)}
+        if meta.head_mode == "pinned":
+            assert meta.head_version in existing, (
+                f"head pinned to deleted version {meta.head_version}; {box_delete}, {box_pin}"
+            )
+
+
+def test_a_deleted_newest_version_number_is_never_reused(api: Api) -> None:
+    """COR-075-004: the next number is max(existing)+1, so deleting the newest
+    hands its number to different content -- and every link, comment anchor
+    and diff that named it now points at something else."""
+    artifact_id = _publish_markdown(api, "# One")
+    assert _submit_version(api, artifact_id, "# Two").json()["version"] == 2
+    assert api.client.delete(f"/api/artifacts/{artifact_id}/versions/2", headers=AUTH_HEADERS).status_code == 200
+    assert _submit_version(api, artifact_id, "# Three").json()["version"] == 3
+
+    # ...and still not after a restart with an empty index.
+    fresh = ArtifactStore(
+        backend=api.backend,
+        cache_dir=api.settings.cache_dir / "fresh",
+        cache_max_entries=api.settings.cache_max_entries,
+        max_versions=api.settings.max_versions,
+    )
+    fresh.hydrate()
+    assert api.client.delete(f"/api/artifacts/{artifact_id}/versions/3", headers=AUTH_HEADERS).status_code == 200
+    fresh.hydrate()
+    assert fresh.next_version(artifact_id) == 4
+
+
+# --------------------------------------------------------------------------
+# Write ordering: settings last, and no orphan in the caller's project
+# --------------------------------------------------------------------------
+
+
+def _break_version_writes(monkeypatch, method: str) -> None:
+    def boom(_envelope):
+        raise BackendError("version write failed")
+    monkeypatch.setattr(main.app.state.store, method, boom)
+
+
+def test_a_failed_content_update_does_not_apply_the_settings(api: Api, monkeypatch) -> None:
+    """REL-075-004: the password landed while the caller was told the update failed."""
+    artifact_id = _publish_markdown(api, "# One")
+    _break_version_writes(monkeypatch, "add_version_next")
+
+    resp = _policy(api, artifact_id, password="hunter2", markdown="# Two")
+    assert resp.status_code == 502, resp.text
+
+    meta = main.app.state.store.get_meta(artifact_id)
+    assert meta.password is None, "a password was applied by an update that failed"
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+
+
+def test_a_failed_content_update_discards_its_canonical_copy(api: Api, monkeypatch) -> None:
+    """REL-075-008: the copy in the author's project outlived the version it was for."""
+    artifact_id = _publish_markdown(api, "# One")
+    _break_version_writes(monkeypatch, "add_version_next")
+    before = len([c for c in api.canonical_calls if "file_id" in c])
+
+    assert _policy(api, artifact_id, markdown="# Two").status_code == 502
+
+    uploads = [c["file_id"] for c in api.canonical_calls if "file_id" in c]
+    deletes = [c["deleted"] for c in api.canonical_calls if "deleted" in c]
+    assert len(uploads) == before + 1
+    assert uploads[-1] in deletes, "the orphaned canonical copy was not discarded"
+
+
+def test_a_failed_version_write_on_publish_leaves_nothing_behind(api: Api, monkeypatch) -> None:
+    """REL-075-008 on publish: the canonical copy and the meta record both go."""
+    monkeypatch.setattr(main, "new_artifact_id", lambda: "doomed-publish-id")
+    _break_version_writes(monkeypatch, "add_version")
+
+    resp = api.client.post("/api/artifacts", json={"markdown": "# Doomed"}, headers=AUTH_HEADERS)
+    assert resp.status_code == 502, resp.text
+
+    assert main.app.state.store.get_meta("doomed-publish-id") is None
+    assert api.backend.search_by_tag("artifact-id-doomed-publish-id") == []
+    uploads = [c["file_id"] for c in api.canonical_calls if "file_id" in c]
+    deletes = [c["deleted"] for c in api.canonical_calls if "deleted" in c]
+    assert uploads and uploads[-1] in deletes
+
+
+def _code_lines(text: str) -> list[str]:
+    """Lines inside fenced code blocks only -- prose may name an anti-pattern."""
+    inside, out = False, []
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            inside = not inside
+            continue
+        if inside:
+            out.append(line)
+    return out
+
+
+def test_no_documented_curl_example_puts_the_token_in_argv(api: Api) -> None:
+    """SEC-075-004: every example passed the token as a curl argument.
+
+    The shell expands -H "X-StorageApi-Token: $KBC_TOKEN" before curl runs,
+    so for that process's lifetime the token is visible to anyone who can
+    list processes on the host. The documented pattern is a shell function
+    that feeds curl a config from a process substitution instead.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    served = {
+        "/agent": api.client.get("/agent").text,
+        "/skill": api.client.get("/skill").text,
+        "README.md": (root / "README.md").read_text(encoding="utf-8"),
+    }
+    for name, text in served.items():
+        code = _code_lines(text)
+        offenders = [l for l in code if re.search(r"""-H\s+["']X-StorageApi-Token""", l)]
+        assert offenders == [], (name, offenders)
+        assert any(l.startswith("hub()") for l in code), f"{name} does not define hub()"
+
+
+class TestCommentRoutesShareTheArtifactLock:
+    """Comment routes address the document by its *public* share id.
+
+    A lock keyed on that path parameter would not serialize them with the
+    owner routes, which use the internal id -- so a comment could land on a
+    document being finalized, or be resolved on one being trashed. The key
+    has to be the internal id, resolved before the lock is taken. The link is
+    rotated first so the two ids actually differ.
+    """
+
+    @staticmethod
+    def _rotated(api: Api) -> tuple[str, str]:
+        artifact_id = _publish_markdown(api, "# One")
+        assert api.client.post(
+            f"/api/artifacts/{artifact_id}/rotate-link", headers=AUTH_HEADERS
+        ).status_code == 200
+        share_id = main.app.state.store.get_meta(artifact_id).share_id
+        assert share_id != artifact_id
+        return artifact_id, share_id
+
+    def test_finalizing_waits_for_a_comment_written_via_the_share_id(self, api: Api) -> None:
+        artifact_id, share_id = self._rotated(api)
+        entered, release = _pause_inside(main.app.state.comments, "create")
+
+        comment, box_comment = _in_thread(
+            lambda: _comment(api, share_id, exact="One").status_code
+        )
+        assert entered.wait(timeout=5)
+        finalize, box_final = _in_thread(
+            lambda: _policy(api, artifact_id, status="final").status_code
+        )
+        finalize.join(timeout=0.5)
+        assert box_final == [], "the document was finalized under an in-flight comment"
+        release.set()
+        comment.join(timeout=5)
+        finalize.join(timeout=5)
+        assert box_comment == [201] and box_final == [200], (box_comment, box_final)
+
+    def test_trashing_waits_for_a_resolve_written_via_the_share_id(self, api: Api) -> None:
+        artifact_id, share_id = self._rotated(api)
+        thread_id = _comment(api, share_id, exact="One").json()["id"]
+        entered, release = _pause_inside(main.app.state.comments, "update")
+
+        resolve, box_resolve = _in_thread(
+            lambda: api.client.post(
+                f"/api/artifacts/{share_id}/comments/{thread_id}/resolve",
+                json={"resolved": True},
+                headers=AUTH_HEADERS,
+            ).status_code
+        )
+        assert entered.wait(timeout=5)
+        trash, box_trash = _in_thread(lambda: _trash(api, artifact_id).status_code)
+        trash.join(timeout=0.5)
+        assert box_trash == [], "the document was trashed under an in-flight resolve"
+        release.set()
+        resolve.join(timeout=5)
+        trash.join(timeout=5)
+        assert box_resolve == [200] and box_trash == [200], (box_resolve, box_trash)
+
+
+# --------------------------------------------------------------------------
+# SEC-075-003: verifiable agent instructions
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path,filename", [("/agent", "AGENT.md"), ("/skill", "SKILL.md")])
+def test_served_documents_carry_their_digest_and_version(api: Api, path: str, filename: str) -> None:
+    """A hub says what it serves, so an installer can spot drift before trusting it."""
+    resp = api.client.get(path)
+    assert resp.status_code == 200
+    digest = hashlib.sha256(resp.content).hexdigest()
+    assert resp.headers["x-content-sha256"] == digest
+    assert resp.headers["etag"] == f'"sha256:{digest}"'
+    assert resp.headers["x-hub-version"] == main.SERVICE_VERSION
+
+    unchanged = api.client.get(path, headers={"If-None-Match": resp.headers["etag"]})
+    assert unchanged.status_code == 304
+    assert unchanged.content == b""
+    assert unchanged.headers["etag"] == resp.headers["etag"]
+
+
+def test_context_lists_the_documents_with_digests_and_release_assets(api: Api) -> None:
+    body = api.client.get("/context").json()
+    docs = body["documents"]
+    for key, path, filename in (("agent", "/agent", "AGENT.md"), ("skill", "/skill", "SKILL.md")):
+        served = api.client.get(path)
+        entry = docs[key]
+        assert entry["sha256"] == hashlib.sha256(served.content).hexdigest()
+        assert entry["bytes"] == len(served.content)
+        assert entry["version"] == main.SERVICE_VERSION
+        assert entry["url"] == f"https://testserver{path}"
+        assert entry["release_asset"] == (
+            f"{main.GITHUB_REPO_URL}/releases/download/v{main.SERVICE_VERSION}/{filename}"
+        )
+    assert docs["sums"] == f"{main.GITHUB_REPO_URL}/releases/download/v{main.SERVICE_VERSION}/SHA256SUMS"
+
+
+def test_install_instructions_verify_a_release_not_the_live_endpoint(api: Api) -> None:
+    """The documented install must come from the signed release, not from /agent.
+
+    The live endpoint is the right thing to *read* -- it describes the hub you
+    are talking to -- and the wrong thing to *install*: a file that grants
+    Bash/Read/WebFetch authority must be the reviewed, attested release copy.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for name, text in (
+        ("README.md", (root / "README.md").read_text(encoding="utf-8")),
+        ("/skill", api.client.get("/skill").text),
+    ):
+        code = _code_lines(text)
+        installs_live = [l for l in code if "$HUB/agent" in l and " -o " in l]
+        assert installs_live == [], (name, installs_live)
+        assert any("gh release download" in l for l in code), name
+        assert any("gh attestation verify" in l for l in code), name
+
+
+def test_release_workflow_gates_tests_and_attests_the_documents() -> None:
+    import yaml
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    wf = yaml.safe_load((root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8"))
+    triggers = wf.get("on") or wf.get(True)  # PyYAML reads a bare `on:` key as True
+    assert triggers["push"]["tags"] == ["v*"]
+
+    (job,) = wf["jobs"].values()
+    perms = job["permissions"]
+    assert perms["id-token"] == "write" and perms["attestations"] == "write"
+    assert perms["contents"] == "write"
+    steps = job["steps"]
+    uses = [s.get("uses", "") for s in steps]
+    runs = "\n".join(s.get("run", "") for s in steps)
+    assert any(u.startswith("actions/attest-build-provenance@") for u in uses)
+    assert "uv run pytest tests/" in runs, "the release must be gated on the suite"
+    assert "SHA256SUMS" in runs
+    assert "gh release" in runs

@@ -1,0 +1,86 @@
+name: Release
+
+# Fires on a version tag. Runs the whole suite and the version-parity check
+# first, so a tag that does not match pyproject.toml and the changelog never
+# becomes a release. Then publishes the two instruction documents as release
+# assets with SHA256SUMS, and attests them with GitHub artifact attestations:
+# anyone can later prove a downloaded AGENT.md was built by *this* workflow
+# from *this* tag with plain `gh attestation verify`. The live /agent endpoint
+# is for reading; installing is done from these assets (README, "Install").
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the release and upload its assets
+      id-token: write      # sign the attestation with the workflow's identity
+      attestations: write  # store it in the repository's attestation store
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Tag, package version and changelog must agree
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          PKG="v$(uv run python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          LOG="v$(grep -m1 -E '^## [0-9]+\.[0-9]+\.[0-9]+' CHANGELOG.md | sed -E 's/^## ([0-9.]+).*/\1/')"
+          echo "tag=$TAG pyproject=$PKG changelog=$LOG"
+          test "$TAG" = "$PKG" -a "$TAG" = "$LOG"
+
+      - name: Test suite
+        run: uv run pytest tests/ -q
+
+      - name: Assemble the release documents
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp skills/artifact-hub-agent/AGENT.md dist/AGENT.md
+          cp skills/artifact-publisher/SKILL.md dist/SKILL.md
+          (cd dist && sha256sum AGENT.md SKILL.md > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Attest the documents
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/AGENT.md
+            dist/SKILL.md
+            dist/SHA256SUMS
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Title and notes come from this version's changelog section.
+          uv run python - "$TAG" <<'PY'
+          import re, sys, pathlib
+          tag = sys.argv[1]; version = tag.lstrip("v")
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          m = re.search(rf"^## {re.escape(version)}[^\n]*\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+          heading = re.search(rf"^## {re.escape(version)}\s*—\s*([^(\n]*)", text, re.M)
+          title = f"{tag} — {heading.group(1).strip()}" if heading else tag
+          body = (m.group(1).strip() if m else "") + (
+              "\n\n---\nAssets: `AGENT.md`, `SKILL.md`, `SHA256SUMS`. "
+              "Verify with `gh attestation verify <file> --repo padak/kbc_ai_artifact`."
+          )
+          pathlib.Path("dist/TITLE").write_text(title, encoding="utf-8")
+          pathlib.Path("dist/NOTES.md").write_text(body, encoding="utf-8")
+          PY
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/AGENT.md dist/SKILL.md dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" dist/AGENT.md dist/SKILL.md dist/SHA256SUMS \
+              --verify-tag --title "$(cat dist/TITLE)" --notes-file dist/NOTES.md
+          fi

@@ -42,6 +42,17 @@ consequences baked into `src/main.py`:
    Files in the *host* project; anything written to local disk
    (`HUB_CACHE_DIR`) is an LRU cache only and must be safely rebuildable from
    Storage after a restart with an empty disk.
+5. **Exactly one instance, ever.** One Keboola App is one organisation's hub,
+   and a Data App is one container (single uvicorn process, no `--workers`,
+   auto-suspend and restart — never two at once). This is a *deployment
+   invariant*, not a scaling limit to engineer around: the in-memory artifact
+   index, the per-process locks that serialize check-then-act mutations, the
+   version-number allocator and the StateDB whole-snapshot cycle are all
+   correct **only** under it. Do not add HA, replicas or `--workers`; if that
+   ever changes, the state layer needs shared compare-and-swap, which Storage
+   Files cannot provide (immutable, no create-if-absent) — that is a redesign,
+   not a flag. `StateDB._retire_older_snapshots` detects a second writer and
+   logs an ERROR naming this rule.
 
 ## Storage model
 
@@ -52,7 +63,10 @@ Two kinds of Storage File back every artifact, both tagged for index rebuild:
   overwritten.
 - **Meta file** `artifact-{id}-meta.json`, tagged `artifact-hub`,
   `artifact-id-{id}`, `artifact-meta`, `artifact-owner-{key}`. Owner, password
-  hash, `accept_versions`, head pointer.
+  hash, `accept_versions`, head pointer, and `version_high_water` — the
+  highest version number ever allocated, written only when the newest
+  version is deleted, so that number is never handed to new content after a
+  restart (`ArtifactStore.delete_version` persists it *before* the file goes).
 
 On startup the in-memory index is rebuilt entirely by listing Storage Files
 tagged `artifact-hub` (`ArtifactStore.hydrate` in `src/store.py`) — there is
@@ -123,6 +137,13 @@ isn't, that's a bug**, not a case to special-case around with local state.
 - Logs: `kbagent data-app logs --project artifacts --app-id 1304628444`.
 - **Version single source of truth is `pyproject.toml`** (`[project].version`,
   read at runtime via `importlib.metadata` with a `tomllib` fallback for local
-  dev). Bump it, tag the commit, and cut a GitHub release for any
-  user-visible change — don't let the reported `/health`/`/context` version
-  drift from what's actually deployed.
+  dev). Bump it and push a `vX.Y.Z` tag for any user-visible change — don't
+  let the reported `/health`/`/context` version drift from what's actually
+  deployed. **The release itself is made by CI** (`.github/workflows/release.yml`,
+  on the tag push): it refuses a tag that disagrees with `pyproject.toml` or
+  the changelog head, runs the suite, then creates the GitHub release with
+  `AGENT.md`, `SKILL.md` and `SHA256SUMS` as assets and attests them
+  (`gh attestation verify <file> --repo padak/kbc_ai_artifact`). Users
+  install the agent from those assets, never from the live `/agent`; keep
+  that true in the docs. Edit the release title/notes afterwards if needed,
+  don't create the release by hand first.
