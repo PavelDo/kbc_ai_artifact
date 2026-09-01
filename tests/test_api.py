@@ -2374,7 +2374,10 @@ def test_comment_body_and_quote_validation_is_422(api: Api) -> None:
 
     long_quote = _comment(api, artifact_id, exact="x" * 2001)
     assert long_quote.status_code == 422
-    assert "too long" in long_quote.json()["detail"]
+    # SEC-100-004 put the store's own ceiling on the field itself, so an
+    # oversized quote is refused by request validation before it reaches the
+    # comment store's "quoted selection is too long" check.
+    assert "at most 2000 characters" in long_quote.text
 
 
 def test_comments_are_rate_limited_per_day(api: Api, monkeypatch) -> None:
@@ -3646,8 +3649,17 @@ def test_password_header_path_is_throttled_too(api: Api, monkeypatch) -> None:
     assert "too many wrong passwords" in blocked.json()["detail"]
 
 
-def test_unlock_throttle_buckets_per_client_address(api: Api, monkeypatch) -> None:
-    """A different client address gets its own budget (X-Real-IP from nginx)."""
+def test_unlock_throttle_ignores_an_untrusted_forwarded_address(
+    api: Api, monkeypatch
+) -> None:
+    """SEC-100-003: changing X-Real-IP no longer buys a fresh budget.
+
+    The header is honoured only from a peer inside HUB_TRUSTED_PROXY_CIDRS,
+    which is unset here (and in every default deployment), so all three
+    attempts share the peer's bucket. The trusted-proxy case — where a
+    forwarded address *does* get its own budget — lives in
+    tests/test_review100_request_hygiene.py.
+    """
     artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
     _low_unlock_limit(api, monkeypatch, limit=1)
 
@@ -3665,13 +3677,13 @@ def test_unlock_throttle_buckets_per_client_address(api: Api, monkeypatch) -> No
         ).status_code
         == 429
     )
-    # A second address is unaffected.
+    # A second address does not reset it: the caller chose that header.
     assert (
         api.client.get(
             f"/a/{artifact_id}/raw",
             headers={"X-Artifact-Password": "wrong", "X-Real-IP": "10.0.0.2"},
         ).status_code
-        == 401
+        == 429
     )
 
 
@@ -5774,10 +5786,12 @@ def test_guest_credential_checks_are_throttled(api: Api, monkeypatch) -> None:
     # One budget covers every route that verifies a guest credential.
     assert _guest_comment(api, artifact_id, wrong).status_code == 429
 
-    # Another client address has its own budget (X-Real-IP, as nginx sets it).
+    # SEC-100-003: a self-chosen X-Real-IP does not buy a fresh budget. The
+    # header counts only from a peer inside HUB_TRUSTED_PROXY_CIDRS, which no
+    # default deployment configures.
     assert api.client.get(
         f"/a/{artifact_id}/guest", headers={**wrong, "X-Real-IP": "10.0.0.9"}
-    ).status_code == 401
+    ).status_code == 429
 
 
 # --------------------------------------------------------------------------

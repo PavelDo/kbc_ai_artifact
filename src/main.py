@@ -28,6 +28,7 @@ import dataclasses
 import fcntl
 import functools
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -35,7 +36,8 @@ import re
 import sys
 import threading
 import tomllib
-from contextlib import asynccontextmanager
+from collections import OrderedDict
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError
@@ -70,6 +72,8 @@ from src.auth import (
 )
 from src.builder import BuildError, BuiltArtifact
 from src.comments import (
+    MAX_BODY_CHARS,
+    MAX_QUOTE_CHARS,
     MAX_REPLIES_PER_THREAD,
     MAX_THREAD_BYTES,
     CommentStore,
@@ -381,17 +385,33 @@ RESP_HUB_502 = {
 RESP_NOT_FOUND = {"description": "No artifact exists with this id."}
 RESP_UNLOCK_429 = {
     "description": (
-        "Too many failed password attempts for this artifact from this "
-        "client address in the current hour (HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR)."
+        "Too many failed password attempts for this artifact — either from "
+        "this client address in the current hour "
+        "(HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR) or, as a backstop no change of "
+        "address gets around, from every address together "
+        "(HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR)."
     )
 }
 RESP_GUEST_429 = {
     "description": (
         "Too many failed password *or* invitation attempts for this artifact "
-        "from this client address in the current hour "
-        "(HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR, counted separately for each). "
-        "Verifying an invitation secret is as expensive as verifying a "
-        "password, so rejected credentials are budgeted the same way."
+        "in the current hour, counted separately for each and budgeted both "
+        "per client address (HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR) and per "
+        "artifact across all addresses "
+        "(HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR). Verifying an "
+        "invitation secret is as expensive as verifying a password, so "
+        "rejected credentials are budgeted the same way."
+    )
+}
+#: SEC-100-004. Answered from the ASGI layer before routing, authentication,
+#: lock allocation, body parsing or PBKDF2, so it is the one error that can
+#: arrive without the route having run at all.
+RESP_BODY_413 = {
+    "description": (
+        "The request body is larger than this route accepts. Routes that "
+        "carry a document (publish, update, submit a version) allow a whole "
+        "document; every other route allows HUB_MAX_SMALL_REQUEST_BYTES "
+        "(256 KB by default). Both ceilings are reported by GET /context."
     )
 }
 RESP_VERSIONS_429 = {
@@ -497,29 +517,116 @@ settings: Settings = load_settings()
 #: Storage at once after a failed startup hydration.
 _hydrate_lock = threading.Lock()
 
-#: One lock per artifact, created on first use and kept for the life of the
-#: process. Every mutating ``/api/artifacts/{id}...`` route reads the artifact,
-#: decides, then writes -- through *separate* store locks -- so two requests
-#: on one artifact could interleave between the decision and the write and
-#: both act on a state that was no longer true: two promotions of one
-#: proposal both firing, two deletes jointly removing the last live version,
-#: a submission landing on a document finalized a moment earlier. This
-#: serializes whole routes per artifact instead. Sound because this process
-#: is the only writer (see CLAUDE.md, "Exactly one instance"); with a second
-#: instance it would be no protection at all. The registry never shrinks --
-#: it is bounded by the artifacts this process ever mutates, a few dozen
-#: bytes each.
-_artifact_locks: dict[str, threading.Lock] = {}
-_artifact_locks_guard = threading.Lock()
+#: Shape an artifact or share identifier taken from a URL path must have
+#: before anything at all is allocated for it. Ids are minted by
+#: ``secrets.token_urlsafe`` — 24 characters of the URL-safe alphabet — so
+#: this is a deliberate superset: the same character set the stores accept for
+#: cache file names (``_SAFE_ID_CHARS`` in src/store.py), with a length bound
+#: on top. Rejecting rather than trimming *is* the normalization: an
+#: identifier carrying whitespace, a slash, a dot or a hundred kilobytes of
+#: padding is not a mangled real id, it is somebody probing (SEC-100-002).
+_PATH_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
-def _artifact_lock(artifact_id: str) -> threading.Lock:
-    """The lock serializing mutations of one artifact."""
-    with _artifact_locks_guard:
-        lock = _artifact_locks.get(artifact_id)
-        if lock is None:
-            lock = _artifact_locks[artifact_id] = threading.Lock()
-        return lock
+class _ArtifactLockRegistry:
+    """Bounded, reference-counted registry of per-artifact mutation locks.
+
+    Every mutating ``/api/artifacts/{id}...`` route reads the artifact,
+    decides, then writes -- through *separate* store locks -- so two requests
+    on one artifact could interleave between the decision and the write and
+    both act on a state that was no longer true: two promotions of one
+    proposal both firing, two deletes jointly removing the last live version,
+    a submission landing on a document finalized a moment earlier. Holding one
+    lock per artifact for the whole handler serializes that. Sound because
+    this process is the only writer (see CLAUDE.md, "Exactly one instance");
+    with a second instance it would be no protection at all.
+
+    SEC-100-002 replaced the plain dictionary this used to be. That one kept
+    an entry for every key it was ever handed, and the comment routes handed
+    it keys straight out of the URL: 250 anonymous requests naming made-up
+    artifacts grew it by 250 entries that nothing would ever remove. Two
+    things changed. Keys now have to survive :data:`_PATH_ID` and name an
+    artifact that exists before a lock is taken at all (see
+    :func:`_serialized_per_comment_target`), and the registry itself is
+    reference-counted: an entry lives while somebody holds or waits for it,
+    and once the last holder leaves it becomes idle. Idle entries are kept in
+    a least-recently-used queue of at most ``HUB_LOCK_REGISTRY_MAX_ENTRIES``,
+    so a hot artifact keeps its lock object across requests while a long tail
+    of one-off artifacts is reclaimed.
+
+    Dropping an *idle* entry is safe precisely because it is idle: a key with
+    no holders has no lock state to lose, and the next request for it simply
+    creates a fresh lock. The invariant that matters -- two concurrent
+    requests for one key get the *same* lock object -- holds because the
+    refcount is taken under the registry guard before the lock is acquired,
+    so an entry cannot be reclaimed out from under a waiter.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
+        #: key -> how many requests hold or are waiting for its lock.
+        self._holders: dict[str, int] = {}
+        #: Keys with no holders, oldest first; the eviction queue.
+        self._idle: "OrderedDict[str, threading.Lock]" = OrderedDict()
+
+    def __len__(self) -> int:
+        """How many locks the registry currently holds (idle plus in use)."""
+        with self._guard:
+            return len(self._locks)
+
+    def clear(self) -> None:
+        """Forget every lock. For tests; never called while requests run."""
+        with self._guard:
+            self._locks.clear()
+            self._holders.clear()
+            self._idle.clear()
+
+    @contextmanager
+    def hold(self, key: str):
+        """Hold ``key``'s lock for the duration of the block."""
+        lock = self._checkout(key)
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+            self._return(key)
+
+    def _checkout(self, key: str) -> threading.Lock:
+        """Claim a reference on ``key``'s lock, creating it if needed."""
+        with self._guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = self._locks[key] = threading.Lock()
+            # No longer idle: it must not be evicted while we wait for it.
+            self._idle.pop(key, None)
+            self._holders[key] = self._holders.get(key, 0) + 1
+            return lock
+
+    def _return(self, key: str) -> None:
+        """Drop a reference; the last one out makes the entry evictable."""
+        with self._guard:
+            remaining = self._holders.get(key, 1) - 1
+            if remaining > 0:
+                self._holders[key] = remaining
+                return
+            self._holders.pop(key, None)
+            lock = self._locks.get(key)
+            if lock is None:
+                return
+            self._idle[key] = lock
+            self._idle.move_to_end(key)
+            bound = max(0, settings.lock_registry_max_entries)
+            while len(self._idle) > bound:
+                stale, _ = self._idle.popitem(last=False)
+                self._locks.pop(stale, None)
+
+
+#: The process-wide registry. Named as it was before SEC-100-002 so the
+#: reasoning in the routes still reads the same; ``len()`` and ``clear()``
+#: keep working on it too.
+_artifact_locks = _ArtifactLockRegistry()
 
 
 def _serialized_per_artifact(route):
@@ -534,7 +641,7 @@ def _serialized_per_artifact(route):
     """
     @functools.wraps(route)
     def serialized(*args, **kwargs):
-        with _artifact_lock(kwargs["artifact_id"]):
+        with _artifact_locks.hold(kwargs["artifact_id"]):
             return route(*args, **kwargs)
     return serialized
 
@@ -547,20 +654,39 @@ def _serialized_per_comment_target(route):
     fallback (see :func:`_comment_target_of`). Keying the lock on the path
     parameter would therefore not serialize a comment with the owner routes,
     which always use the internal id, and a comment could land on a document
-    being finalized in the same instant. The key is resolved first, without
+    being finalized in the same instant. So the key is resolved first, without
     authentication: ``resolve_share`` maps a live share id to the internal id
     and answers None for anything else -- a rotated-away link, or the bare
-    internal id of a rotated artifact -- in which case the path id *is* the
-    internal id if it is anything at all, so it is used as the key as-is. A
-    made-up id locks a key nobody else holds and then 404s inside the route.
+    internal id of a rotated artifact, which is still a real artifact and
+    still has to serialize against its owner's routes.
+
+    SEC-100-002 put two gates in front of that. The path identifier has to
+    look like an identifier at all (:data:`_PATH_ID`), and it has to name an
+    artifact that exists, *before* a lock is allocated for it. A made-up id
+    used to mint a registry entry nobody would ever remove; now it takes no
+    lock and the route answers exactly what it always did -- a 404, or the
+    401/400 its authentication reaches first, since which of those a caller
+    sees is a property the comment routes deliberately own (see
+    :func:`_comment_writer`) and not something a lock decorator should
+    decide. Running that request unlocked is safe because there is nothing to
+    serialize it against: no artifact of that name exists to mutate.
     """
     @functools.wraps(route)
     def serialized(*args, **kwargs):
         request = kwargs["request"]
         path_id = kwargs["artifact_id"]
+        if not _PATH_ID.match(path_id):
+            # Nothing this shape was ever minted, so there is no artifact to
+            # look up and no lock to take: answer without touching either.
+            return _not_found(path_id)
         ensure_hydrated(request.app)
-        internal_id = request.app.state.store.resolve_share(path_id) or path_id
-        with _artifact_lock(internal_id):
+        store = request.app.state.store
+        internal_id = store.resolve_share(path_id)
+        if internal_id is None and store.get_meta(path_id) is not None:
+            internal_id = path_id
+        if internal_id is None:
+            return route(*args, **kwargs)
+        with _artifact_locks.hold(internal_id):
             return route(*args, **kwargs)
     return serialized
 
@@ -590,6 +716,16 @@ COUNTER_SUBMISSIONS = "submissions"
 COUNTER_COMMENTS = "comments"
 COUNTER_UNLOCK_FAILURES = "unlock_failures"
 COUNTER_GUEST_FAILURES = "guest_failures"
+
+#: The ``who`` half of a counter key standing for "every caller together".
+#: SEC-100-003 gives each brute-force scope a second, address-independent
+#: budget per artifact, and it shares the machinery of the per-address one by
+#: using this sentinel in place of a client address. Real ``who`` values are
+#: client addresses or ``"{project}@{stack}"`` contributor keys, neither of
+#: which can contain ``*``, so the two buckets can never collide. The key
+#: still starts with the internal artifact id, so purging an artifact takes it
+#: along with everything else.
+COUNTER_ANY_CLIENT = "*"
 
 _fallback_counts: dict[tuple[str, str, str], int] = {}
 _fallback_lock = threading.Lock()
@@ -705,68 +841,96 @@ def _claim_comment_slot(
     )
 
 
+def _brute_force_throttled(
+    app_obj: FastAPI | None, scope: str, artifact_id: str, client_ip: str
+) -> bool:
+    """True when either brute-force budget of one artifact is spent.
+
+    Two budgets, both hourly, both counting only *failures*:
+
+    * per ``(artifact, client address)``,
+      ``HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR`` — the ordinary limit, small enough
+      that a human who mistypes is never troubled by it;
+    * per artifact across *every* address,
+      ``HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR`` — defence in depth for
+      SEC-100-003. The per-address budget is only as strong as the address is
+      hard to change, and the address is not always expensive: a NAT, a
+      botnet, or (before this fix) a forged header all supply new ones for
+      free. This second budget cannot be rotated away, so it is set far above
+      any real audience of one document and stops industrial guessing rather
+      than individual readers.
+    """
+    per_client = _read_counter(
+        app_obj, scope, _counter_key(artifact_id, client_ip), _utc_hour()
+    )
+    if per_client >= settings.max_unlock_attempts_per_hour:
+        return True
+    per_artifact = _read_counter(
+        app_obj, scope, _counter_key(artifact_id, COUNTER_ANY_CLIENT), _utc_hour()
+    )
+    return per_artifact >= settings.max_unlock_attempts_per_artifact_per_hour
+
+
+def _record_brute_force_failure(
+    app_obj: FastAPI | None, scope: str, artifact_id: str, client_ip: str
+) -> None:
+    """Count one failure against both budgets of :func:`_brute_force_throttled`."""
+    _bump_counter(
+        app_obj, scope, _counter_key(artifact_id, client_ip), _utc_hour()
+    )
+    _bump_counter(
+        app_obj, scope, _counter_key(artifact_id, COUNTER_ANY_CLIENT), _utc_hour()
+    )
+
+
 def _unlock_throttled(
     app_obj: FastAPI | None, artifact_id: str, client_ip: str
 ) -> bool:
-    """True when this (artifact, client) burnt its failed-attempt budget.
+    """True when this artifact's failed-password budget is spent.
 
     Verifying an artifact password runs a full PBKDF2 (200k iterations), so an
     unthrottled gate is both a password oracle and a cheap way to burn the
     hub's CPU. Only failures are counted, so a legitimate reader who types the
     password correctly is never affected, and the hour in the bucket key makes
-    the window reset on its own.
+    the window reset on its own. See :func:`_brute_force_throttled` for the
+    two budgets this consults.
     """
-    count = _read_counter(
-        app_obj,
-        COUNTER_UNLOCK_FAILURES,
-        _counter_key(artifact_id, client_ip),
-        _utc_hour(),
+    return _brute_force_throttled(
+        app_obj, COUNTER_UNLOCK_FAILURES, artifact_id, client_ip
     )
-    return count >= settings.max_unlock_attempts_per_hour
 
 
 def _record_unlock_failure(
     app_obj: FastAPI | None, artifact_id: str, client_ip: str
 ) -> None:
-    """Count one *failed* password attempt against the hourly budget."""
-    _bump_counter(
-        app_obj,
-        COUNTER_UNLOCK_FAILURES,
-        _counter_key(artifact_id, client_ip),
-        _utc_hour(),
+    """Count one *failed* password attempt against the hourly budgets."""
+    _record_brute_force_failure(
+        app_obj, COUNTER_UNLOCK_FAILURES, artifact_id, client_ip
     )
 
 
 def _guest_throttled(
     app_obj: FastAPI | None, artifact_id: str, client_ip: str
 ) -> bool:
-    """True when this (artifact, client) burnt its failed-invitation budget.
+    """True when this artifact's failed-invitation budget is spent.
 
     Checking an invitation secret runs the same full PBKDF2 as a password, and
     ``GET /a/{id}/guest`` is public, so a known invitation id would otherwise
     be a free CPU-exhaustion primitive as well as an offline-free oracle. The
-    budget is the unlock budget (``HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR``) in its
-    own scope, so guest probing and password guessing cannot spend each
-    other's allowance.
+    budgets are the unlock budgets in their own scope, so guest probing and
+    password guessing cannot spend each other's allowance.
     """
-    count = _read_counter(
-        app_obj,
-        COUNTER_GUEST_FAILURES,
-        _counter_key(artifact_id, client_ip),
-        _utc_hour(),
+    return _brute_force_throttled(
+        app_obj, COUNTER_GUEST_FAILURES, artifact_id, client_ip
     )
-    return count >= settings.max_unlock_attempts_per_hour
 
 
 def _record_guest_failure(
     app_obj: FastAPI | None, artifact_id: str, client_ip: str
 ) -> None:
-    """Count one *failed* guest verification against the hourly budget."""
-    _bump_counter(
-        app_obj,
-        COUNTER_GUEST_FAILURES,
-        _counter_key(artifact_id, client_ip),
-        _utc_hour(),
+    """Count one *failed* guest verification against the hourly budgets."""
+    _record_brute_force_failure(
+        app_obj, COUNTER_GUEST_FAILURES, artifact_id, client_ip
     )
 
 
@@ -785,18 +949,70 @@ def _record_view(app_obj: FastAPI | None, artifact_id: str, kind: str) -> None:
         logger.warning("Could not record a %s view of %s: %s", kind, artifact_id, exc)
 
 
+#: Request headers, in order of preference, that a trusted proxy may use to
+#: name the real client. ``X-Real-IP`` is what our own nginx sets;
+#: ``X-Forwarded-For`` is the standard fallback and is read first-entry-only
+#: (see :func:`_first_forwarded`), which is the hop closest to the client.
+_FORWARDED_CLIENT_HEADERS = ("x-real-ip", "x-forwarded-for")
+
+
+def _peer_ip(request: Request) -> str:
+    """The address the TCP connection actually came from, or ``"unknown"``."""
+    client = request.client
+    return client.host if client is not None else "unknown"
+
+
+def _forwarded_client_trusted(request: Request) -> bool:
+    """True when this request's forwarded client address may be believed.
+
+    SEC-100-003. Two conditions, both required. The deployment has to have
+    opted into forwarded headers at all (``HUB_TRUST_FORWARDED_HEADERS``,
+    the same switch :func:`_forwarded_trusted` reads), *and* the direct peer —
+    the address the connection came from, which no client can forge — has to
+    fall inside one of ``HUB_TRUSTED_PROXY_CIDRS``. With no CIDRs configured
+    nothing is ever trusted, which is the safe default: every caller behind
+    the proxy then shares the proxy's bucket.
+
+    Deliberately *not* the same predicate as :func:`_forwarded_trusted`: that
+    one also insists no ``HUB_PUBLIC_BASE_URL`` is configured, because an
+    explicit public origin outranks a forwarded one when naming URLs. That has
+    nothing to do with who the client is, and production sets a base URL — so
+    reusing it here would have made the trusted-proxy setting dead code in the
+    one deployment that needs it.
+    """
+    if not settings.trust_forwarded_headers or not settings.trusted_proxy_cidrs:
+        return False
+    try:
+        peer = ipaddress.ip_address(_peer_ip(request))
+    except ValueError:
+        # Not an IP literal at all (a unix socket, a test transport): there is
+        # no way to place it in a network, so it is not a trusted proxy.
+        return False
+    return any(peer in network for network in settings.trusted_proxy_cidrs)
+
+
 def _client_ip(request: Request) -> str:
     """Best-effort client address, used only as a rate-limit bucket key.
 
-    ``X-Real-IP`` is what our own nginx sets. It is deliberately *not* trusted
-    for anything but bucketing: a forged value can only split an attacker's
-    own budget, never grant access or identify anybody.
+    Until SEC-100-003 this returned ``X-Real-IP`` whenever it was present. The
+    header is attacker-supplied, so a password guesser reset their own
+    brute-force budget simply by changing it — a budget of one still allowed
+    unlimited attempts. The header is now honoured only from a peer inside a
+    configured trusted-proxy network (:func:`_forwarded_client_trusted`);
+    otherwise the bucket key is the peer address, which nobody can choose.
+
+    Even then this identity is only ever a bucket key: a forged value can
+    split an attacker's own budget, never grant access or identify anybody.
+    The address-independent per-artifact budget (see
+    :func:`_unlock_throttled`) is what bounds an attacker who *can* change
+    addresses cheaply.
     """
-    real_ip = _first_forwarded(request.headers.get("x-real-ip"))
-    if real_ip:
-        return real_ip
-    client = request.client
-    return client.host if client is not None else "unknown"
+    if _forwarded_client_trusted(request):
+        for header in _FORWARDED_CLIENT_HEADERS:
+            forwarded = _first_forwarded(request.headers.get(header))
+            if forwarded:
+                return forwarded
+    return _peer_ip(request)
 
 
 def _version_rate_limited() -> JSONResponse:
@@ -1275,6 +1491,155 @@ async def public_origin(request: Request, call_next):
     return await call_next(request)
 
 
+#: Methods whose requests carry no body this service ever reads. Budgeting
+#: them would only add work to the cheapest requests we serve.
+_BODILESS_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "DELETE", "TRACE"})
+
+#: The routes whose body legitimately carries a whole document, as
+#: ``(method, path pattern)``. Everything else — comments, replies, guest
+#: invitations, the unlock form, webhook management, policy-only calls, the
+#: platform's ``POST /`` probe — gets the much smaller
+#: ``HUB_MAX_SMALL_REQUEST_BYTES``. The list is deliberately an allowlist:
+#: a route added later is bounded tightly until somebody decides otherwise,
+#: which is the safe direction to be wrong in.
+_CONTENT_REQUEST_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("POST", re.compile(r"^/api/artifacts/?$")),
+    ("PUT", re.compile(r"^/api/artifacts/[^/]+/?$")),
+    ("POST", re.compile(r"^/api/artifacts/[^/]+/versions/?$")),
+)
+
+
+def _request_body_limit(method: str, path: str) -> int:
+    """Largest request body this method and path may send, in bytes."""
+    for route_method, pattern in _CONTENT_REQUEST_ROUTES:
+        if method == route_method and pattern.match(path):
+            return settings.max_content_request_bytes
+    return settings.max_small_request_bytes
+
+
+def _declared_content_length(scope: dict[str, Any]) -> int | None:
+    """The request's ``Content-Length``, or None when absent or unparseable."""
+    for name, value in scope.get("headers", ()):
+        if name == b"content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+async def _send_body_too_large(send: Any, limit: int) -> None:
+    """Answer 413 straight from the ASGI layer, without invoking the app."""
+    payload = json.dumps(
+        {
+            "error": "request body too large",
+            "detail": (
+                f"This endpoint accepts at most {limit} bytes of request "
+                "body. Send less, or use a route meant for documents."
+            ),
+            "limit": limit,
+        }
+    ).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(payload)).encode("ascii")),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": payload})
+
+
+class RequestBodyLimitMiddleware:
+    """Reject an oversized request body before anything expensive touches it.
+
+    SEC-100-004. Every budget this service had was applied *after* the body
+    had already been read and parsed: an anonymous caller could post three
+    megabytes at a comment route, have it streamed in, JSON-decoded and
+    validated into Pydantic models, and only then be told the artifact does
+    not exist. Authentication, the per-artifact lock and PBKDF2 all sit behind
+    that same parse, so the cheapest request an attacker can send was also one
+    of the most expensive to refuse.
+
+    This is raw ASGI rather than a ``BaseHTTPMiddleware`` on purpose: it has
+    to see the request *before* Starlette builds a ``Request`` object and
+    before FastAPI reads the body, and it has to be able to wrap ``receive``.
+    Two gates, because either alone is bypassable:
+
+    * a declared ``Content-Length`` above the ceiling is refused outright,
+      with the body never read at all;
+    * ``receive`` is wrapped and the bytes that actually arrive are counted,
+      so a chunked request (no ``Content-Length``) and a request that lies
+      about its length are both cut off the moment they cross the ceiling.
+      Nothing is buffered: the stream is closed by handing the application a
+      disconnect, which unwinds it, and whatever it answers is replaced by
+      the 413 on the way out.
+
+    ``POST /`` — the platform's startup probe — carries no body and passes
+    through untouched, as it must (see CLAUDE.md).
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        method = str(scope.get("method", "GET")).upper()
+        if method in _BODILESS_METHODS:
+            await self.app(scope, receive, send)
+            return
+
+        limit = _request_body_limit(method, str(scope.get("path", "")))
+        declared = _declared_content_length(scope)
+        if declared is not None and declared > limit:
+            await _send_body_too_large(send, limit)
+            return
+
+        seen = 0
+        over = False
+        replaced = False
+
+        async def counted_receive() -> dict[str, Any]:
+            nonlocal seen, over
+            message = await receive()
+            if message.get("type") == "http.request":
+                seen += len(message.get("body", b"") or b"")
+                if seen > limit:
+                    over = True
+                    # Close the body rather than buffer the rest of it. The
+                    # application sees a disconnected client, stops reading
+                    # and unwinds; ``guarded_send`` turns its answer into
+                    # the 413 this really is.
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def guarded_send(message: dict[str, Any]) -> None:
+            nonlocal replaced
+            if replaced:
+                # Our 413 is already on the wire; the application's own
+                # response body would only corrupt it.
+                return
+            if over and message.get("type") == "http.response.start":
+                replaced = True
+                await _send_body_too_large(send, limit)
+                return
+            await send(message)
+
+        await self.app(scope, counted_receive, guarded_send)
+
+
+# Registered here, between the two HTTP middlewares, so it runs before routing,
+# authentication, lock allocation, JSON/Pydantic parsing and PBKDF2 — while
+# still sitting inside ``artifact_headers``, which therefore decorates the 413
+# exactly like every other response.
+app.add_middleware(RequestBodyLimitMiddleware)
+
+
 @app.middleware("http")
 async def artifact_headers(request: Request, call_next):
     """Keep artifact responses out of search indexes, shared caches and referrers."""
@@ -1452,9 +1817,11 @@ def reader_allowed(meta: ArtifactMeta, request: Request) -> bool:
         raise HTTPException(
             status_code=429,
             detail=(
-                "too many wrong passwords for this artifact from your "
-                f"address; at most {settings.max_unlock_attempts_per_hour} "
-                "failed attempts are allowed per hour"
+                "too many wrong passwords for this artifact; at most "
+                f"{settings.max_unlock_attempts_per_hour} failed attempts per "
+                "hour are allowed from one address, and "
+                f"{settings.max_unlock_attempts_per_artifact_per_hour} from "
+                "all addresses together"
             ),
         )
     if check_password(supplied, meta.password):
@@ -1801,10 +2168,11 @@ def _verify_guest_checked(
         raise HTTPException(
             status_code=429,
             detail=(
-                "too many rejected invitation credentials for this artifact "
-                f"from your address; at most "
-                f"{settings.max_unlock_attempts_per_hour} failed attempts are "
-                "allowed per hour"
+                "too many rejected invitation credentials for this artifact; "
+                f"at most {settings.max_unlock_attempts_per_hour} failed "
+                "attempts per hour are allowed from one address, and "
+                f"{settings.max_unlock_attempts_per_artifact_per_hour} from "
+                "all addresses together"
             ),
         )
     try:
@@ -2279,14 +2647,23 @@ class CommentBody(BaseModel):
             "there is no cross-version re-anchoring."
         ),
     )
+    # SEC-100-004: every string here carries a length ceiling on the *field*,
+    # so an oversized value is refused by request validation instead of
+    # travelling all the way to the comment store. The values are the store's
+    # own limits (src/comments.py), so nothing that used to be accepted is
+    # rejected now; the anchor context shares the quote's ceiling because it
+    # is the same rendered text, captured a few characters to either side.
     exact: str = Field(
         ...,
+        max_length=MAX_QUOTE_CHARS,
         description=(
-            "The quoted text itself, exactly as rendered. Must not be blank."
+            "The quoted text itself, exactly as rendered. Must not be blank, "
+            f"and at most {MAX_QUOTE_CHARS} characters."
         ),
     )
     prefix: str = Field(
         "",
+        max_length=MAX_QUOTE_CHARS,
         description=(
             "Rendered text immediately before the quote (about 32 "
             "characters). Used to disambiguate a quote that occurs more than "
@@ -2295,10 +2672,16 @@ class CommentBody(BaseModel):
     )
     suffix: str = Field(
         "",
+        max_length=MAX_QUOTE_CHARS,
         description="Rendered text immediately after the quote (about 32 characters).",
     )
     body: str = Field(
-        ..., description="The comment itself, as plain text. Must not be blank."
+        ...,
+        max_length=MAX_BODY_CHARS,
+        description=(
+            "The comment itself, as plain text. Must not be blank, and at "
+            f"most {MAX_BODY_CHARS} characters."
+        ),
     )
 
 
@@ -2311,8 +2694,15 @@ class ReplyBody(BaseModel):
         }
     }
 
+    # Same field-level ceiling as a thread body, for the same reason
+    # (SEC-100-004).
     body: str = Field(
-        ..., description="The reply itself, as plain text. Must not be blank."
+        ...,
+        max_length=MAX_BODY_CHARS,
+        description=(
+            "The reply itself, as plain text. Must not be blank, and at most "
+            f"{MAX_BODY_CHARS} characters."
+        ),
     )
 
 
@@ -3900,6 +4290,15 @@ def context(request: Request) -> dict:
             "max_thread_bytes": MAX_THREAD_BYTES,
             "max_contributors": MAX_CONTRIBUTORS,
             "max_unlock_attempts_per_hour": settings.max_unlock_attempts_per_hour,
+            "max_unlock_attempts_per_artifact_per_hour": (
+                settings.max_unlock_attempts_per_artifact_per_hour
+            ),
+            # SEC-100-004: the inbound body ceilings, so a client can size its
+            # request before sending it rather than discovering a 413.
+            "max_content_request_bytes": settings.max_content_request_bytes,
+            "max_small_request_bytes": settings.max_small_request_bytes,
+            "max_comment_body_chars": MAX_BODY_CHARS,
+            "max_comment_quote_chars": MAX_QUOTE_CHARS,
             "max_webhooks_per_artifact": settings.max_webhooks_per_artifact,
             "webhook_timeout_s": settings.webhook_timeout_s,
             "webhook_max_attempts": settings.webhook_max_attempts,
@@ -7917,6 +8316,7 @@ def _may_moderate_thread(
         },
         404: RESP_NOT_FOUND,
         409: RESP_FINAL_409,
+        413: RESP_BODY_413,
         422: {
             "description": (
                 "The referenced version does not exist, the quote is empty or "
@@ -8031,6 +8431,7 @@ def create_comment(
         },
         404: RESP_THREAD_404,
         409: RESP_FINAL_409,
+        413: RESP_BODY_413,
         422: {"description": "The reply body is empty or too long."},
         429: RESP_COMMENTS_429,
         502: {

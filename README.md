@@ -453,7 +453,11 @@ are missing. Everything else has a documented default, overridable via env.
 | `HUB_REAP_ABORTED_PUBLISH_AFTER_S` | `3600` | A meta record with no version is a publish that died between its two writes; startup deletes such records once older than this, so they cannot be a publish still in flight (`0` disables) |
 | `HUB_MAX_PROPOSED_VERSIONS` | `50` | Per-artifact cap on retained proposed versions; the oldest proposals above this are pruned (proposals are never served as head, so this is always safe) |
 | `HUB_TRUST_FORWARDED_HEADERS` | `false` | Trust `X-Forwarded-Host`/`X-Forwarded-Proto` to name the public origin when `HUB_PUBLIC_BASE_URL` is unset — only for local development behind a proxy; a direct client can forge these headers |
-| `HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR` | `30` | Failed password-unlock attempts allowed per (artifact, client IP) per UTC hour before the gate answers 429 (each attempt costs a full PBKDF2 verification) |
+| `HUB_TRUSTED_PROXY_CIDRS` | empty | Comma-separated CIDR networks whose members may name the real client in `X-Real-IP` / `X-Forwarded-For`. Honoured only together with `HUB_TRUST_FORWARDED_HEADERS`, and only when the direct peer is inside one of them; empty means a forwarded client address is never believed and every caller buckets by the peer address. A malformed entry fails at startup. See *Deployment to Keboola* |
+| `HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR` | `30` | Failed password-unlock (and guest-invitation) attempts allowed per (artifact, client address) per UTC hour before the gate answers 429 (each attempt costs a full PBKDF2 verification) |
+| `HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR` | `500` | The same budget again, per artifact across *all* addresses together — a backstop nobody can rotate away by changing address. Set well above any real audience of one document; it stops industrial guessing, not individual readers |
+| `HUB_MAX_SMALL_REQUEST_BYTES` | `262144` (256 KB) | Largest inbound request body accepted by every route that does not carry a document — comments, replies, invitations, the unlock form, webhook management, policy-only updates. Enforced from the ASGI layer, before authentication, locking, JSON parsing or PBKDF2 (413 above it). The document routes (publish, update, submit a version) instead get `max(HUB_MAX_HTML_BYTES, HUB_MAX_ENVELOPE_BYTES)` plus 1 MB of JSON-envelope head-room, so raising either content limit raises what they accept |
+| `HUB_LOCK_REGISTRY_MAX_ENTRIES` | `1024` | Idle per-artifact mutation locks kept before the least recently used are dropped. A lock somebody holds or waits on is never dropped, so this bounds memory without weakening serialization |
 | `HUB_STATE_SNAPSHOT_INTERVAL_S` | `300` | Seconds between snapshots of the rate-limit/analytics sidecar into Storage Files; `0` disables the background thread (snapshots then need an explicit call, as the tests do) |
 | `HUB_STATE_MAX_SNAPSHOT_BYTES` | `52428800` (50 MB) | Largest state snapshot the hub will upload or restore; an oversized one is skipped with a warning rather than restored (`0` disables the bound) |
 | `HUB_STATE_DB_FILENAME` | `state.sqlite3` | File name of the SQLite sidecar holding rate-limit counters and view analytics, under `HUB_CACHE_DIR` |
@@ -525,6 +529,31 @@ That is now enforced rather than assumed, in two places:
   platform's own startup check — keeps answering 200, so the container is not
   restarted into the same broken situation; the fix is to stop the extra
   process and restart the remaining one.
+
+**Tell the hub which proxy to believe.** The brute-force budgets behind the
+artifact password gate and the guest-invitation gate are keyed on the client
+address, and behind the platform proxy the only address the app sees on the
+connection is the proxy's. The real one arrives in `X-Real-IP` — but that
+header is equally easy for a direct caller to write, so the hub believes it
+only when the connection came from a network you named:
+
+```bash
+kbagent data-app secrets-set --secrets-file <file>   # HUB_TRUST_FORWARDED_HEADERS=1
+                                                     # HUB_TRUSTED_PROXY_CIDRS=10.0.0.0/8
+```
+
+Set `HUB_TRUSTED_PROXY_CIDRS` to the proxy's network (and
+`HUB_TRUST_FORWARDED_HEADERS=1`, which both this and the public-origin
+headers require). Multiple networks are comma-separated; a malformed entry
+fails at startup rather than being skipped.
+
+**If you leave it unset, nothing breaks** — the hub falls back to the address
+the connection actually came from, which behind the proxy is the proxy
+itself. That is safe (no caller can choose their own bucket) but coarse:
+every reader of a password-protected document shares one hourly budget, so
+one person guessing passwords can push everyone else into 429 until the hour
+rolls over. The per-artifact backstop
+(`HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR`) applies either way.
 
 Secrets are set with `kbagent data-app secrets-set` and never committed to
 the repository:
