@@ -1536,11 +1536,13 @@ _ADMIN_STACKS = ("us", "gcp-us", "eu", "azure-eu", "gcp-eu")
 #:
 #: Design note — why polling. This service runs as a Keboola Data App behind a
 #: platform proxy that buffers responses, which would silently break
-#: server-sent events, and a long-lived in-process subscription would stop
-#: working the moment the app runs more than one replica. A conditional GET
-#: against a tiny snapshot endpoint (``GET /a/{id}/live``) survives both: the
-#: proxy has nothing to buffer, and every replica computes the same ETag from
-#: the same Storage-backed index.
+#: server-sent events, and a long-lived in-process subscription would not
+#: survive the app's own auto-suspend/restart cycle (CLAUDE.md, "Exactly one
+#: instance, ever" — a Data App is one process, restarted rather than scaled).
+#: A conditional GET against a tiny snapshot endpoint (``GET /a/{id}/live``)
+#: survives both: the proxy has nothing to buffer, and a poller that catches
+#: the process mid-restart just sees a fresh baseline (a new boot nonce, see
+#: ``RevisionLedger.token``) instead of a broken connection.
 #:
 #: Exposed as ``window.AHLive.watch(options)``:
 #:

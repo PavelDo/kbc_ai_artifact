@@ -1178,6 +1178,14 @@ async def lifespan(app: FastAPI):
         derive_key(settings.secret_key, KEY_LABEL_WEBHOOK),
         queue_max=settings.webhook_queue_max,
     )
+    # SEC-100-006 follow-up: without this, the overlap window is synced into
+    # the dispatcher only when an owner calls GET .../webhooks or the
+    # rotate-key route for the first time in this process's life (see the
+    # comment on WebhookDispatcher._key_overlap_s). Setting it here too means
+    # a delivery that goes out before either of those has ever been called
+    # honours the configured grace period from the first request, instead of
+    # silently running on the class default until an owner happens to look.
+    webhooks.configure_key_overlap_s(settings.webhook_key_overlap_s)
     app.state.webhooks = webhooks
     try:
         artifacts, threads = _hydrate(app)
@@ -2355,6 +2363,18 @@ def _emit_webhook(
     dispatcher = getattr(request.app.state, "webhooks", None)
     if dispatcher is None:
         return
+    # SEC-100-006 follow-up: the dispatcher's epoch cache starts empty on
+    # every process start (see WebhookDispatcher._epochs) and used to be
+    # seeded only when an owner called GET .../webhooks or the rotate-key
+    # route -- so after a restart, a receiver that had already been rotated
+    # was signed with the legacy, epoch-less key until its owner happened to
+    # look, and would reject the genuinely current delivery. The persisted
+    # record (ArtifactMeta.webhook_key_epochs) is the source of truth on
+    # every emit, not just on a read or a rotation; reseeding it here is one
+    # dict assignment per receiver and keeps the live cache always current.
+    epochs = meta.webhook_key_epochs or {}
+    for url in urls:
+        dispatcher.seed_epoch(meta.id, url, epochs.get(url))
     body: dict[str, Any] = {
         "artifact_id": meta.id,
         "url": f"{base_url(request).rstrip('/')}/a/{meta.share_id}",
@@ -4381,6 +4401,12 @@ def context(request: Request) -> dict:
             "max_webhooks_per_artifact": settings.max_webhooks_per_artifact,
             "webhook_timeout_s": settings.webhook_timeout_s,
             "webhook_max_attempts": settings.webhook_max_attempts,
+            # SEC-100-006: how long a rotated receiver's previous key still
+            # verifies (X-Hub-Signature-256-Previous) after
+            # POST .../rotate-key -- see the "webhooks"."rotation" prose above
+            # for the full explanation; duplicated here as a plain number
+            # alongside its sibling webhook settings.
+            "webhook_key_overlap_s": settings.webhook_key_overlap_s,
             "max_invitations_per_artifact": settings.max_invitations_per_artifact,
             "max_invitation_name_chars": MAX_INVITATION_NAME_CHARS,
             "export_max_bytes": settings.export_max_bytes,
@@ -7238,12 +7264,13 @@ def rotate_webhook_key(
     new_record = mint_key_epoch(previous_epoch, now=_now())
 
     # Copy-then-save, not an in-place mutation: store.get_meta answers from an
-    # in-process cache, so every other reader on this replica sees whatever
-    # ``meta`` holds right now. Building a new dict and handing save_meta a
-    # dataclasses.replace()'d copy (same pattern as revoke_invitation above)
-    # means a failed save leaves the cached meta -- and therefore every
-    # concurrent read -- still describing the key that is actually still
-    # correct, instead of a rotation the write never durably committed.
+    # in-process cache, so every other concurrent reader in this process sees
+    # whatever ``meta`` holds right now. Building a new dict and handing
+    # save_meta a dataclasses.replace()'d copy (same pattern as
+    # revoke_invitation above) means a failed save leaves the cached meta --
+    # and therefore every concurrent read -- still describing the key that is
+    # actually still correct, instead of a rotation the write never durably
+    # committed.
     updated_epochs = dict(meta.webhook_key_epochs or {})
     updated_epochs[url] = new_record
     candidate = dataclasses.replace(
@@ -7690,13 +7717,14 @@ def revoke_invitation(
 
     if not target.get("revoked"):
         # A copy, not an in-place flag. store.get_meta answers from cache, so
-        # ``meta`` is the object every later read on this replica gets:
+        # ``meta`` is the object every later read in this process gets:
         # marking the invitation revoked before the save succeeds means a
         # failed revocation still reads as revoked here, while Storage --
-        # and every other replica -- still honours the guest. The owner is
-        # told 502 and retries, but a restart rehydrates from Storage and
-        # quietly brings the guest back. save_meta uploads before it caches,
-        # so handing it a copy leaves the original untouched on failure.
+        # and therefore any process that later rehydrates from it -- still
+        # honours the guest. The owner is told 502 and retries, but a restart
+        # rehydrates from Storage and quietly brings the guest back. save_meta
+        # uploads before it caches, so handing it a copy leaves the original
+        # untouched on failure.
         revoked = [
             {**invitation, "revoked": True}
             if invitation.get("id") == invitation_id
@@ -8592,7 +8620,7 @@ def reply_to_comment(
         return _comment_rate_limited(guest=caller is None)
 
     # A copy, not an append. CommentStore.get answers from its in-memory LRU,
-    # so the object here is the very one every later read on this replica
+    # so the object here is the very one every later read in this process
     # gets: mutating it before the write succeeds means a refused reply is
     # still shown, and is persisted by whatever writes the thread next.
     candidate = dataclasses.replace(
