@@ -986,7 +986,7 @@ your `html`: it is the difference between `original` and `converted` here.
 hub "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/export/vault" -o vault.zip
 ```
 
-Returns an in-memory ZIP that is a ready-to-open Obsidian vault:
+Returns a ZIP that is a ready-to-open Obsidian vault:
 
 - `INDEX.md` — the hub note, wikilinked to every version and every comment
   thread, plus artifact-level frontmatter (status, owner, version and comment
@@ -1006,6 +1006,17 @@ there is no separate graph engine to run. This is the artifact's endpoint for
 "archive everything that happened here" — pull it once a document is marked
 `final` to keep a permanent, browsable record of the discussion that produced
 it.
+
+The archive is streamed rather than assembled in memory, and it is budgeted,
+because building one diffs every version and converts every HTML document —
+the heaviest thing this service does for an unauthenticated caller:
+
+- **413** when the artifact's visible history and comments exceed the hub's
+  `HUB_EXPORT_MAX_BYTES` (64 MB by default). Nothing is built. Fall back to
+  `GET /a/{id}/export/markdown` for the served version.
+- **429** when this client address has already built `HUB_MAX_EXPORTS_PER_HOUR`
+  vaults of this artifact in the current hour (20 by default). Pull the vault
+  once and keep it; do not poll or re-download this endpoint.
 
 ## Reading (public, no token required)
 
@@ -1038,7 +1049,7 @@ either against a frozen document answers 409.
 | `GET /a/{id}/guest` | Resolve an `X-Artifact-Guest` credential to its display name, without writing anything |
 | `GET /a/{id}/review` | Browser review UI: select text to comment, sidebar of threads, sandboxed artifact iframe; also the guest entry point via a `#invite=` link |
 | `GET /a/{id}/export/markdown` | Head version as Markdown: the author's own source, else converted from the HTML (lossy for charts and images); `X-Artifact-Markdown-Source: original\|converted` says which |
-| `GET /a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, and a chronological reasoning trail) |
+| `GET /a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, and a chronological reasoning trail); 413 over `HUB_EXPORT_MAX_BYTES` of history, 429 over `HUB_MAX_EXPORTS_PER_HOUR` builds per hour |
 | `GET /changelog` | Rendered changelog, in the hub's own visual design |
 | `GET /admin` | Browser moderation studio for the artifact owner (token pasted client-side, never stored server-side) |
 | `GET /agent` | This hub's SKILL.md distilled into a ready-to-install Claude Code subagent |

@@ -125,6 +125,21 @@ class Settings:
     # stored in the artifact's meta record, so this bounds both the meta file
     # and the number of people who can comment without a Keboola account.
     max_invitations_per_artifact: int = 20
+    # Vault exports (REL-100-002)
+    # Ceiling on the source material one GET /a/{id}/export/vault may render,
+    # and on the archive it may write (HUB_EXPORT_MAX_BYTES). 0 disables the
+    # bound. Derived from the two limits that decide the worst case: an
+    # artifact may keep HUB_MAX_VERSIONS (50) records of up to
+    # HUB_MAX_ENVELOPE_BYTES (20 MiB) each, so an unbounded export is a ~1 GiB
+    # request anybody holding the capability URL can repeat. The default is
+    # three envelopes' worth -- comfortably above any real document's whole
+    # history, far below what a container with one process can absorb.
+    export_max_bytes: int = 64 * 1024 * 1024
+    # Vault builds allowed per (artifact, client address) per UTC hour before
+    # the export answers 429 (HUB_MAX_EXPORTS_PER_HOUR). Building a vault
+    # diffs every version and converts every HTML document, so this bounds how
+    # often one capability-URL holder can ask for that work.
+    max_exports_per_hour: int = 20
 
 
 def load_settings() -> Settings:
@@ -189,4 +204,6 @@ def load_settings() -> Settings:
         max_invitations_per_artifact=_int_env(
             "HUB_MAX_INVITATIONS_PER_ARTIFACT", 20
         ),
+        export_max_bytes=_int_env("HUB_EXPORT_MAX_BYTES", 64 * 1024 * 1024),
+        max_exports_per_hour=_int_env("HUB_MAX_EXPORTS_PER_HOUR", 20),
     )

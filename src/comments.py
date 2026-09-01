@@ -36,6 +36,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from src.kbc import BackendError, FilesBackend
+from src.store import RevisionLedger
 
 logger = logging.getLogger(__name__)
 
@@ -504,6 +505,10 @@ class CommentStore:
         self._index: dict[str, dict[str, int]] = {}
         self._memory: OrderedDict[tuple[str, int], CommentThread] = OrderedDict()
         self._lock = threading.Lock()
+        # Bumped by every write method below and read by the live-poll ETag,
+        # which combines it with the artifact store's own number so a comment
+        # is as visible to a poller as a new version is (REL-100-003).
+        self._revisions = RevisionLedger()
         try:
             _harden_cache_dir(self._cache_dir)
         except OSError as exc:  # Disk cache is optional — degrade gracefully.
@@ -543,6 +548,14 @@ class CommentStore:
         """Number of threads currently indexed."""
         with self._lock:
             return sum(len(threads) for threads in self._index.values())
+
+    def revision(self, artifact_id: str) -> str:
+        """Opaque token that changes whenever this artifact's threads change.
+
+        The comment half of the live poll's ETag; see
+        :class:`~src.store.RevisionLedger`.
+        """
+        return self._revisions.token(artifact_id)
 
     # ----------------------------------------------------------------- write
 
@@ -584,6 +597,9 @@ class CommentStore:
             self._delete_disk_cache(artifact_id, previous)
         if retire_older:
             self._delete_superseded(artifact_id, thread_id, keep_file_id=file_id)
+        # One choke point for both create and update, so a new thread, a reply,
+        # a resolve and an edit all move the artifact's comment revision.
+        self._revisions.bump(artifact_id)
 
     # ------------------------------------------------------------------ read
 
@@ -713,6 +729,9 @@ class CommentStore:
                     self._memory.pop((artifact_id, file_id), None)
                 if not threads:
                     self._index.pop(artifact_id, None)
+        # Only on a confirmed erasure: a partial delete left the thread
+        # listable, so nothing changed for a poller either.
+        self._revisions.bump(artifact_id)
         return True
 
     def delete_all_for(self, artifact_id: str) -> tuple[int, int]:
@@ -776,6 +795,13 @@ class CommentStore:
                         self._memory.pop((artifact_id, file_id), None)
                 if not threads:
                     self._index.pop(artifact_id, None)
+        if failed:
+            self._revisions.bump(artifact_id)
+        else:
+            # Called when the artifact itself is purged: with every thread
+            # confirmed gone there is nothing left to describe, and dropping
+            # the entry keeps a create/purge loop from growing the ledger.
+            self._revisions.forget(artifact_id)
         return (deleted, failed)
 
     def _delete_superseded(

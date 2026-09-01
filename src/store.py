@@ -59,6 +59,7 @@ import json
 from datetime import datetime, timezone
 import logging
 import os
+import secrets
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
@@ -168,6 +169,70 @@ ARTIFACT_SETTABLE_STATUSES = (ARTIFACT_DRAFT, ARTIFACT_FINAL)
 
 #: Schema version written by this module.
 SCHEMA_VERSION = 2
+
+
+class RevisionLedger:
+    """A monotonic mutation counter per artifact, for O(1) change detection.
+
+    Closes REL-100-003. ``GET /a/{id}/live`` used to enumerate every version
+    and every comment thread just to hash them into an ETag, which meant a
+    conditional poll that answers "nothing changed" still paid the full price
+    of finding that out. With this ledger the poll turns
+    :meth:`token` into an ETag and answers 304 having read one dictionary
+    entry.
+
+    **Why an in-memory counter is exact here, not an approximation.** Per
+    CLAUDE.md this service is deployed as exactly one Keboola Data App
+    container running exactly one uvicorn process, and that is a deployment
+    invariant rather than a scaling choice -- the version allocator, the
+    per-process locks and the StateDB snapshot cycle already depend on it.
+    Under it, this process is the only writer that exists, and no artifact can
+    change without passing through the store method that bumps its number. So
+    "same token" really does mean "same state", with no window in which
+    somebody else moved the artifact behind our back.
+
+    **Why a boot nonce.** The ledger does not survive a restart, and a bare
+    counter restarting at zero would let a cold process re-issue a tag it had
+    already used for older content -- a client would be told "unchanged" about
+    something that had in fact moved. Mixing a random per-process nonce into
+    every token makes that impossible: after a restart the same artifact in
+    the same state hands out a *different* tag, so a stale client refetches
+    once (cheap, correct) instead of missing an update (silent, wrong).
+
+    **Why reads never insert.** :meth:`token` treats an unknown artifact as
+    revision 0 rather than creating an entry, and :meth:`forget` drops an
+    artifact when it is purged. Between them the ledger stays bounded by the
+    number of live artifacts, so neither anonymous polling of made-up ids nor
+    a create/purge loop can grow it -- the failure mode SEC-100-002 found in
+    the lock registry.
+    """
+
+    def __init__(self) -> None:
+        # 128 bits: this only has to be unique across process lifetimes, and
+        # it is public (it ends up hashed into an ETag), never a secret.
+        self._boot = secrets.token_hex(16)
+        self._revisions: dict[str, int] = {}
+        # Its own lock, never taken while a store lock is held, so bumping can
+        # be called from inside a store method without any ordering concern.
+        self._lock = threading.Lock()
+
+    def bump(self, artifact_id: str) -> int:
+        """Record one committed mutation of an artifact; returns the new number."""
+        with self._lock:
+            value = self._revisions.get(artifact_id, 0) + 1
+            self._revisions[artifact_id] = value
+            return value
+
+    def token(self, artifact_id: str) -> str:
+        """This artifact's current revision, as an opaque per-process token."""
+        with self._lock:
+            value = self._revisions.get(artifact_id, 0)
+        return f"{self._boot}:{value}"
+
+    def forget(self, artifact_id: str) -> None:
+        """Drop a purged artifact's entry. Ids are random and never come back."""
+        with self._lock:
+            self._revisions.pop(artifact_id, None)
 
 
 def tag_for_id(artifact_id: str) -> str:
@@ -909,6 +974,9 @@ class ArtifactStore:
         self._memory: OrderedDict[tuple[str, int], Envelope] = OrderedDict()
         self._meta_memory: OrderedDict[tuple[str, int], ArtifactMeta] = OrderedDict()
         self._lock = threading.Lock()
+        # Bumped by every write method below, read by the live-poll ETag.
+        # See :class:`RevisionLedger` (REL-100-003).
+        self._revisions = RevisionLedger()
         try:
             _harden_cache_dir(self._cache_dir)
         except OSError as exc:  # Disk cache is optional — degrade gracefully.
@@ -1000,6 +1068,15 @@ class ArtifactStore:
         """Number of artifacts currently indexed."""
         with self._lock:
             return len(self._index)
+
+    def revision(self, artifact_id: str) -> str:
+        """Opaque token that changes whenever this artifact is mutated.
+
+        The cheap half of the live poll: see :class:`RevisionLedger` for why
+        an in-memory number is exact under this service's single-writer
+        deployment, and why it carries a per-process boot nonce.
+        """
+        return self._revisions.token(artifact_id)
 
     def _resolve(self, artifact_id: str) -> _ArtEntry | None:
         """Index lookup with a Storage fallback for artifacts we never saw.
@@ -1111,6 +1188,10 @@ class ArtifactStore:
         if previous is not None and previous != file_id:
             self._delete_disk_cache(artifact_id, previous)
         self._delete_stale_meta_files(artifact_id, keep_file_id=file_id)
+        # Every artifact-level change -- settings, password, head pin, status,
+        # trash/restore, link rotation, invitations -- lands here, so this one
+        # bump is what makes all of them visible to a live poll (REL-100-003).
+        self._revisions.bump(artifact_id)
 
     def owner_key_of(self, artifact_id: str) -> str | None:
         """Owner key of an artifact, or None when the artifact is unknown."""
@@ -1340,6 +1421,9 @@ class ArtifactStore:
             self._delete_file(artifact_id, previous.file_id)
         self._prune_versions(artifact_id)
         self._prune_proposals(artifact_id)
+        # Also the choke point for set_status (promote/withdraw rewrite the
+        # version file through here), so a live poll sees those too.
+        self._revisions.bump(artifact_id)
 
     def add_version_next(self, env: Envelope) -> int:
         """Atomically allocate the next version number and write the version.
@@ -1395,6 +1479,7 @@ class ArtifactStore:
             self._delete_file(artifact_id, previous.file_id)
         self._prune_versions(artifact_id)
         self._prune_proposals(artifact_id)
+        self._revisions.bump(artifact_id)
         return version
 
     def get_version(
@@ -1627,6 +1712,9 @@ class ArtifactStore:
             if legacy_file_id is not None and entry.legacy_file_id == legacy_file_id:
                 entry.legacy_file_id = None
                 self._memory.pop((artifact_id, legacy_file_id), None)
+        # Bumped only on a confirmed deletion: a failed backend delete left the
+        # version in place, so nothing changed for a poller either.
+        self._revisions.bump(artifact_id)
         return True
 
     # ---------------------------------------------------------------- trash
@@ -1733,6 +1821,9 @@ class ArtifactStore:
             self._forget_meta_locked(artifact_id)
             self._forget_share_locked(artifact_id)
         self._purge_disk_cache(artifact_id)
+        # The artifact is gone, so its revision has nothing left to describe;
+        # dropping it keeps a create/purge loop from growing the ledger.
+        self._revisions.forget(artifact_id)
         return True
 
     # ----------------------------------------------------------------- list
