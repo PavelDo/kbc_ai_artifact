@@ -24,6 +24,7 @@ transient Storage outage cannot put the app into a crash loop.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -1087,7 +1088,11 @@ async def artifact_headers(request: Request, call_next):
     response = await call_next(request)
     if request.url.path.startswith("/a/"):
         response.headers["X-Robots-Tag"] = "noindex, nofollow"
-        response.headers["Cache-Control"] = "no-cache"
+        # setdefault, not assignment: a handler that has already asked for
+        # something stricter (GET /a/{id}/live sends "no-store", so no
+        # intermediary can ever answer a change-detection poll from a cache)
+        # keeps what it set.
+        response.headers.setdefault("Cache-Control", "no-cache")
     return response
 
 
@@ -1299,7 +1304,13 @@ def health_headers(request: Request) -> dict[str, Any]:
     return {"received_header_names": sorted(request.headers.keys())}
 
 
-def _framed(envelope: Envelope) -> HTMLResponse:
+def _framed(
+    request: Request,
+    meta: ArtifactMeta,
+    envelope: Envelope,
+    *,
+    pinned: bool = False,
+) -> HTMLResponse:
     """One version, wrapped in the zero-chrome sandboxed-iframe page.
 
     The browser-facing read paths never hand a publisher's document to the
@@ -1310,9 +1321,21 @@ def _framed(envelope: Envelope) -> HTMLResponse:
     wrapper itself from being embedded elsewhere; no other CSP directive is
     set, because the artifact inside ``srcdoc`` must keep rendering exactly as
     published. Machines that need the bytes use ``/a/{id}/raw``.
+
+    The wrapper also carries the live-update shell, which polls
+    ``GET /a/{id}/live`` and swaps a new head version in (or offers a banner —
+    see :func:`~src.pages.artifact_frame_page`). ``pinned`` marks the
+    ``/a/{id}/v/{n}`` route, where the reader asked for one specific version
+    and the document is therefore never swapped underneath them.
     """
     return HTMLResponse(
-        artifact_frame_page(envelope.title, envelope.html),
+        artifact_frame_page(
+            envelope.title,
+            envelope.html,
+            base_url=base_url(request),
+            share_id=meta.share_id,
+            pinned_version=envelope.version if pinned else None,
+        ),
         headers={"Content-Security-Policy": "frame-ancestors 'self'"},
     )
 
@@ -2795,6 +2818,19 @@ def context(request: Request) -> dict:
             },
             {
                 "method": "GET",
+                "path": "/a/{id}/live",
+                "auth": "url capability",
+                "purpose": (
+                    "tiny change-detection snapshot (head version, counts, "
+                    "document status) with a strong ETag; answers 304 to a "
+                    "matching If-None-Match. This is what the artifact page, "
+                    "the review UI and the admin studio poll so a reader sees "
+                    "a new version without reloading. Readable while the "
+                    "artifact is protected, exactly like /a/{id}/meta."
+                ),
+            },
+            {
+                "method": "GET",
                 "path": "/a/{id}/v/{n}",
                 "auth": "url capability; owner or author for proposals",
                 "purpose": "one specific version",
@@ -3581,7 +3617,7 @@ def read_artifact(
     if envelope is None:
         return _not_found(public_id)
     _record_view(request.app, meta.id, "page")
-    return _framed(envelope)
+    return _framed(request, meta, envelope)
 
 
 @app.post(
@@ -3917,6 +3953,145 @@ def read_meta(
     )
 
 
+#: The snapshot fields ``GET /a/{id}/live`` hashes into its ETag. Kept as an
+#: explicit tuple so the ETag can never start depending on something that is
+#: not in the body a client would receive.
+_LIVE_FIELDS = (
+    "id",
+    "head_version",
+    "updated_at",
+    "versions_count",
+    "proposed_count",
+    "comment_threads",
+    "document_status",
+    "contributions_frozen",
+)
+
+
+def _live_snapshot(request: Request, meta: ArtifactMeta) -> dict:
+    """The tiny change-detection payload behind ``GET /a/{id}/live``."""
+    store = request.app.state.store
+    head = store.get_head(meta.id)
+    versions = store.list_versions(meta.id)
+    return {
+        # The public identifier, exactly as /a/{id}/meta reports it: a
+        # capability-URL holder is not entitled to the internal id.
+        "id": meta.share_id,
+        "head_version": head.version if head is not None else None,
+        "updated_at": meta.updated_at,
+        "versions_count": len(versions),
+        "proposed_count": sum(
+            1 for row in versions if row.get("status") == STATUS_PROPOSED
+        ),
+        "comment_threads": len(request.app.state.comments.list_for(meta.id)),
+        "document_status": meta.status,
+        "contributions_frozen": meta.is_frozen(),
+    }
+
+
+def _live_etag(snapshot: dict) -> str:
+    """A strong ETag over a canonical serialisation of the snapshot.
+
+    Canonical (sorted keys, no incidental whitespace) so every replica of this
+    app derives the same tag from the same state — which is exactly why
+    polling was chosen over a per-process subscription. Truncated to 32 hex
+    characters: still 128 bits, and short enough to keep the request header
+    small when a browser echoes it back on every poll.
+    """
+    payload = {key: snapshot.get(key) for key in _LIVE_FIELDS}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+    return f'"{digest}"'
+
+
+def _etag_matches(header: str | None, etag: str) -> bool:
+    """True when an ``If-None-Match`` header covers ``etag``.
+
+    Handles the comma-separated list and the ``W/`` weak prefix a browser or
+    an intermediary may add; ``*`` matches anything, per RFC 9110.
+    """
+    if not header:
+        return False
+    for candidate in header.split(","):
+        value = candidate.strip()
+        if value == "*":
+            return True
+        if value.startswith("W/"):
+            value = value[2:].strip()
+        if value == etag:
+            return True
+    return False
+
+
+@app.get(
+    "/a/{artifact_id}/live",
+    tags=["public"],
+    summary="Change-detection snapshot",
+    description=(
+        "A deliberately tiny JSON snapshot of everything a reader's open page "
+        "needs in order to notice that something moved: 'id', "
+        "'head_version', 'updated_at', 'versions_count', 'proposed_count', "
+        "'comment_threads', 'document_status' and 'contributions_frozen'. It "
+        "carries no content, no owner identity and no password record — it is "
+        "a change *signal*, not a payload, and the pages fetch the real thing "
+        "(/a/{id}/raw, /a/{id}/versions, /a/{id}/comments) once it tells them "
+        "to.\n\n"
+        "This is what the rendered artifact page, the review UI and the admin "
+        "studio poll, roughly every ten seconds while their tab is visible, "
+        "to update a reader's screen without a reload. Polling — rather than "
+        "server-sent events or a websocket — because this service runs behind "
+        "a buffering platform proxy and may run more than one replica; a "
+        "conditional GET survives both.\n\n"
+        "The response carries a strong `ETag` computed from those fields. "
+        "Send it back as `If-None-Match` and an unchanged artifact answers "
+        "**304 with no body**, which is what makes polling this cheap. "
+        "`Cache-Control: no-store` keeps any intermediary from ever serving a "
+        "stale snapshot in place of a fresh one.\n\n"
+        "Like GET /a/{id}/meta — and unlike every content endpoint — this is "
+        "readable while the artifact is password-protected: it is metadata "
+        "only, and a reader sitting behind the unlock form still has to pass "
+        "that form to see anything it points at.\n\n"
+        + STATUS_VS_DOCUMENT_STATUS_NOTE
+    ),
+    responses={
+        200: {
+            "description": (
+                "The snapshot, with a strong ETag for the next conditional "
+                "request."
+            )
+        },
+        304: {
+            "description": (
+                "The If-None-Match tag still matches: nothing changed, and no "
+                "body is sent."
+            )
+        },
+        404: {
+            "description": (
+                "No artifact exists with this id — it never did, it was "
+                "trashed or purged, or its share link has been rotated and "
+                "this is the old one. A polling client stops on this."
+            )
+        },
+        502: RESP_HUB_502,
+    },
+)
+def read_live(
+    request: Request,
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
+) -> Response:
+    """Change-detection snapshot; public even when the artifact is protected."""
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
+    if meta is None:
+        return _not_found(public_id)
+    snapshot = _live_snapshot(request, meta)
+    etag = _live_etag(snapshot)
+    headers = {"ETag": etag, "Cache-Control": "no-store"}
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(snapshot, headers=headers)
+
 @app.get(
     "/a/{artifact_id}/v/{version}",
     tags=["public"],
@@ -3972,7 +4147,7 @@ def read_version(
     if not may_see(meta, envelope, optional_caller(request)):
         return _proposal_hidden(public_id, version)
     _record_view(request.app, meta.id, "version")
-    return _framed(envelope)
+    return _framed(request, meta, envelope, pinned=True)
 
 
 @app.get(

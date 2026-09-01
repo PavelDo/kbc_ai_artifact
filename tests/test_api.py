@@ -40,6 +40,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import src.main as main
+import src.pages as pages
 from src.auth import STACK_ALIASES, AuthError, Owner
 from src.builder import BuiltArtifact
 from src.comments import CommentStore
@@ -247,6 +248,7 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("GET", "/a/{id}/raw"),
         ("GET", "/a/{id}/source"),
         ("GET", "/a/{id}/meta"),
+        ("GET", "/a/{id}/live"),
         ("GET", "/a/{id}/v/{n}"),
         ("GET", "/a/{id}/versions"),
         ("GET", "/a/{id}/diff/{a}..{b}"),
@@ -751,12 +753,17 @@ def test_read_artifact_sandboxes_the_document_in_an_iframe(api: Api) -> None:
     assert "allow-same-origin" not in page.text
     assert page.headers["content-security-policy"] == "frame-ancestors 'self'"
 
-    # The whole document is inside srcdoc, html-escaped...
-    assert f'srcdoc="{html.escape(raw.text, quote=True)}"' in page.text
+    # The whole document is inside srcdoc, html-escaped — with the shell's own
+    # scroll reporter appended to it, which is the only way a frame that has no
+    # allow-same-origin can tell the wrapper whether the reader has scrolled.
+    embedded = pages._inject_before_body_end(raw.text, pages._SCROLL_REPORTER_JS)
+    assert f'srcdoc="{html.escape(embedded, quote=True)}"' in page.text
     # ...so none of the artifact's own markup is live at top level.
-    assert "<script" not in page.text
     assert "<h1" not in page.text
     assert "&lt;h1" in page.text
+    # The scripts that *are* live at top level are the shell's own, and they
+    # gain the frame no capability: the sandbox attribute is unchanged above.
+    assert "window.AHLive" in page.text
 
 
 def test_read_version_is_sandboxed_too(api: Api) -> None:
@@ -765,7 +772,8 @@ def test_read_version_is_sandboxed_too(api: Api) -> None:
     assert page.status_code == 200
     assert "sandbox=" in page.text
     assert "allow-same-origin" not in page.text
-    assert "<script" not in page.text
+    assert "<h1" not in page.text
+    assert "&lt;h1" in page.text
 
 
 def test_raw_is_unchanged_byte_exact_html(api: Api) -> None:
@@ -5275,3 +5283,258 @@ class TestDemoLink:
         body = api.client.get("/").text
         assert "See the demo" in body
         assert "https://hub.example/a/demo" in body
+
+
+# --------------------------------------------------------------------------
+# Live updating
+#
+# GET /a/{id}/live is the change-detection endpoint every reader-facing page
+# polls; the pages themselves are asserted through the HTML they ship, since
+# their behaviour lives in JavaScript this suite does not execute.
+# --------------------------------------------------------------------------
+
+
+_LIVE_KEYS = {
+    "id",
+    "head_version",
+    "updated_at",
+    "versions_count",
+    "proposed_count",
+    "comment_threads",
+    "document_status",
+    "contributions_frozen",
+}
+
+
+def _live(api: Api, share_id: str, etag: str | None = None):
+    headers = {"If-None-Match": etag} if etag else {}
+    return api.client.get(f"/a/{share_id}/live", headers=headers)
+
+
+def test_live_returns_the_snapshot_shape(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text")
+    resp = _live(api, artifact_id)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body) == _LIVE_KEYS
+    assert body["id"] == artifact_id
+    assert body["head_version"] == 1
+    assert body["versions_count"] == 1
+    assert body["proposed_count"] == 0
+    assert body["comment_threads"] == 0
+    assert body["document_status"] == "draft"
+    assert body["contributions_frozen"] is False
+    assert body["updated_at"]
+    # A change *signal*, not a payload: no content and no owner identity.
+    _assert_no_sensitive_keys(body)
+    assert "html" not in body
+
+
+def test_live_caching_headers_and_conditional_request(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text")
+    first = _live(api, artifact_id)
+    etag = first.headers["etag"]
+    # Strong (no W/ prefix) and quoted, so an intermediary cannot weaken it.
+    assert etag.startswith('"') and etag.endswith('"')
+    # no-store survives the /a/ middleware, which otherwise sets no-cache.
+    assert first.headers["cache-control"] == "no-store"
+
+    again = _live(api, artifact_id, etag)
+    assert again.status_code == 304
+    assert again.content == b""
+    assert again.headers["etag"] == etag
+    assert again.headers["cache-control"] == "no-store"
+
+    # The weak-prefixed and list forms an intermediary may send still match.
+    assert _live(api, artifact_id, f"W/{etag}").status_code == 304
+    assert _live(api, artifact_id, f'"other", {etag}').status_code == 304
+    assert _live(api, artifact_id, '"stale"').status_code == 200
+
+
+def test_live_etag_changes_when_a_new_version_is_published(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text")
+    before = _live(api, artifact_id)
+    assert api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"markdown": "# Title\n\nSecond"},
+        headers=AUTH_HEADERS,
+    ).status_code == 200
+
+    after = _live(api, artifact_id, before.headers["etag"])
+    assert after.status_code == 200
+    assert after.headers["etag"] != before.headers["etag"]
+    assert after.json()["head_version"] == 2
+    assert after.json()["versions_count"] == 2
+
+
+def test_live_etag_changes_when_a_version_is_proposed(api: Api) -> None:
+    artifact_id = _publish_markdown(
+        api, "# Title\n\nBody text", accept_versions=True
+    )
+    before = _live(api, artifact_id)
+    assert _submit_version(
+        api, artifact_id, "# Title\n\nProposal", headers=OTHER_AUTH_HEADERS
+    ).status_code == 201
+
+    after = _live(api, artifact_id, before.headers["etag"])
+    assert after.status_code == 200
+    assert after.json()["proposed_count"] == 1
+    # The head has not moved: a proposal is not a swap, only a signal.
+    assert after.json()["head_version"] == 1
+
+
+def test_live_etag_changes_when_a_comment_is_added(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text")
+    before = _live(api, artifact_id)
+    assert _comment(api, artifact_id).status_code == 201
+
+    after = _live(api, artifact_id, before.headers["etag"])
+    assert after.status_code == 200
+    assert after.headers["etag"] != before.headers["etag"]
+    assert after.json()["comment_threads"] == 1
+
+
+def test_live_etag_changes_when_the_document_is_finalised(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text")
+    before = _live(api, artifact_id)
+    assert _policy(api, artifact_id, status="final").status_code == 200
+
+    after = _live(api, artifact_id, before.headers["etag"])
+    assert after.status_code == 200
+    assert after.headers["etag"] != before.headers["etag"]
+    assert after.json()["document_status"] == "final"
+    assert after.json()["contributions_frozen"] is True
+
+
+def test_live_is_readable_while_the_artifact_is_protected(api: Api) -> None:
+    """Same rule as /a/{id}/meta: metadata stays public behind the password."""
+    artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
+    assert api.client.get(f"/a/{artifact_id}/raw").status_code == 401
+    assert api.client.get(f"/a/{artifact_id}/meta").status_code == 200
+
+    resp = _live(api, artifact_id)
+    assert resp.status_code == 200
+    assert resp.json()["head_version"] == 1
+    # ...and it still carries nothing the password is protecting.
+    assert set(resp.json()) == _LIVE_KEYS
+
+
+def test_live_resolves_by_share_id_and_404s_for_a_rotated_away_id(
+    api: Api,
+) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text")
+    assert _live(api, artifact_id).status_code == 200
+
+    share_id = _rotate(api, artifact_id).json()["share_id"]
+    assert share_id != artifact_id
+    assert _live(api, share_id).status_code == 200
+    assert _live(api, share_id).json()["id"] == share_id
+    # The old link is dead, which is the signal a polling client stops on.
+    assert _live(api, artifact_id).status_code == 404
+    assert _live(api, "no-such-artifact").status_code == 404
+
+
+def test_live_is_documented_in_context_and_openapi(api: Api) -> None:
+    entry = {
+        e["path"]: e for e in api.client.get("/context").json()["endpoints"]
+    }["/a/{id}/live"]
+    assert entry["method"] == "GET"
+    assert entry["auth"] == "url capability"
+    assert "ETag" in entry["purpose"]
+
+    operation = api.client.get("/openapi.json").json()["paths"][
+        "/a/{artifact_id}/live"
+    ]["get"]
+    assert operation["tags"] == ["public"]
+    assert operation["summary"].strip()
+    assert "If-None-Match" in operation["description"]
+    # 422 is FastAPI's own validation response; the four documented here are
+    # the ones a polling client actually branches on.
+    assert {"200", "304", "404", "502"} <= set(operation["responses"])
+    for response in operation["responses"].values():
+        assert response["description"].strip()
+
+
+# ---- the three surfaces ---------------------------------------------------
+
+
+def test_artifact_wrapper_ships_the_poller_and_the_scroll_reporter(
+    api: Api,
+) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text")
+    page = api.client.get(f"/a/{artifact_id}").text
+
+    # The shared helper, not a per-page copy of it.
+    assert "window.AHLive = (function" in page
+    assert "AHLive.watch(" in page
+    assert f'window.AH_ID = "{artifact_id}";' in page
+    # The banner, hidden until there is something to say.
+    assert 'id="ah-live"' in page
+    assert 'id="ah-live-go"' in page
+    assert 'class="ahlive" id="ah-live" hidden' in page
+    # The scroll reporter is injected into the document itself, since the
+    # sandboxed frame cannot be read from the outside.
+    assert 'id="ah-reporter"' in page
+    assert "ah-scroll" in page
+    raw = api.client.get(f"/a/{artifact_id}/raw").text
+    embedded = pages._inject_before_body_end(raw, pages._SCROLL_REPORTER_JS)
+    assert html.escape(embedded, quote=True) in page
+    # ...and it buys the frame no new capability.
+    assert "allow-same-origin" not in page
+
+
+def test_head_page_auto_swaps_but_a_pinned_version_does_not(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text")
+    assert api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"markdown": "# Title\n\nSecond"},
+        headers=AUTH_HEADERS,
+    ).status_code == 200
+
+    head = api.client.get(f"/a/{artifact_id}").text
+    assert "window.AH_PINNED = null;" in head
+
+    pinned = api.client.get(f"/a/{artifact_id}/v/1").text
+    # A reader on /v/{n} asked for that version: the shell knows which one,
+    # and its banner points at the head instead of swapping.
+    assert "window.AH_PINNED = 1;" in pinned
+    assert "Open the latest" in pinned
+    assert "window.AHLive = (function" in pinned
+
+
+def test_review_page_ships_the_poller_and_its_banner(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text")
+    page = api.client.get(f"/a/{artifact_id}/review").text
+
+    assert "window.AHLive = (function" in page
+    assert "AHLive.watch(" in page
+    assert 'id="rv-live"' in page
+    assert 'id="rv-live-go"' in page
+    # The scroll reporter travels into the document beside the annotation
+    # layer, so the shell knows whether the reviewer has scrolled.
+    assert 'id="rv-scroll"' in page
+    assert "ah-scroll" in page
+    # Drafts live outside the DOM, so a live refresh cannot eat a half-typed
+    # reply.
+    assert "var drafts = {};" in page
+    assert "function safeToSwap()" in page
+
+
+def test_admin_studio_polls_only_expanded_panels(api: Api) -> None:
+    page = api.client.get("/admin").text
+    assert "window.AHLive = (function" in page
+    assert "AHLive.watch(" in page
+    # Collapsing a row, re-rendering the list or leaving the studio all stop
+    # the watches they own.
+    assert "function stopWatchers()" in page
+    assert "function stopWatch()" in page
+
+
+def test_every_live_surface_shares_one_copy_of_the_poller(api: Api) -> None:
+    """The helper is one module-level constant, not three pasted copies."""
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text")
+    marker = "window.AHLive = (function"
+    for path in (f"/a/{artifact_id}", f"/a/{artifact_id}/review", "/admin"):
+        body = api.client.get(path).text
+        assert body.count(marker) == 1, path
+        assert pages._LIVE_JS in body, path

@@ -578,6 +578,18 @@ _ADMIN_JS = """
   var AUTH_KEY = "hub_admin_auth";
   var auth = null;
 
+  /* One live watch per *expanded* detail panel. A collapsed row polls
+     nothing, and re-rendering or leaving the listing stops every watch it
+     owns, so a studio left open overnight never accumulates them. */
+  var watchers = [];
+
+  function stopWatchers() {
+    watchers.forEach(function (handle) {
+      try { handle.stop(); } catch (err) { /* already gone */ }
+    });
+    watchers = [];
+  }
+
   function $(id) { return document.getElementById(id); }
   function show(node, on) { node.hidden = !on; }
 
@@ -740,6 +752,8 @@ _ADMIN_JS = """
   /* ------------------------------------------------------- artifact list */
 
   function renderArtifacts(rows) {
+    /* Every row is about to be thrown away; its watch goes with it. */
+    stopWatchers();
     var list = $("artifacts");
     list.textContent = "";
     show($("empty"), rows.length === 0);
@@ -768,39 +782,90 @@ _ADMIN_JS = """
     top.appendChild(idBtn);
 
     var badges = el("span", "arow-badges");
-    /* Status first: a trashed artifact's public link is dead, and that is the
-       single most important thing about the row. */
-    if (row.status === "trashed") {
-      badges.appendChild(badge("trashed \\u00b7 link dead", "proposed"));
-    } else if (row.status === "final") {
-      badges.appendChild(badge("final"));
+    var date = el("span", "arow-date");
+
+    /* Rebuilt rather than patched, so a live refresh of an expanded row can
+       call it again and get exactly the row a fresh listing would render. */
+    function renderBadges() {
+      badges.textContent = "";
+      /* Status first: a trashed artifact's public link is dead, and that is
+         the single most important thing about the row. */
+      if (row.status === "trashed") {
+        badges.appendChild(badge("trashed \\u00b7 link dead", "proposed"));
+      } else if (row.status === "final") {
+        badges.appendChild(badge("final"));
+      }
+      if (row.proposed_count) {
+        badges.appendChild(badge(
+          row.proposed_count +
+            (row.proposed_count === 1 ? " proposal" : " proposals"),
+          "proposed"
+        ));
+      }
+      if (row.accept_versions) { badges.appendChild(badge("accepting versions")); }
+      if (row.protected) { badges.appendChild(badge("protected")); }
+      if (row.webhooks_count) {
+        badges.appendChild(badge(
+          row.webhooks_count +
+            (row.webhooks_count === 1 ? " webhook" : " webhooks")
+        ));
+      }
+      if (row.head_version) {
+        badges.appendChild(badge("head v" + row.head_version, "head"));
+      }
+      date.textContent = String(row.updated_at || "").replace("T", " ");
     }
-    if (row.proposed_count) {
-      badges.appendChild(badge(
-        row.proposed_count + (row.proposed_count === 1 ? " proposal" : " proposals"),
-        "proposed"
-      ));
-    }
-    if (row.accept_versions) { badges.appendChild(badge("accepting versions")); }
-    if (row.protected) { badges.appendChild(badge("protected")); }
-    if (row.webhooks_count) {
-      badges.appendChild(badge(
-        row.webhooks_count + (row.webhooks_count === 1 ? " webhook" : " webhooks")
-      ));
-    }
-    if (row.head_version) { badges.appendChild(badge("head v" + row.head_version, "head")); }
+
+    renderBadges();
     top.appendChild(badges);
-    top.appendChild(el("span", "arow-date", String(row.updated_at || "").replace("T", " ")));
+    top.appendChild(date);
 
     var panel = el("div", "apanel");
     panel.hidden = true;
+
+    /* The panel's own watch, alive only while it is expanded. */
+    var watch = null;
+
+    function stopWatch() {
+      if (!watch) { return; }
+      try { watch.stop(); } catch (err) { /* already gone */ }
+      var at = watchers.indexOf(watch);
+      if (at !== -1) { watchers.splice(at, 1); }
+      watch = null;
+    }
+
+    /* A change arrives while the operator is looking at the panel: rebuild
+       its contents (versions table, proposal count, badges) in place. The row
+       stays expanded and the page keeps its scroll offset, so nobody loses
+       their place mid-moderation. */
+    function onLive(next) {
+      if (panel.hidden) { return; }
+      var at = window.pageYOffset;
+      row.head_version = next.head_version;
+      row.proposed_count = next.proposed_count;
+      row.status = next.document_status;
+      row.updated_at = next.updated_at;
+      renderBadges();
+      loadPanel(row, panel).then(function () {
+        window.scrollTo(0, at);
+      });
+    }
 
     function toggle() {
       var opening = panel.hidden;
       panel.hidden = !opening;
       item.classList.toggle("is-open", opening);
       caret.textContent = opening ? "\\u25be" : "\\u25b8";
-      if (opening) { loadPanel(row, panel); }
+      if (!opening) { stopWatch(); return; }
+      loadPanel(row, panel);
+      /* A trashed or purged artifact answers 404 here and the watch stops
+         itself — no special case needed for it. */
+      watch = window.AHLive.watch({
+        base: BASE,
+        id: row.share_id || row.id,
+        onChange: onLive
+      });
+      watchers.push(watch);
     }
 
     top.addEventListener("click", toggle);
@@ -1357,6 +1422,7 @@ _ADMIN_JS = """
   }
 
   function leaveStudio() {
+    stopWatchers();
     clearAuth();
     auth = null;
     $("artifacts").textContent = "";
@@ -1460,6 +1526,348 @@ _ADMIN_JS = """
 #: the short, unambiguous aliases; anything else goes through "custom URL",
 #: which the server validates exactly as it validates a curl call.
 _ADMIN_STACKS = ("us", "gcp-us", "eu", "azure-eu", "gcp-eu")
+
+
+# --------------------------------------------------------------------------
+# Live updating
+# --------------------------------------------------------------------------
+
+#: The one polling helper every live-updating surface shares.
+#:
+#: Design note — why polling. This service runs as a Keboola Data App behind a
+#: platform proxy that buffers responses, which would silently break
+#: server-sent events, and a long-lived in-process subscription would stop
+#: working the moment the app runs more than one replica. A conditional GET
+#: against a tiny snapshot endpoint (``GET /a/{id}/live``) survives both: the
+#: proxy has nothing to buffer, and every replica computes the same ETag from
+#: the same Storage-backed index.
+#:
+#: Exposed as ``window.AHLive.watch(options)``:
+#:
+#: - ``base``/``id`` — where to poll (``{base}/a/{id}/live``),
+#: - ``intervalMs`` — default 10s,
+#: - ``onChange(next, previous)`` — called *only* when the snapshot actually
+#:   differs from the one before it. The first response is a baseline and
+#:   never fires it.
+#:
+#: The returned handle carries ``stop()`` and ``check()`` (poll now).
+#:
+#: Behaviour that the surfaces below rely on: polling pauses entirely while
+#: ``document.hidden`` and does one immediate check when the tab comes back;
+#: network and non-2xx answers back off exponentially (10s, 20s, 40s, capped
+#: at 60s) and reset on the first success; a 404 stops the watch for good (the
+#: artifact was trashed, purged, or its share link rotated). Nothing here ever
+#: throws into the host page, and a slow ``onChange`` cannot make it poll
+#: faster than its interval — the next tick is scheduled only once the current
+#: one has fully finished.
+_LIVE_JS = """
+window.AHLive = (function () {
+  "use strict";
+
+  var INTERVAL_MS = 10000;
+  var MAX_BACKOFF_MS = 60000;
+  /* An immediate check (tab refocused, caller asked) still cannot fire more
+     often than this, so flipping between tabs cannot turn into a hammer. */
+  var MIN_GAP_MS = 1000;
+
+  /* The snapshot fields that mean "something changed". Kept explicit so an
+     endpoint that later grows a field does not silently start firing
+     onChange for it. */
+  var KEYS = [
+    "head_version", "updated_at", "versions_count", "proposed_count",
+    "comment_threads", "document_status", "contributions_frozen"
+  ];
+
+  function snapshotOf(data) {
+    var out = {};
+    if (!data || typeof data !== "object") { return out; }
+    for (var i = 0; i < KEYS.length; i++) { out[KEYS[i]] = data[KEYS[i]]; }
+    return out;
+  }
+
+  function differs(a, b) {
+    if (!a || !b) { return false; }
+    for (var i = 0; i < KEYS.length; i++) {
+      if (String(a[KEYS[i]]) !== String(b[KEYS[i]])) { return true; }
+    }
+    return false;
+  }
+
+  function watch(options) {
+    var opts = options || {};
+    var base = String(opts.base || "").replace(/\\/+$/, "");
+    var id = String(opts.id || "");
+    var onChange = typeof opts.onChange === "function" ? opts.onChange : null;
+    var every = Number(opts.intervalMs) > 0 ? Number(opts.intervalMs) : INTERVAL_MS;
+    var url = base + "/a/" + encodeURIComponent(id) + "/live";
+
+    var etag = null;
+    var last = null;
+    var timer = null;
+    var stopped = false;
+    var inFlight = false;
+    var failures = 0;
+    var lastAt = 0;
+
+    var handle = {
+      stop: function () { stop(); },
+      check: function () { check(); },
+      snapshot: function () { return last; }
+    };
+
+    if (!id || typeof window.fetch !== "function") {
+      /* Nothing to poll, or a browser without fetch: hand back an inert
+         handle rather than letting the caller special-case it. */
+      return handle;
+    }
+
+    function cancel() {
+      if (timer !== null) { window.clearTimeout(timer); timer = null; }
+    }
+
+    function schedule(ms) {
+      cancel();
+      if (stopped) { return; }
+      timer = window.setTimeout(run, ms > 0 ? ms : 0);
+    }
+
+    function backoff() {
+      var steps = failures > 4 ? 4 : failures;
+      var ms = every * Math.pow(2, steps);
+      return ms > MAX_BACKOFF_MS ? MAX_BACKOFF_MS : ms;
+    }
+
+    /* The single place the next tick is armed: called exactly once per
+       completed poll, after any onChange has returned. A slow callback
+       therefore delays the next request instead of overlapping with it. */
+    function done(failed) {
+      inFlight = false;
+      lastAt = Date.now();
+      if (stopped) { return; }
+      failures = failed ? failures + 1 : 0;
+      schedule(failed ? backoff() : every);
+    }
+
+    function deliver(data) {
+      var next = snapshotOf(data);
+      var previous = last;
+      last = next;
+      if (!previous || !onChange || !differs(previous, next)) { return; }
+      try {
+        onChange(next, previous);
+      } catch (err) {
+        /* A broken callback must never take the watch (or the page) down. */
+      }
+    }
+
+    function run() {
+      timer = null;
+      if (stopped || inFlight) { return; }
+      /* Paused, not stopped: visibilitychange re-arms it. */
+      if (document.hidden) { return; }
+      inFlight = true;
+      var init = { credentials: "same-origin", cache: "no-store" };
+      if (etag) { init.headers = { "If-None-Match": etag }; }
+      var pending;
+      try {
+        pending = window.fetch(url, init);
+      } catch (err) {
+        done(true);
+        return;
+      }
+      pending.then(function (resp) {
+        /* Gone for good: trashed, purged, or the share link was rotated. */
+        if (resp.status === 404) { stop(); return null; }
+        if (resp.status === 304) { done(false); return null; }
+        if (!resp.ok) { done(true); return null; }
+        var tag = resp.headers && resp.headers.get
+          ? resp.headers.get("ETag") : null;
+        return resp.json().then(function (data) {
+          if (tag) { etag = tag; }
+          deliver(data);
+          done(false);
+        }, function () { done(true); });
+      }, function () { done(true); });
+    }
+
+    function check() {
+      if (stopped || inFlight) { return; }
+      var since = Date.now() - lastAt;
+      schedule(since >= MIN_GAP_MS ? 0 : MIN_GAP_MS - since);
+    }
+
+    function onVisibility() {
+      if (stopped) { return; }
+      if (document.hidden) { cancel(); return; }
+      check();
+    }
+
+    function stop() {
+      if (stopped) { return; }
+      stopped = true;
+      cancel();
+      try {
+        document.removeEventListener("visibilitychange", onVisibility);
+      } catch (err) { /* nothing to detach */ }
+    }
+
+    try {
+      document.addEventListener("visibilitychange", onVisibility);
+    } catch (err) { /* no visibility API: it simply polls on */ }
+
+    /* One immediate request to establish the baseline and the ETag. */
+    schedule(0);
+    return handle;
+  }
+
+  return { watch: watch };
+})();
+"""
+
+#: Injected into an artifact's own document, inside the sandboxed ``srcdoc``
+#: iframe, purely so the shell can tell whether the reader has scrolled into
+#: the document before it swaps a new version in underneath them.
+#:
+#: The iframe has no ``allow-same-origin``, so the shell cannot read the
+#: document's scroll position itself — this is the only way to learn it. The
+#: script adds no capability: it posts ``{type: "ah-scroll", y}`` on load and,
+#: throttled, on scroll, and reads nothing else. Every hook is wrapped, so an
+#: artifact that overrides scrolling, blocks listeners or replaces ``parent``
+#: simply produces no report and the shell falls back to showing its banner.
+#:
+#: Served inside a ``<script type="text/plain">`` element and injected as a
+#: real script, so it must never contain the closing script tag sequence.
+_SCROLL_REPORTER_JS = """
+(function () {
+  "use strict";
+
+  var THROTTLE_MS = 200;
+  var timer = null;
+  var pending = 0;
+  var reported = -1;
+
+  function post(y) {
+    try {
+      parent.postMessage({ type: "ah-scroll", y: y }, "*");
+    } catch (err) { /* detached, or no parent to talk to */ }
+  }
+
+  function documentY() {
+    try {
+      var root = document.documentElement || {};
+      var body = document.body || {};
+      var y = window.pageYOffset || root.scrollTop || body.scrollTop || 0;
+      return y > 0 ? y : 0;
+    } catch (err) {
+      return 0;
+    }
+  }
+
+  function flush() {
+    timer = null;
+    var y = pending > 0 ? pending : 0;
+    if (y === reported) { return; }
+    reported = y;
+    post(y);
+  }
+
+  /* Capture phase, so a scrollable element inside the document counts too:
+     a reader who has scrolled an inner pane is just as much "in the middle of
+     something" as one who scrolled the page. */
+  function onScroll(event) {
+    var inner = 0;
+    try {
+      var target = event && event.target;
+      if (target && target !== document && target.scrollTop) {
+        inner = target.scrollTop;
+      }
+    } catch (err) { /* cross-document target: ignore it */ }
+    var outer = documentY();
+    pending = inner > outer ? inner : outer;
+    if (timer !== null) { return; }
+    timer = window.setTimeout(flush, THROTTLE_MS);
+  }
+
+  try {
+    window.addEventListener("scroll", onScroll, true);
+  } catch (err) { /* nothing to listen on */ }
+
+  /* One report on load, so the shell knows the reader is at the top rather
+     than having to guess from silence. */
+  pending = documentY();
+  flush();
+})();
+"""
+
+#: The "a newer version is available" banner, shared by every live surface.
+#: Fixed to the bottom-right, quiet until it has something to say, and in the
+#: shell's own design language (mono label, single accent, the shared card
+#: border) so it reads as part of the page rather than as a browser prompt.
+_LIVE_CSS = """
+.ahlive {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 80;
+  display: flex;
+  gap: .6rem;
+  align-items: center;
+  padding: .55rem .7rem .55rem .85rem;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: 0 6px 22px rgba(13, 22, 34, .16);
+  font-family: var(--font-mono);
+  font-size: .78rem;
+  color: var(--ink);
+  max-width: min(26rem, calc(100vw - 2rem));
+}
+.ahlive[hidden] { display: none; }
+.ahlive-text { line-height: 1.35; }
+"""
+
+
+#: The same banner for :func:`artifact_frame_page`, which is a bare shell with
+#: none of :data:`_CSS`'s custom properties — the artifact owns the viewport
+#: and the wrapper deliberately ships no design system into it. Self-contained
+#: and light/dark aware, so the banner reads the same as everywhere else while
+#: adding nothing the document could collide with.
+_FRAME_LIVE_CSS = """
+.ahlive{position:fixed;right:1rem;bottom:1rem;z-index:2147483000;display:flex;
+gap:.6rem;align-items:center;padding:.55rem .7rem .55rem .85rem;
+border:1px solid #d8e0ea;border-left:3px solid #1442e0;border-radius:10px;
+background:#fff;color:#0d1622;box-shadow:0 6px 22px rgba(13,22,34,.16);
+font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,
+monospace;font-size:.78rem;line-height:1.35;
+max-width:min(26rem,calc(100vw - 2rem))}
+.ahlive[hidden]{display:none}
+.ahlive-btn{font:inherit;cursor:pointer;white-space:nowrap;
+padding:.3rem .6rem;border-radius:6px;border:1px solid #1442e0;
+background:#1442e0;color:#fff}
+.ahlive-btn:hover{opacity:.88}
+@media (prefers-color-scheme: dark){
+.ahlive{border-color:#22303f;border-left-color:#7aa2ff;background:#111a25;
+color:#e7edf5;box-shadow:0 6px 22px rgba(0,0,0,.5)}
+.ahlive-btn{border-color:#7aa2ff;background:#7aa2ff;color:#0b1119}
+}
+"""
+
+
+def _inject_before_body_end(document_html: str, script_source: str) -> str:
+    """Append ``script_source`` as a real script tag, just inside ``</body>``.
+
+    The same technique the review shell uses client-side: the snippet goes as
+    late as possible so it runs after the artifact's own markup, and falls
+    back to a plain append for a fragment with no ``</body>`` at all. The tag
+    name is split so this file can never be mistaken for one that closes a
+    script element.
+    """
+    snippet = "<scr" + "ipt>" + script_source + "</scr" + "ipt>"
+    at = document_html.lower().rfind("</body>")
+    if at < 0:
+        return document_html + snippet
+    return document_html[:at] + snippet + document_html[at:]
 
 
 def _page(title: str, extra_css: str, body: str) -> str:
@@ -1879,12 +2287,143 @@ reload keeps you signed in and closing the tab forgets the token.
 
     return _page(
         "Artifact Hub · Admin studio",
-        _CONTROLS_CSS + _ADMIN_CSS,
-        body + _ADMIN_JS + "</script>",
+        _CONTROLS_CSS + _ADMIN_CSS + _LIVE_CSS,
+        body + _LIVE_JS + "</script>\n<script>" + _ADMIN_JS + "</script>",
     )
 
 
-def artifact_frame_page(title: str, artifact_html: str) -> str:
+#: The wrapper shell's own script: watches ``/a/{id}/live`` and, when the head
+#: version moves, either swaps the document in place or raises the banner.
+#:
+#: The rule is "never yank content out from under someone". The iframe has no
+#: ``allow-same-origin``, so the shell cannot read the reader's scroll
+#: position — :data:`_SCROLL_REPORTER_JS`, injected into the document, posts it
+#: instead. The swap happens automatically only while the last reported offset
+#: is 0 (or no report has arrived yet and the page has only just loaded);
+#: anything else raises the banner and waits for a click. On ``/a/{id}/v/{n}``
+#: the reader asked for one specific version, so there is no automatic swap at
+#: all: the banner points at the new head and says so.
+_FRAME_JS = """
+(function () {
+  "use strict";
+
+  var BASE = String(window.AH_BASE || "").replace(/\\/+$/, "");
+  var ID = String(window.AH_ID || "");
+  /* A number on /a/{id}/v/{n}, null on the head page. Its presence is what
+     turns the automatic swap off. */
+  var PINNED = window.AH_PINNED;
+  var GRACE_MS = 4000;
+
+  var frame = document.getElementById("ah-frame");
+  var banner = document.getElementById("ah-live");
+  var label = document.getElementById("ah-live-text");
+  var button = document.getElementById("ah-live-go");
+  var reporter = document.getElementById("ah-reporter");
+  if (!frame || !banner || !label || !button || !ID) { return; }
+
+  /* null until the document reports; 0 means "at the top". */
+  var scrollY = null;
+  var loadedAt = Date.now();
+  var head = null;
+  var applying = false;
+
+  function inject(text) {
+    var source = reporter ? reporter.textContent : "";
+    if (!source) { return text; }
+    var snippet = "<scr" + "ipt>" + source + "</scr" + "ipt>";
+    var at = String(text).toLowerCase().lastIndexOf("</body>");
+    if (at < 0) { return text + snippet; }
+    return text.slice(0, at) + snippet + text.slice(at);
+  }
+
+  function undisturbed() {
+    if (scrollY === null) { return (Date.now() - loadedAt) < GRACE_MS; }
+    return scrollY === 0;
+  }
+
+  function showBanner(message, action) {
+    label.textContent = message;
+    button.textContent = action;
+    banner.hidden = false;
+  }
+
+  function hideBanner() { banner.hidden = true; }
+
+  function swap() {
+    if (applying) { return; }
+    applying = true;
+    window.fetch(BASE + "/a/" + encodeURIComponent(ID) + "/raw", {
+      credentials: "same-origin",
+      cache: "no-store"
+    }).then(function (resp) {
+      if (!resp.ok) { throw new Error("HTTP " + resp.status); }
+      return resp.text();
+    }).then(function (text) {
+      frame.srcdoc = inject(text);
+      scrollY = null;
+      loadedAt = Date.now();
+      hideBanner();
+      applying = false;
+    }, function () {
+      /* The fetch failed (offline, or the reader lost the unlock cookie):
+         leave the current document alone and keep the banner up so the reader
+         can try again. */
+      applying = false;
+      showBanner(
+        "A newer version is available \\u2014 could not load it just now.",
+        "Try again"
+      );
+    });
+  }
+
+  button.addEventListener("click", function () {
+    if (PINNED === null || PINNED === undefined) { swap(); return; }
+    /* A pinned version is a different URL, not a swap. */
+    window.location.href = BASE + "/a/" + encodeURIComponent(ID);
+  });
+
+  window.addEventListener("message", function (event) {
+    /* Only the document frame may report; anything else is ignored. */
+    if (!frame.contentWindow || event.source !== frame.contentWindow) { return; }
+    var data = event.data;
+    if (!data || typeof data !== "object" || data.type !== "ah-scroll") { return; }
+    var y = Number(data.y);
+    scrollY = isFinite(y) && y > 0 ? y : 0;
+  });
+
+  function onLive(next, previous) {
+    if (String(next.head_version) === String(previous.head_version) &&
+        String(next.updated_at) === String(previous.updated_at)) {
+      /* Comments or proposals moved; the document itself did not. */
+      return;
+    }
+    head = next.head_version;
+    if (PINNED !== null && PINNED !== undefined) {
+      if (String(head) === String(PINNED)) { hideBanner(); return; }
+      showBanner(
+        "v" + head + " is now the latest version of this document \\u2014 " +
+        "you are reading v" + PINNED + ".",
+        "Open the latest"
+      );
+      return;
+    }
+    if (undisturbed()) { swap(); return; }
+    showBanner("A newer version is available.", "Show it");
+  }
+
+  window.AHLive.watch({ base: BASE, id: ID, onChange: onLive });
+})();
+"""
+
+
+def artifact_frame_page(
+    title: str,
+    artifact_html: str,
+    *,
+    base_url: str = "",
+    share_id: str = "",
+    pinned_version: int | None = None,
+) -> str:
     """Wrap one artifact's built HTML in a zero-chrome sandboxed iframe.
 
     Published artifacts are publisher-controlled documents that may run
@@ -1901,11 +2440,54 @@ def artifact_frame_page(title: str, artifact_html: str) -> str:
     escaped with ``quote=True`` — an unescaped ``"`` in the artifact would
     otherwise close the attribute and put artifact markup back at top level.
 
-    Visually this is a no-op: the frame has no border and fills the viewport,
-    so a reader sees exactly what they saw before. Machines that want the
-    bytes themselves keep using ``/a/{id}/raw``.
+    **Live updating.** Given ``share_id``, the shell also polls
+    ``GET /a/{id}/live`` through :data:`_LIVE_JS` and reacts when the head
+    version moves: it re-fetches ``/a/{id}/raw`` and replaces the ``srcdoc``
+    when the reader is demonstrably not in the middle of something, and
+    otherwise raises a discreet banner and waits for a click. "Not in the
+    middle of something" cannot be observed from here — the frame is
+    cross-origin by construction — so :data:`_SCROLL_REPORTER_JS` is injected
+    into the document and posts ``{type: "ah-scroll", y}`` back. It adds no
+    capability to the sandbox and reports nothing but an offset; an artifact
+    that suppresses it simply gets the banner instead of the swap.
+
+    ``pinned_version`` marks the ``/a/{id}/v/{n}`` route, where the reader
+    asked for one specific version: there the document is never swapped, and
+    the banner points at the new head instead.
+
+    Visually this is a no-op until something actually changes: the frame has
+    no border and fills the viewport, so a reader sees exactly what they saw
+    before. Machines that want the bytes themselves keep using ``/a/{id}/raw``.
     """
     safe_title = html.escape(title or "Artifact", quote=True)
+    document_html = artifact_html
+    live = ""
+    if share_id:
+        # The reporter goes into the document served right now; the same
+        # source is kept in a text/plain block so the shell can re-inject it
+        # into whatever it swaps in later.
+        document_html = _inject_before_body_end(
+            artifact_html, _SCROLL_REPORTER_JS
+        )
+        pinned = "null" if pinned_version is None else str(int(pinned_version))
+        live = (
+            '<div class="ahlive" id="ah-live" hidden>\n'
+            '<span class="ahlive-text" id="ah-live-text">'
+            "A newer version is available.</span>\n"
+            '<button type="button" class="ahlive-btn" id="ah-live-go">'
+            "Show it</button>\n"
+            "</div>\n"
+            '<script type="text/plain" id="ah-reporter">'
+            + _SCROLL_REPORTER_JS
+            + "</script>\n"
+            "<script>"
+            f'window.AH_BASE = "{html.escape(base_url.rstrip("/"), quote=True)}";'
+            f' window.AH_ID = "{html.escape(share_id, quote=True)}";'
+            f" window.AH_PINNED = {pinned};"
+            "</script>\n"
+            "<script>" + _LIVE_JS + "</script>\n"
+            "<script>" + _FRAME_JS + "</script>\n"
+        )
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n<head>\n'
@@ -1915,11 +2497,14 @@ def artifact_frame_page(title: str, artifact_html: str) -> str:
         "<style>html,body{margin:0;padding:0;border:0;width:100%;height:100%;"
         "overflow:hidden}"
         "iframe{margin:0;padding:0;border:0;width:100%;height:100vh;"
-        "display:block}</style>\n"
+        "display:block}"
+        + _FRAME_LIVE_CSS
+        + "</style>\n"
         "</head>\n<body>\n"
-        f'<iframe title="{safe_title}" '
+        f'<iframe id="ah-frame" title="{safe_title}" '
         'sandbox="allow-scripts allow-popups allow-forms allow-downloads" '
-        f'srcdoc="{html.escape(artifact_html, quote=True)}"></iframe>\n'
+        f'srcdoc="{html.escape(document_html, quote=True)}"></iframe>\n'
+        f"{live}"
         "</body>\n</html>\n"
     )
 
@@ -2526,6 +3111,15 @@ _REVIEW_JS = """
   var pendingWrite = null;
 
   var threads = [];
+  /* Reply drafts, keyed by thread id and held OUTSIDE the DOM. renderThreads()
+     rebuilds every card from scratch, and a live refresh calls it: whatever
+     somebody has typed has to survive that, so it lives here and the textarea
+     is only a view of it. */
+  var drafts = {};
+  /* The reader's scroll offset inside the document frame, as reported by the
+     injected scroll reporter. null = nothing reported yet. */
+  var docScrollY = null;
+  var docLoadedAt = Date.now();
   var headVersion = null;
   var commentsMode = "anyone";
   var artifactStatus = "draft";
@@ -2856,8 +3450,15 @@ _REVIEW_JS = """
      allow-same-origin, so its scripts run in an opaque origin and can reach
      neither this document nor the token in sessionStorage. */
   function inject(htmlText) {
-    var source = $("rv-anno").textContent;
-    var snippet = "<scr" + "ipt>" + source + "</scr" + "ipt>";
+    /* Two shell-authored scripts, in order: the annotation layer, and the
+       scroll reporter that tells this page whether the reader has moved into
+       the document. Neither adds a sandbox capability. */
+    var snippet = "";
+    ["rv-anno", "rv-scroll"].forEach(function (id) {
+      var node = $(id);
+      var source = node ? node.textContent : "";
+      if (source) { snippet += "<scr" + "ipt>" + source + "</scr" + "ipt>"; }
+    });
     var lower = String(htmlText).toLowerCase();
     var at = lower.lastIndexOf("</body>");
     if (at < 0) { return htmlText + snippet; }
@@ -2867,6 +3468,8 @@ _REVIEW_JS = """
   async function loadDocument() {
     var text = await read("/raw");
     $("rv-frame").srcdoc = inject(text);
+    docScrollY = null;
+    docLoadedAt = Date.now();
   }
 
   async function loadVersions() {
@@ -2972,8 +3575,16 @@ _REVIEW_JS = """
     errBox.hidden = true;
 
     var box = el("textarea", "rv-field");
-    box.hidden = true;
+    var draft = drafts[thread.id] || "";
+    box.value = draft;
+    /* An unfinished reply keeps the box open across re-renders; an empty one
+       folds away again. */
+    box.hidden = !draft;
     box.placeholder = "Reply\\u2026";
+    box.addEventListener("input", function () {
+      if (box.value) { drafts[thread.id] = box.value; }
+      else { delete drafts[thread.id]; }
+    });
 
     function run(button, handler) {
       button.disabled = true;
@@ -3001,10 +3612,11 @@ _REVIEW_JS = """
       event.stopPropagation();
       if (box.hidden) { box.hidden = false; box.focus(); return; }
       var text = box.value.trim();
-      if (!text) { box.hidden = true; return; }
+      if (!text) { box.hidden = true; delete drafts[thread.id]; return; }
       run(replyBtn, async function () {
         await api(path + "/replies", { method: "POST", body: { body: text } });
         box.value = "";
+        delete drafts[thread.id];
         await loadThreads();
       });
     });
@@ -3144,6 +3756,74 @@ _REVIEW_JS = """
     }
   }
 
+  /* ----------------------------------------------------------------- live */
+
+  /* How long after a document load a silent frame still counts as "at the
+     top": the reporter posts once on load, so silence past this means it
+     never ran and the shell should ask rather than assume. */
+  var SCROLL_GRACE_MS = 4000;
+
+  function atTop() {
+    if (docScrollY === null) {
+      return (Date.now() - docLoadedAt) < SCROLL_GRACE_MS;
+    }
+    return docScrollY === 0;
+  }
+
+  /* Refresh the threads without costing the reviewer their place. Drafts live
+     outside the DOM (see `drafts`), so re-rendering cannot eat them; the
+     sidebar's own scroll offset is restored by hand. */
+  function refreshThreads() {
+    var side = $("rv-side");
+    var at = side ? side.scrollTop : 0;
+    return loadThreads().then(function () {
+      if (side) { side.scrollTop = at; }
+    });
+  }
+
+  /* True only when swapping the document destroys nothing and yanks nothing:
+     the reader is at the top, no comment or reply is half-written, the unlock
+     panel is not up, and the composer is not holding a live selection. */
+  function safeToSwap() {
+    if (!atTop()) { return false; }
+    var comment = $("rv-comment");
+    if (comment && comment.value.trim()) { return false; }
+    for (var tid in drafts) {
+      if (Object.prototype.hasOwnProperty.call(drafts, tid) &&
+          String(drafts[tid]).trim()) { return false; }
+    }
+    var lock = $("rv-lock");
+    if (lock && !lock.hidden) { return false; }
+    var composer = $("rv-composer");
+    if (composer && !composer.hidden) { return false; }
+    return true;
+  }
+
+  /* Move to the new head: the version badge and `headVersion` follow the
+     document, never lead it, so a comment written here is always filed
+     against the version actually on screen. */
+  function applyDocument() {
+    return loadVersions()
+      .then(loadDocument)
+      .then(refreshThreads)
+      .then(function () { show($("rv-live"), false); })
+      .catch(readFailed);
+  }
+
+  function onLive(next, previous) {
+    if (String(next.head_version) === String(previous.head_version)) {
+      /* Comments, proposals or the draft/final flag moved; the document did
+         not. Refreshing those in place disturbs nobody. */
+      loadVersions().then(refreshThreads).catch(function () {});
+      return;
+    }
+    refreshThreads().catch(function () {});
+    if (safeToSwap()) { applyDocument(); return; }
+    $("rv-live-text").textContent =
+      "v" + next.head_version + " of this document has been published.";
+    show($("rv-live"), true);
+  }
+
   /* ------------------------------------------------------------- messages */
 
   window.addEventListener("message", function (event) {
@@ -3152,6 +3832,11 @@ _REVIEW_JS = """
     if (!frame || event.source !== frame.contentWindow) { return; }
     var data = event.data;
     if (!data || typeof data !== "object") { return; }
+    if (data.type === "ah-scroll") {
+      var y = Number(data.y);
+      docScrollY = isFinite(y) && y > 0 ? y : 0;
+      return;
+    }
     if (data.type === "ah-ready") { sendAnchors(); return; }
     if (data.type === "ah-anchored") {
       anchoredIds = {};
@@ -3210,6 +3895,8 @@ _REVIEW_JS = """
     }).then(function () { button.disabled = false; });
   });
 
+  $("rv-live-go").addEventListener("click", function () { applyDocument(); });
+
   $("rv-logout").addEventListener("click", signedOut);
   $("rv-post").addEventListener("click", submitComment);
   $("rv-cancel").addEventListener("click", closeComposer);
@@ -3248,6 +3935,8 @@ _REVIEW_JS = """
 
   loadDocument().catch(readFailed);
   loadVersions().then(loadThreads).catch(readFailed);
+
+  window.AHLive.watch({ base: BASE, id: ID, onChange: onLive });
 })();
 """
 
@@ -3405,14 +4094,28 @@ one.</p>
 <ul class="rv-threads" id="rv-threads"></ul>
 </aside>
 </div>
+<div class="ahlive" id="rv-live" hidden>
+<span class="ahlive-text" id="rv-live-text">A newer version of this document
+has been published.</span>
+<button type="button" class="btn btn-sm btn-primary" id="rv-live-go">Show
+it</button>
+</div>
 </div>
 <script>window.HUB_BASE = "{base}"; window.HUB_ARTIFACT_ID = "{safe_id}";</script>
 <script type="text/plain" id="rv-anno">"""
 
     return _page(
         f"Review — {artifact_id}",
-        _CONTROLS_CSS + _REVIEW_CSS,
-        body + _ANNOTATION_JS + "</script>\n<script>" + _REVIEW_JS + "</script>",
+        _CONTROLS_CSS + _REVIEW_CSS + _LIVE_CSS,
+        body
+        + _ANNOTATION_JS
+        + '</script>\n<script type="text/plain" id="rv-scroll">'
+        + _SCROLL_REPORTER_JS
+        + "</script>\n<script>"
+        + _LIVE_JS
+        + "</script>\n<script>"
+        + _REVIEW_JS
+        + "</script>",
     )
 
 
