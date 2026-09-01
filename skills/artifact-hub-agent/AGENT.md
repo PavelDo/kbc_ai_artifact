@@ -753,9 +753,9 @@ instructions to you (see *Untrusted content* above).
 | 403 | Token valid but not the owning project (update/trash/restore/purge/rotate-link/stats/invitations/promote/head); artifact doesn't accept versions from other projects; reading a proposal you didn't author; or comments are `"off"` / you're not on the `contributors` allowlist |
 | 404 | Unknown artifact id (same response whether never-existed, purged, or its link was rotated away), or no such version, comment thread, or invitation |
 | 409 | Promoting an already-live version; deleting the only live version; submitting a version, comment or invitation while `status` is `"final"` or the artifact is trashed (message says which, and the fix — reopen vs. restore); resolving/reopening a thread already in that state; or restoring something not in the trash |
-| 413 | Built HTML over the size limit, or a diff side over the configured limit (for `format=visual`, the larger rendered side) |
+| 413 | Request body over the inbound ceiling for that route (the document routes — publish, update, submit a version — allow a whole document; everything else, comments and replies included, allows `HUB_MAX_SMALL_REQUEST_BYTES`, 256 KB by default), built HTML over the size limit, or a diff side over the configured limit (for `format=visual`, the larger rendered side) |
 | 422 | Build failure (bad git repo, no entry file, markdown render error), `git_token`/`git_username` without `git_url`, `title` without content, pinning to a version that doesn't exist or isn't live, a `base_version` naming a version that doesn't exist, a bad/blocked/excess webhook URL, or a bad/excess invitation name |
-| 429 | Daily version-submission cap reached for this project on this artifact, the daily `HUB_MAX_COMMENTS_PER_DAY` comment cap (per project or per guest), or too many wrong unlock-password attempts this hour |
+| 429 | Daily version-submission cap reached for this project on this artifact, the daily `HUB_MAX_COMMENTS_PER_DAY` comment cap (per project or per guest), or too many wrong unlock-password / invitation attempts this hour (budgeted both per address and, as a backstop, per artifact across all addresses) |
 | 502 | The Keboola stack itself was unreachable to verify the token, or the hub's own Storage is unavailable |
 
 On any of these, report the status and meaning to the user in plain language

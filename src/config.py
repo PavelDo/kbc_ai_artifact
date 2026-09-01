@@ -5,6 +5,7 @@ defaults — the app fails fast at startup with a clear error instead of
 inventing values. Optional limits have documented defaults overridable via env.
 """
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,10 +18,47 @@ REQUIRED_ENV = ["HUB_STORAGE_TOKEN", "HUB_STACK_URL", "HUB_SECRET_KEY"]
 #: startup rather than silently accepted.
 MIN_SECRET_KEY_CHARS = 32
 
+#: Head-room added on top of the largest document the hub accepts when sizing
+#: the inbound request-body ceiling of the content routes (SEC-100-004). A
+#: document travels inside a JSON envelope, escaped, next to a handful of
+#: sibling fields, so the request is always somewhat larger than the document
+#: it carries; without this allowance a legitimate maximum-size publish would
+#: be rejected before it was ever parsed.
+REQUEST_ENVELOPE_SLACK_BYTES = 1024 * 1024
+
+#: One parsed entry of ``HUB_TRUSTED_PROXY_CIDRS``.
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
 
 def _int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     return int(raw) if raw else default
+
+
+def _cidr_env(name: str) -> tuple[IPNetwork, ...]:
+    """Parse a comma-separated list of CIDR networks, or fail fast at startup.
+
+    A malformed entry is a configuration error, not something to skip with a
+    warning: this list decides whose ``X-Real-IP`` the brute-force limiter
+    believes (SEC-100-003), so silently dropping an unparseable entry would
+    quietly widen or narrow that trust in a way nobody would notice until it
+    mattered. ``strict=False`` accepts a host address carrying a prefix
+    (``10.0.0.7/8``) and a bare address (``10.0.0.7`` becomes ``/32``), which
+    is how operators usually write down a proxy's address.
+    """
+    networks: list[IPNetwork] = []
+    for entry in os.environ.get(name, "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{name} contains an entry that is not a valid CIDR network "
+                f"({entry!r}): {exc}"
+            ) from exc
+    return tuple(networks)
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -87,11 +125,46 @@ class Settings:
     # anyway. Local development behind a proxy opts in with
     # HUB_TRUST_FORWARDED_HEADERS=1.
     trust_forwarded_headers: bool = False
+    # Networks whose members are believed when they name the real client in a
+    # forwarded header (env HUB_TRUSTED_PROXY_CIDRS, comma-separated CIDRs).
+    # SEC-100-003: X-Real-IP is the key of the brute-force budget, and anyone
+    # can send it, so a caller could reset their own budget at will. A
+    # forwarded client address is now honoured only when
+    # HUB_TRUST_FORWARDED_HEADERS is on *and* the direct peer
+    # (request.client.host) falls inside one of these networks. Empty (the
+    # default) therefore means "never believe a forwarded client address" —
+    # everything buckets by the peer address, which is safe but coarse behind
+    # a proxy, since every caller then shares the proxy's bucket.
+    trusted_proxy_cidrs: tuple[IPNetwork, ...] = ()
     # Failed unlock attempts allowed per (artifact, client IP) per UTC hour
     # before the password gate answers 429 (env
     # HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR). Each attempt costs a full PBKDF2
     # verification, so this bounds both brute force and the CPU it can burn.
     max_unlock_attempts_per_hour: int = 30
+    # Failed unlock (or guest-credential) attempts allowed against one
+    # artifact per UTC hour *from every address together*
+    # (HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR). Defence in depth for
+    # SEC-100-003: the per-address budget above is only as strong as the
+    # address is hard to change, and behind a NAT, a botnet or a proxy whose
+    # network is trusted it can be changed cheaply. This budget cannot be
+    # rotated away at all, so it is set far above what a real audience of one
+    # document would ever spend — it is a stop on industrial guessing, not a
+    # per-reader limit.
+    max_unlock_attempts_per_artifact_per_hour: int = 500
+    # Largest inbound request body accepted by every route that does not carry
+    # a document — comments, replies, invitations, the unlock form, webhook
+    # management, policy-only calls (HUB_MAX_SMALL_REQUEST_BYTES). SEC-100-004:
+    # before this ceiling an anonymous caller could have megabytes read and
+    # parsed before authentication, a lock or a 404 ever happened. The content
+    # routes get the much larger ``max_content_request_bytes`` instead.
+    max_small_request_bytes: int = 256 * 1024
+    # Most per-artifact mutation locks kept once nothing holds them
+    # (HUB_LOCK_REGISTRY_MAX_ENTRIES). SEC-100-002: the registry used to keep
+    # an entry per key it ever saw, including keys invented by anonymous
+    # callers. Idle entries above this are dropped least-recently-used; a lock
+    # somebody is holding or waiting on is never dropped, so the bound cannot
+    # break serialization.
+    lock_registry_max_entries: int = 1024
     # Operational state sidecar (phase 4, src/statedb.py)
     # Seconds between SQLite snapshots into the host project's Storage Files
     # (env HUB_STATE_SNAPSHOT_INTERVAL_S). 0 disables the background thread and
@@ -125,6 +198,21 @@ class Settings:
     # stored in the artifact's meta record, so this bounds both the meta file
     # and the number of people who can comment without a Keboola account.
     max_invitations_per_artifact: int = 20
+
+    @property
+    def max_content_request_bytes(self) -> int:
+        """Inbound body ceiling for the routes that carry a document.
+
+        Derived rather than configured on its own, so it can never drift below
+        the documents the hub already promises to accept: whichever of
+        ``max_html_bytes`` and ``max_envelope_bytes`` is larger, plus
+        :data:`REQUEST_ENVELOPE_SLACK_BYTES` for the JSON envelope around it.
+        Raising either content limit raises this with it.
+        """
+        return (
+            max(self.max_html_bytes, self.max_envelope_bytes)
+            + REQUEST_ENVELOPE_SLACK_BYTES
+        )
 
 
 def load_settings() -> Settings:
@@ -172,9 +260,15 @@ def load_settings() -> Settings:
         reap_aborted_publish_after_s=_int_env("HUB_REAP_ABORTED_PUBLISH_AFTER_S", 3600),
         max_proposed_versions=_int_env("HUB_MAX_PROPOSED_VERSIONS", 50),
         trust_forwarded_headers=_bool_env("HUB_TRUST_FORWARDED_HEADERS", False),
+        trusted_proxy_cidrs=_cidr_env("HUB_TRUSTED_PROXY_CIDRS"),
         max_unlock_attempts_per_hour=_int_env(
             "HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR", 30
         ),
+        max_unlock_attempts_per_artifact_per_hour=_int_env(
+            "HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR", 500
+        ),
+        max_small_request_bytes=_int_env("HUB_MAX_SMALL_REQUEST_BYTES", 256 * 1024),
+        lock_registry_max_entries=_int_env("HUB_LOCK_REGISTRY_MAX_ENTRIES", 1024),
         state_snapshot_interval_s=_int_env("HUB_STATE_SNAPSHOT_INTERVAL_S", 300),
         state_max_snapshot_bytes=_int_env(
             "HUB_STATE_MAX_SNAPSHOT_BYTES", 50 * 1024 * 1024
