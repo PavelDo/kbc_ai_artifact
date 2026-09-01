@@ -733,6 +733,40 @@ def _run_git(
         ) from exc
 
 
+#: Lengths of a git object id in hex: SHA-1 and SHA-256 respectively. A ref of
+#: exactly one of these lengths and entirely hexadecimal is an object id, not a
+#: branch someone happened to name that way.
+_OBJECT_ID_LENGTHS = (40, 64)
+
+
+def _validate_git_ref(ref: str | None) -> str | None:
+    """Return ``ref`` unchanged, or raise if it is a commit id.
+
+    The clone runs ``git clone --depth 1 --branch <ref>``, and ``--branch``
+    resolves a branch or a tag only -- an object id there fails inside git.
+    The public contract used to say "branch, tag or commit", so a caller
+    pinning an immutable source got an opaque subprocess failure rather than
+    an answer about what it asked for. The contract now says branch or tag,
+    and this turns the one case it excludes into a message that says which
+    ref was rejected and why.
+
+    Only a full object id is refused. A shorter hexadecimal string is a
+    perfectly ordinary branch name, and refusing those would reject valid
+    input to describe an unsupported feature.
+    """
+    if not ref:
+        return ref
+    candidate = ref.strip()
+    if len(candidate) in _OBJECT_ID_LENGTHS and all(
+        character in "0123456789abcdefABCDEF" for character in candidate
+    ):
+        raise BuildError(
+            f"git_ref {ref!r} looks like a commit id; this service checks out "
+            "a branch or a tag. Use a tag to pin an immutable source."
+        )
+    return ref
+
+
 def _clone(
     git_url: str,
     ref: str | None,
@@ -1033,6 +1067,7 @@ def build_from_git(
     token.
     """
     url = _validate_git_url(git_url)
+    ref = _validate_git_ref(ref)
     _check_git_host(url, allow_private=settings.git_allow_private_hosts)
 
     with tempfile.TemporaryDirectory(prefix="artifact-git-") as tmp:

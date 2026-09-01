@@ -44,6 +44,7 @@ import src.main as main
 import src.pages as pages
 from src.auth import STACK_ALIASES, AuthError, Owner
 from src.builder import BuiltArtifact
+import src.comments as comments_module
 from src.comments import CommentStore
 from src.config import load_settings
 from src.kbc import BackendError, InMemoryFilesBackend
@@ -968,6 +969,95 @@ def test_publish_git_username_with_markdown_is_422(api: Api) -> None:
     )
     assert resp.status_code == 422
     assert "git_url" in resp.json()["detail"]
+
+
+def test_a_rejected_reply_does_not_linger_in_the_thread(
+    api: Api, monkeypatch
+) -> None:
+    """A write that was refused must leave no trace in what readers see.
+
+    CommentStore.get returns the *cached* thread object, so appending a reply
+    to it before the write succeeds mutates what every later read on this
+    replica returns -- a reply that was refused would still be shown, and
+    would be persisted by whatever wrote the thread next.
+    """
+    monkeypatch.setattr(comments_module, "MAX_REPLIES_PER_THREAD", 1)
+    artifact_id = _publish_markdown(api, "# One")
+    created = _comment(api, artifact_id, exact="One")
+    assert created.status_code == 201
+    thread_id = created.json()["id"]
+
+    accepted = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}/replies",
+        json={"body": "first reply"},
+        headers=AUTH_HEADERS,
+    )
+    assert accepted.status_code == 201, accepted.text
+
+    refused = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}/replies",
+        json={"body": "one too many"},
+        headers=AUTH_HEADERS,
+    )
+    assert refused.status_code == 422, refused.text
+
+    threads = api.client.get(f"/a/{artifact_id}/comments").json()["threads"]
+    bodies = [reply["body"] for reply in threads[0]["replies"]]
+    assert bodies == ["first reply"]
+
+
+def test_a_rejected_resolve_leaves_the_thread_open(api: Api, monkeypatch) -> None:
+    """Same rule for resolve: a refused write must not change what readers see."""
+    artifact_id = _publish_markdown(api, "# One")
+    created = _comment(api, artifact_id, exact="One")
+    assert created.status_code == 201
+    thread_id = created.json()["id"]
+
+    # Any write is over budget now, so the resolve is refused at the store.
+    monkeypatch.setattr(comments_module, "MAX_THREAD_BYTES", 1)
+    refused = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+        json={"resolved": True},
+        headers=AUTH_HEADERS,
+    )
+    assert refused.status_code == 422, refused.text
+
+    monkeypatch.undo()
+    threads = api.client.get(f"/a/{artifact_id}/comments").json()["threads"]
+    assert threads[0]["resolved"] is False
+
+
+def test_publish_with_a_commit_id_git_ref_is_422_with_a_usable_message(
+    api: Api,
+) -> None:
+    """The contract says branch or tag, so a commit id gets a clear refusal.
+
+    Checked before the clone -- and before any DNS -- so the caller learns
+    what was wrong with its request instead of an opaque git failure.
+    """
+    resp = api.client.post(
+        "/api/artifacts",
+        json={
+            "git_url": "https://github.com/org/repo",
+            "git_ref": "0" * 40,
+        },
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert "commit id" in detail
+    assert "branch or a tag" in detail
+
+
+def test_openapi_does_not_promise_commit_ids_for_git_ref(api: Api) -> None:
+    schema = api.client.get("/openapi.json").json()
+    for name in ("PublishBody", "UpdateBody"):
+        body = schema["components"]["schemas"].get(name)
+        if body is None or "git_ref" not in body.get("properties", {}):
+            continue
+        description = body["properties"]["git_ref"]["description"]
+        assert "branch or tag" in description or "branch or a tag" in description
+        assert "tag or commit" not in description
 
 
 def test_put_git_token_without_git_url_is_422(api: Api) -> None:

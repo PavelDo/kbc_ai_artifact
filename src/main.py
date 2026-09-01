@@ -24,6 +24,7 @@ transient Storage outage cannot put the app into a crash loop.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -64,6 +65,8 @@ from src.auth import (
 )
 from src.builder import BuildError, BuiltArtifact
 from src.comments import (
+    MAX_REPLIES_PER_THREAD,
+    MAX_THREAD_BYTES,
     CommentStore,
     CommentThread,
     Reply,
@@ -1847,7 +1850,13 @@ class PublishBody(BaseModel):
         ),
     )
     git_ref: str | None = Field(
-        None, description="Optional branch, tag or commit to check out for 'git_url'."
+        None,
+        description=(
+            "Optional branch or tag to check out for 'git_url'. Not a commit "
+            "id: the clone resolves this with git's --branch, which takes a "
+            "branch or a tag only, and a commit id is refused with 422. Tag "
+            "the commit to pin an immutable source."
+        ),
     )
     git_path: str | None = Field(
         None,
@@ -1939,7 +1948,13 @@ class UpdateBody(BaseModel):
         ),
     )
     git_ref: str | None = Field(
-        None, description="Optional branch, tag or commit to check out for 'git_url'."
+        None,
+        description=(
+            "Optional branch or tag to check out for 'git_url'. Not a commit "
+            "id: the clone resolves this with git's --branch, which takes a "
+            "branch or a tag only, and a commit id is refused with 422. Tag "
+            "the commit to pin an immutable source."
+        ),
     )
     git_path: str | None = Field(
         None,
@@ -2165,7 +2180,9 @@ class VersionBody(BaseModel):
         None, description="Markdown source, rendered by the built-in template."
     )
     git_url: str | None = Field(None, description="HTTPS git repository to clone.")
-    git_ref: str | None = Field(None, description="Optional branch, tag or commit.")
+    git_ref: str | None = Field(
+        None, description="Optional branch or tag (not a commit id)."
+    )
     git_path: str | None = Field(
         None, description="Optional entry file or directory inside the repository."
     )
@@ -3090,7 +3107,10 @@ def context(request: Request) -> dict:
                 "lists, mermaid fences, syntax highlighting)"
             ),
             "git_url": "string, https git repository to clone (public, or private with git_token)",
-            "git_ref": "string, optional branch/tag/commit for git_url",
+            "git_ref": (
+                "string, optional branch or tag for git_url; a commit id is "
+                "refused -- tag it to pin an immutable source"
+            ),
             "git_path": (
                 "string, optional entry file or directory inside the repository; "
                 "defaults to index.html, then README.md, then a single root *.html"
@@ -3229,6 +3249,13 @@ def context(request: Request) -> dict:
             "comment_rate_limit": (
                 f"{settings.max_comments_per_day} comments and replies per "
                 "project per artifact per UTC day (429 afterwards)"
+            ),
+            "comment_thread_budget": (
+                f"one thread holds at most {MAX_REPLIES_PER_THREAD} replies "
+                f"and {MAX_THREAD_BYTES} serialized bytes (422 past either). "
+                "The per-day limit bounds the rate; these bound the object, "
+                "which is rewritten whole on every reply and re-read on "
+                "every listing."
             ),
             "export": (
                 "GET /a/{id}/export/markdown downloads the served version's "
@@ -3371,6 +3398,8 @@ def context(request: Request) -> dict:
             "diff_max_bytes": settings.diff_max_bytes,
             "max_note_chars": MAX_NOTE_CHARS,
             "max_comments_per_day": settings.max_comments_per_day,
+            "max_replies_per_thread": MAX_REPLIES_PER_THREAD,
+            "max_thread_bytes": MAX_THREAD_BYTES,
             "max_contributors": MAX_CONTRIBUTORS,
             "max_unlock_attempts_per_hour": settings.max_unlock_attempts_per_hour,
             "max_webhooks_per_artifact": settings.max_webhooks_per_artifact,
@@ -6817,13 +6846,19 @@ def reply_to_comment(
     if not _claim_comment_slot(request.app, meta.id, writer_key):
         return _comment_rate_limited(guest=caller is None)
 
-    thread.replies.append(
-        Reply(author=author, body=body.body, created_at=_now())
+    # A copy, not an append. CommentStore.get answers from its in-memory LRU,
+    # so the object here is the very one every later read on this replica
+    # gets: mutating it before the write succeeds means a refused reply is
+    # still shown, and is persisted by whatever writes the thread next.
+    candidate = dataclasses.replace(
+        thread,
+        replies=[*thread.replies, Reply(author=author, body=body.body, created_at=_now())],
     )
     try:
-        comments.update(thread)
+        comments.update(candidate)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    thread = candidate
 
     _emit_webhook(
         request,
@@ -6936,9 +6971,18 @@ def resolve_comment(
         )
 
     author, writer_key = _comment_author(caller, invitation)
-    thread.resolved = wanted
-    thread.resolved_by = author if wanted else None
-    comments.update(thread)
+    # Copied for the same reason as a reply: the thread is the cached object,
+    # so a failed write must not leave it looking resolved to every later read.
+    candidate = dataclasses.replace(
+        thread, resolved=wanted, resolved_by=author if wanted else None
+    )
+    try:
+        comments.update(candidate)
+    except ValueError as exc:
+        # A thread that is already over an aggregate budget must still answer
+        # with a reason rather than a 500 -- resolving it adds no content.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    thread = candidate
 
     logger.info(
         "Comment thread %s of artifact %s %s by %s",

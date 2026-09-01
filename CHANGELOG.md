@@ -47,6 +47,15 @@ your side.**
   pending notifications without limit; past a configurable ceiling
   (`HUB_WEBHOOK_QUEUE_MAX`) the newest is dropped, and publishing is never held
   up waiting for one.
+- A comment thread now has a size ceiling of its own: 500 replies and 2 MB.
+  Individual comments were capped, but nothing capped the thread they pile up
+  in, and a thread is rewritten whole on every reply and re-read on every
+  listing.
+- A comment or a resolve that is refused no longer shows up as if it had been
+  accepted until the page is reloaded on another server.
+- Publishing from git now says plainly that `git_ref` takes a branch or a tag.
+  A commit id was documented as accepted but always failed inside git; it is
+  now refused with a message that says to tag the commit instead.
 - Permanently erasing a document can now actually be retried when it fails
   partway. It previously removed the document before its comments, so a
   failure left comments behind that nothing could reach or erase, and the

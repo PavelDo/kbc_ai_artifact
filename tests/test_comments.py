@@ -8,6 +8,8 @@ import pytest
 
 from src.comments import (
     MAX_BODY_CHARS,
+    MAX_REPLIES_PER_THREAD,
+    MAX_THREAD_BYTES,
     MAX_QUOTE_CHARS,
     TAG_CMT_ALL,
     CommentStore,
@@ -762,3 +764,97 @@ class TestResolvedIsStrictlyBoolean:
     def test_real_booleans_are_still_honoured(self):
         assert CommentThread.from_json(self._thread_json(True)).resolved is True
         assert CommentThread.from_json(self._thread_json(False)).resolved is False
+
+
+def _thread_with(replies: int, *, body: str = "a comment") -> bytes:
+    """Serialized thread JSON carrying ``replies`` replies."""
+    return json.dumps(
+        {
+            "id": "t1",
+            "artifact_id": ARTIFACT,
+            "version": 1,
+            "selector": {"exact": "quote"},
+            "body": body,
+            "author": {"key": AUTHOR_A},
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "replies": [
+                {
+                    "author": {"key": AUTHOR_A},
+                    "body": f"reply {index}",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                }
+                for index in range(replies)
+            ],
+        }
+    ).encode("utf-8")
+
+
+class TestPersistedThreadBudgets:
+    """A persisted thread must be bounded before it is turned into objects.
+
+    Nothing capped how many replies a thread accumulated or how large its
+    serialized form grew, and parsing materialized every reply before any
+    per-body check ran. A single oversized record therefore set the cost of
+    every hydration, listing and rewrite that touched it.
+    """
+
+    def test_an_oversized_payload_is_refused_before_it_is_decoded(self):
+        oversized = b'{"id": "t1", "junk": "' + b"x" * (MAX_THREAD_BYTES + 1) + b'"}'
+        with pytest.raises(ValueError, match="too large"):
+            CommentThread.from_json(oversized)
+
+    def test_the_refusal_does_not_depend_on_the_payload_being_valid_json(self):
+        """The bound is on bytes, so it holds for garbage too."""
+        with pytest.raises(ValueError, match="too large"):
+            CommentThread.from_json(b"x" * (MAX_THREAD_BYTES + 1))
+
+    def test_too_many_replies_are_refused_before_they_are_materialized(self):
+        with pytest.raises(ValueError, match="replies"):
+            CommentThread.from_json(_thread_with(MAX_REPLIES_PER_THREAD + 1))
+
+    def test_a_thread_at_the_reply_limit_still_parses(self):
+        thread = CommentThread.from_json(_thread_with(MAX_REPLIES_PER_THREAD))
+        assert len(thread.replies) == MAX_REPLIES_PER_THREAD
+
+    def test_an_ordinary_thread_is_unaffected(self):
+        thread = CommentThread.from_json(_thread_with(2))
+        assert len(thread.replies) == 2
+        assert thread.body == "a comment"
+
+
+class TestWrittenThreadBudgets:
+    """The same budgets apply on the way in, so no such record is ever created."""
+
+    def _store(self, tmp_path) -> CommentStore:
+        return CommentStore(InMemoryFilesBackend(), tmp_path / "cache", 10)
+
+    def test_a_thread_over_the_reply_limit_is_refused(self, tmp_path):
+        store = self._store(tmp_path)
+        thread = CommentThread.from_json(_thread_with(MAX_REPLIES_PER_THREAD))
+        thread.replies.append(
+            Reply(author={"key": AUTHOR_A}, body="one too many", created_at="2026")
+        )
+        with pytest.raises(ValueError, match="replies"):
+            store.update(thread)
+
+    def test_a_thread_over_the_byte_budget_is_refused(self, tmp_path):
+        store = self._store(tmp_path)
+        # Each reply body is within MAX_BODY_CHARS, so only the aggregate
+        # budget can catch this -- which is exactly the gap.
+        thread = CommentThread.from_json(_thread_with(0))
+        for index in range(200):
+            thread.replies.append(
+                Reply(
+                    author={"key": AUTHOR_A},
+                    body="x" * (MAX_BODY_CHARS - 1),
+                    created_at=f"2026-01-01T00:00:{index:02d}+00:00",
+                )
+            )
+        with pytest.raises(ValueError, match="too large"):
+            store.update(thread)
+
+    def test_an_ordinary_thread_still_writes(self, tmp_path):
+        store = self._store(tmp_path)
+        thread = CommentThread.from_json(_thread_with(3))
+        store.create(thread)
+        assert len(store.list_for(ARTIFACT)) == 1

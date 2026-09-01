@@ -781,6 +781,10 @@ rather than retrying blindly — retrying will not fix a 401/403/422.
   (429 past that).
 - At most **5 webhooks** and **20 live guest invitations** per artifact
   (`HUB_MAX_WEBHOOKS_PER_ARTIFACT`, `HUB_MAX_INVITATIONS_PER_ARTIFACT`).
+- A comment thread holds at most **500 replies** and **2 MB** serialized
+  (422 past either). Individual bodies are capped separately, so these bound
+  what the whole thread costs to store, read and rewrite — start a new
+  thread rather than growing one indefinitely.
 
 ## Authoring content
 

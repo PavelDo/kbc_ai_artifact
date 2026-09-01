@@ -35,6 +35,7 @@ from src.builder import (
     _repo_size_bytes,
     _resolve_entry,
     _scrub,
+    _validate_git_ref,
     _validate_git_url,
     build_from_git,
     build_from_html,
@@ -823,3 +824,35 @@ class TestCdnPinningAndRawHtml:
         md = 'Before\n\n<div class="marker">raw</div>\n\nAfter\n'
         page = build_from_markdown(md).html
         assert '<div class="marker">raw</div>' in page
+
+
+class TestCommitShaRefIsRefusedClearly:
+    """git clone --branch takes a branch or a tag, never a commit id.
+
+    The public contract used to offer "branch, tag or commit", so an
+    immutable-source workflow passing a commit id got a raw git failure from
+    a subprocess instead of an answer about its request. The contract says
+    branch or tag now, and a commit id is refused in terms the caller can
+    act on.
+    """
+
+    def test_a_full_commit_sha_is_refused_before_any_clone(self):
+        with pytest.raises(BuildError, match="branch or a tag"):
+            _validate_git_ref("0" * 40)
+
+    def test_a_sha256_object_id_is_refused_too(self):
+        with pytest.raises(BuildError, match="branch or a tag"):
+            _validate_git_ref("a" * 64)
+
+    def test_the_message_names_the_offending_ref(self):
+        with pytest.raises(BuildError) as caught:
+            _validate_git_ref("f" * 40)
+        assert "f" * 40 in str(caught.value)
+
+    def test_branches_and_tags_pass_through_unchanged(self):
+        for ref in ("main", "v1.2.3", "release/2026-09", "abc1234", None, ""):
+            assert _validate_git_ref(ref) == ref
+
+    def test_a_hex_name_shorter_than_an_object_id_is_still_a_branch(self):
+        """Only unambiguous object ids are refused, not any hex-looking name."""
+        assert _validate_git_ref("deadbeef") == "deadbeef"
