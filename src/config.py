@@ -227,6 +227,16 @@ class Settings:
     # somebody is holding or waiting on is never dropped, so the bound cannot
     # break serialization.
     lock_registry_max_entries: int = 1024
+    # Artifact ids Storage has confirmed do not exist, remembered so a repeat
+    # lookup costs a dict hit instead of a tag search
+    # (HUB_NEGATIVE_LOOKUP_CACHE_ENTRIES). SEC-100-002 moved target resolution
+    # in front of authentication, which made every well-formed made-up id an
+    # unauthenticated Storage round trip; this bounds the damage a stream of
+    # them can do. Entries are dropped least-recently-used above this, and
+    # invalidated by every write that can make an id appear, so the bound
+    # trades memory for round trips and never for correctness. 0 disables the
+    # cache entirely.
+    negative_lookup_cache_entries: int = 4096
     # Operational state sidecar (phase 4, src/statedb.py)
     # Seconds between SQLite snapshots into the host project's Storage Files
     # (env HUB_STATE_SNAPSHOT_INTERVAL_S). 0 disables the background thread and
@@ -375,6 +385,9 @@ def load_settings() -> Settings:
         ),
         max_small_request_bytes=_int_env("HUB_MAX_SMALL_REQUEST_BYTES", 256 * 1024),
         lock_registry_max_entries=_int_env("HUB_LOCK_REGISTRY_MAX_ENTRIES", 1024),
+        negative_lookup_cache_entries=_int_env(
+            "HUB_NEGATIVE_LOOKUP_CACHE_ENTRIES", 4096
+        ),
         state_snapshot_interval_s=_int_env("HUB_STATE_SNAPSHOT_INTERVAL_S", 300),
         state_max_snapshot_bytes=_int_env(
             "HUB_STATE_MAX_SNAPSHOT_BYTES", 50 * 1024 * 1024

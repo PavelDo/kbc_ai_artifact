@@ -682,6 +682,13 @@ def _serialized_per_comment_target(route):
     :func:`_comment_writer`) and not something a lock decorator should
     decide. Running that request unlocked is safe because there is nothing to
     serialize it against: no artifact of that name exists to mutate.
+
+    Resolving before authentication does mean an anonymous caller decides how
+    often this lookup runs, so it is asked to be cheap: ``resolve_lock_target``
+    answers both halves of the identity pair in a single Storage tag search
+    instead of the two the first SEC-100-002 fix took, and the store remembers
+    ids Storage has confirmed absent, so a made-up id repeated a thousand times
+    reaches Storage once. See :meth:`src.store.ArtifactStore._resolve`.
     """
     @functools.wraps(route)
     def serialized(*args, **kwargs):
@@ -693,9 +700,7 @@ def _serialized_per_comment_target(route):
             return _not_found(path_id)
         ensure_hydrated(request.app)
         store = request.app.state.store
-        internal_id = store.resolve_share(path_id)
-        if internal_id is None and store.get_meta(path_id) is not None:
-            internal_id = path_id
+        internal_id = store.resolve_lock_target(path_id)
         if internal_id is None:
             return route(*args, **kwargs)
         with _artifact_locks.hold(internal_id):
@@ -1149,6 +1154,7 @@ async def lifespan(app: FastAPI):
         settings.max_envelope_bytes,
         settings.max_proposed_versions,
         reap_aborted_after_s=settings.reap_aborted_publish_after_s,
+        negative_lookup_cache_entries=settings.negative_lookup_cache_entries,
     )
     app.state.comments = CommentStore(
         backend,
