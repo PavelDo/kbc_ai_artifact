@@ -124,7 +124,13 @@ from src.store import (
     Envelope,
     tag_for_id,
 )
-from src.webhooks import WebhookDispatcher, WebhookEvent, validate_webhook_url
+from src.webhooks import (
+    WebhookDispatcher,
+    WebhookEvent,
+    mint_key_epoch,
+    receiver_id_for,
+    validate_webhook_url,
+)
 
 SERVICE_NAME = "kbc-artifact-hub"
 
@@ -3456,6 +3462,16 @@ def context(request: Request) -> dict:
             },
             {
                 "method": "POST",
+                "path": "/api/artifacts/{id}/webhooks/{receiver_id}/rotate-key",
+                "auth": "storage token (owner project)",
+                "purpose": (
+                    "mint a fresh signing key for one receiver without "
+                    "touching its URL; the previous key still verifies for "
+                    "webhook_key_overlap_s seconds"
+                ),
+            },
+            {
+                "method": "POST",
                 "path": "/api/artifacts/{id}/rotate-link",
                 "auth": "storage token (owner project)",
                 "purpose": (
@@ -3834,6 +3850,17 @@ def context(request: Request) -> dict:
                 "with its key. A receiver therefore cannot forge a delivery "
                 "for another receiver or another artifact, and its key "
                 "reveals nothing about the hub's own."
+            ),
+            "rotation": (
+                "POST /api/artifacts/{id}/webhooks/{receiver_id}/rotate-key "
+                "(owner only, receiver_id from the 'id' field GET .../webhooks "
+                "reports) mints a fresh key for one receiver without changing "
+                f"its URL. For {settings.webhook_key_overlap_s} seconds "
+                "(webhook_key_overlap_s) afterwards, deliveries carry both "
+                "the new signature (X-Hub-Signature-256) and the previous "
+                "one (X-Hub-Signature-256-Previous), then only the new one. "
+                "Both the listing and the rotate response are "
+                "Cache-Control: no-store."
             ),
             "secrecy": (
                 "A webhook URL is itself a capability, so it is returned only "
@@ -6501,6 +6528,46 @@ def purge_artifact(
     )
 
 
+def _no_store(response: Response) -> Response:
+    """Force ``Cache-Control: no-store`` / ``Pragma: no-cache`` (SEC-100-006).
+
+    Assignment, not ``setdefault``: the ``artifact_headers`` middleware only
+    ever sets a *default* Cache-Control, and only on ``/a/*`` paths, so there
+    is nothing here for this to lose a conflict with -- but a secret-bearing
+    response must never depend on that staying true. Every response that can
+    carry a webhook receiver's signing key (this listing, and the rotate-key
+    response below) goes through this before it leaves the handler, so a
+    shared or browser cache can never be the reason a rotated-away key stays
+    reachable.
+    """
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+def _webhook_receiver_view(
+    dispatcher: WebhookDispatcher, artifact_id: str, url: str, record: dict | None
+) -> dict:
+    """One receiver's entry for the webhook-keys listing and rotate response.
+
+    ``record`` is the receiver's persisted epoch (``None`` for a receiver
+    that has never been rotated); the dispatcher is seeded with it by the
+    caller before this runs, so ``signing_key_for`` already reflects it.
+    ``rotate_key_url`` is included so a caller does not have to reimplement
+    :func:`src.webhooks.receiver_id_for` client-side just to rotate.
+    """
+    view = {
+        "url": url,
+        "id": receiver_id_for(url),
+        "signing_key": dispatcher.signing_key_for(artifact_id, url),
+        "rotated_at": record.get("rotated_at") if record else None,
+        "rotate_key_url": (
+            f"/api/artifacts/{artifact_id}/webhooks/{receiver_id_for(url)}/rotate-key"
+        ),
+    }
+    return view
+
+
 @app.get(
     "/api/artifacts/{artifact_id}/webhooks",
     tags=["artifacts"],
@@ -6518,13 +6585,21 @@ def purge_artifact(
         "The keys are on their own endpoint rather than in the general owner "
         "view because they are credentials: fetch one when you configure a "
         "receiver, store it where that receiver keeps its secrets, and do "
-        "not log it. Registering the same URL again yields the same key; "
-        "removing a URL and its receiver ends its use."
+        "not log it. Registering the same URL again yields the same key "
+        "**until it has been rotated** (SEC-100-006) — see `POST "
+        ".../webhooks/{receiver_id}/rotate-key`, listed here as "
+        "`rotate_key_url`, to mint an independent one without touching the "
+        "URL. This response, like the rotate response, always carries "
+        "`Cache-Control: no-store` and `Pragma: no-cache` — a receiver's key "
+        "is a credential and must never be served from a shared or browser "
+        "cache."
     ),
     responses={
         200: {
             "description": (
-                "The registered receivers, each with its own signing key."
+                "The registered receivers, each with its own signing key and "
+                "a `rotate_key_url`; `rotated_at` is null for a receiver "
+                "that has never been rotated."
             )
         },
         400: RESP_STACK_400,
@@ -6547,14 +6622,161 @@ def read_webhook_keys(
     _owner_only(meta, owner)
 
     dispatcher = request.app.state.webhooks
-    return JSONResponse(
-        {
-            "id": meta.id,
-            "webhooks": [
-                {"url": url, "signing_key": dispatcher.signing_key_for(meta.id, url)}
-                for url in list(meta.webhooks or [])
-            ],
-        }
+    dispatcher.configure_key_overlap_s(settings.webhook_key_overlap_s)
+    epochs = meta.webhook_key_epochs or {}
+    urls = list(meta.webhooks or [])
+    for url in urls:
+        # Re-seed the live epoch cache from the durable record on every read,
+        # not only on rotate: this is the point in the request lifecycle
+        # where a fresh process picks the persisted epoch back up (see the
+        # comment on WebhookDispatcher._epochs), and it costs nothing when
+        # there is nothing to seed.
+        dispatcher.seed_epoch(meta.id, url, epochs.get(url))
+    return _no_store(
+        JSONResponse(
+            {
+                "id": meta.id,
+                "webhooks": [
+                    _webhook_receiver_view(dispatcher, meta.id, url, epochs.get(url))
+                    for url in urls
+                ],
+            }
+        )
+    )
+
+
+@app.post(
+    "/api/artifacts/{artifact_id}/webhooks/{receiver_id}/rotate-key",
+    tags=["artifacts"],
+    summary="Rotate one webhook receiver's signing key",
+    description=(
+        "Owner-only (SEC-100-006). Mints a fresh, independent signing key "
+        "for one receiver without touching its URL, and returns the new "
+        "key. `receiver_id` is the value each entry of `GET "
+        ".../webhooks` reports as `id` (or the `rotate_key_url` there, used "
+        "as-is).\n\n"
+        "**A short grace period, not an instant cutover.** For "
+        "`webhook_key_overlap_s` seconds after rotation (config "
+        "`HUB_WEBHOOK_KEY_OVERLAP_S`, default 600), every delivery to this "
+        "receiver carries *both* signatures: the new key in the usual "
+        "`X-Hub-Signature-256`, and the previous key in "
+        "`X-Hub-Signature-256-Previous`. A receiver that only ever checks "
+        "the first header needs no code change and is protected the moment "
+        "the response is returned; a receiver that wants zero-downtime "
+        "rotation can accept either header until it has picked up the new "
+        "key from this response. Past the overlap window only "
+        "`X-Hub-Signature-256` is sent and the previous key no longer "
+        "verifies anything, full stop.\n\n"
+        "Rotating never changes the receiver's URL and never requires "
+        "re-registering it — `webhooks` on `PUT /api/artifacts/{id}` is "
+        "untouched by this call."
+    ),
+    responses={
+        200: {
+            "description": (
+                "Rotated; JSON with the new `signing_key`, `rotated_at`, and "
+                "`overlap_seconds` the previous key stays valid for. Carries "
+                "`Cache-Control: no-store` and `Pragma: no-cache`."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: RESP_OWNER_403,
+        404: {
+            "description": (
+                "No artifact with this id, or it has no registered receiver "
+                "with this receiver_id."
+            )
+        },
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable so the "
+                "meta record could not be rewritten."
+            )
+        },
+    },
+)
+@_serialized_per_artifact
+def rotate_webhook_key(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    receiver_id: str = PathParam(
+        ...,
+        description=(
+            "A receiver's `id` from `GET /api/artifacts/{id}/webhooks` "
+            "(a hash of its URL, not the URL itself)."
+        ),
+    ),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Mint a fresh key epoch for one receiver, keeping its URL unchanged."""
+    owner, _token = auth
+    ensure_hydrated(request.app)
+    store = request.app.state.store
+
+    meta = store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    _owner_only(meta, owner)
+
+    url = next(
+        (u for u in meta.webhooks or [] if receiver_id_for(u) == receiver_id), None
+    )
+    if url is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "webhook receiver not found",
+                "id": artifact_id,
+                "receiver_id": receiver_id,
+            },
+        )
+
+    existing = (meta.webhook_key_epochs or {}).get(url)
+    previous_epoch = existing.get("epoch") if existing else None
+    new_record = mint_key_epoch(previous_epoch, now=_now())
+
+    # Copy-then-save, not an in-place mutation: store.get_meta answers from an
+    # in-process cache, so every other reader on this replica sees whatever
+    # ``meta`` holds right now. Building a new dict and handing save_meta a
+    # dataclasses.replace()'d copy (same pattern as revoke_invitation above)
+    # means a failed save leaves the cached meta -- and therefore every
+    # concurrent read -- still describing the key that is actually still
+    # correct, instead of a rotation the write never durably committed.
+    updated_epochs = dict(meta.webhook_key_epochs or {})
+    updated_epochs[url] = new_record
+    candidate = dataclasses.replace(
+        meta, webhook_key_epochs=updated_epochs, updated_at=_now()
+    )
+    store.save_meta(candidate)
+
+    dispatcher = request.app.state.webhooks
+    dispatcher.configure_key_overlap_s(settings.webhook_key_overlap_s)
+    dispatcher.seed_epoch(candidate.id, url, new_record)
+
+    logger.info(
+        "Rotated the webhook signing key for artifact %s receiver %s "
+        "(owner project %s)",
+        artifact_id,
+        receiver_id,
+        owner.project_id,
+    )
+    return _no_store(
+        JSONResponse(
+            {
+                "id": artifact_id,
+                "receiver_id": receiver_id,
+                "signing_key": dispatcher.signing_key_for(candidate.id, url),
+                "rotated_at": new_record["rotated_at"],
+                "overlap_seconds": settings.webhook_key_overlap_s,
+                "note": (
+                    "The previous key still verifies deliveries to this "
+                    "receiver (X-Hub-Signature-256-Previous) for "
+                    "overlap_seconds after rotated_at, then stops working."
+                ),
+            }
+        )
     )
 
 

@@ -44,6 +44,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -55,9 +56,14 @@ from src.security import derive_key
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DEFAULT_KEY_OVERLAP_S",
     "DELIVERY_ID_HEADER",
     "EVENT_ID_HEADER",
     "EVENT_KINDS",
+    "active_signing_keys",
+    "mint_key_epoch",
+    "PREVIOUS_SIGNATURE_HEADER",
+    "receiver_id_for",
     "receiver_signing_key",
     "SIGNATURE_HEADER",
     "USER_AGENT",
@@ -80,11 +86,25 @@ DELIVERY_ID_HEADER = "X-Hub-Delivery-Id"
 #: (``sha256=<hex digest>``).
 SIGNATURE_HEADER = "X-Hub-Signature-256"
 
+#: Present only during a rotation's overlap window (see
+#: :data:`DEFAULT_KEY_OVERLAP_S`): the same HMAC, computed with the *previous*
+#: epoch's key, so a receiver that has not yet picked up a freshly rotated key
+#: keeps verifying deliveries until it does. A receiver that only ever checks
+#: :data:`SIGNATURE_HEADER` is unaffected either way -- that header always
+#: carries the *current* key's signature, rotated or not.
+PREVIOUS_SIGNATURE_HEADER = "X-Hub-Signature-256-Previous"
+
 #: Sent on every delivery so receivers can recognise us in their logs.
 USER_AGENT = "kbc-artifact-hub"
 
 #: Longest backoff between retries, in seconds.
 MAX_BACKOFF_S = 60
+
+#: Default overlap window (seconds) during which a just-rotated receiver key
+#: still signs deliveries alongside the new one (``HUB_WEBHOOK_KEY_OVERLAP_S``
+#: in :mod:`src.config`). Long enough for an owner to read the new key from
+#: ``GET .../webhooks`` and update the receiver before the old one goes cold.
+DEFAULT_KEY_OVERLAP_S = 600
 
 #: Host suffix that switches the body to Slack's incoming-webhook shape.
 _SLACK_HOST_SUFFIX = "hooks.slack.com"
@@ -248,12 +268,15 @@ def _body_for(url: str, event: WebhookEvent) -> bytes:
     return json.dumps(document, ensure_ascii=False).encode("utf-8")
 
 
-def receiver_signing_key(webhook_key: str, artifact_id: str, url: str) -> str:
+def receiver_signing_key(
+    webhook_key: str, artifact_id: str, url: str, epoch: str | None = None
+) -> str:
     """The signing key for one receiver of one artifact's events.
 
     Derived, not stored: the hub can always recompute it, so nothing secret
-    has to be persisted alongside the artifact, and there is no schema to
-    migrate or rebuild from Storage tags.
+    has to be persisted alongside the artifact beyond the epoch marker itself
+    (see :func:`mint_key_epoch`) -- no key material is ever written to
+    Storage.
 
     A receiver necessarily learns the key its deliveries are signed with. When
     every receiver shared one key, that knowledge was authority over *all*
@@ -265,12 +288,133 @@ def receiver_signing_key(webhook_key: str, artifact_id: str, url: str) -> str:
 
     The separator keeps the two components unambiguous, so no pair of
     artifact id and URL can be rearranged into another pair's key.
+
+    **``epoch`` (SEC-100-006).** ``None`` -- the receiver's default, and the
+    only shape that existed before rotation was added -- reproduces the
+    original two-component derivation exactly, so a receiver that has never
+    been rotated keeps verifying under the same key it always had, and a meta
+    record persisted before this field existed (no epoch on file at all) is
+    read the same way. Passing a (random, unguessable) epoch string mixes it
+    into the derivation as a third, unambiguous component: two different
+    epochs of the same receiver yield unrelated keys, which is what makes
+    rotation actually replace the key instead of just relabeling it.
     """
-    return derive_key(webhook_key, f"{artifact_id}\x00{url}")
+    if not epoch:
+        return derive_key(webhook_key, f"{artifact_id}\x00{url}")
+    return derive_key(webhook_key, f"{artifact_id}\x00{url}\x00{epoch}")
+
+
+def receiver_id_for(url: str) -> str:
+    """A stable, non-secret handle for one receiver, used in API paths.
+
+    The rotate-key endpoint (``POST .../webhooks/{receiver_id}/rotate-key``)
+    needs something shorter and URL-safe to name a receiver by, and the URL
+    itself is not it -- it is semi-secret (a Slack hook's path *is* its
+    credential) and awkward to path-encode. This is just ``sha256(url)``
+    truncated the same way :meth:`WebhookEvent.delivery_id_for` truncates its
+    own hash: deterministic, so the same receiver always resolves to the same
+    id across a rotation, and one-way, so the id alone does not disclose the
+    URL to someone who does not already have it from the owner-only listing.
+    """
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+
+
+def _iso_now() -> str:
+    """UTC timestamp in the same shape ``main._now()`` produces.
+
+    Kept as an injectable default (:attr:`WebhookDispatcher._clock`) rather
+    than called directly, so a test can freeze or fast-forward "now" without
+    touching the system clock -- the same pattern ``_sleep``/``_post``/
+    ``_resolver`` already use in this class.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def mint_key_epoch(previous_epoch: str | None, *, now: str) -> dict:
+    """A fresh key-epoch record, rotated from ``previous_epoch``.
+
+    Returned shape, persisted verbatim into
+    ``ArtifactMeta.webhook_key_epochs[url]``::
+
+        {"epoch": "<new random token>",
+         "previous_epoch": <the epoch that was current a moment ago, or None>,
+         "rotated_at": "<now>"}
+
+    ``previous_epoch`` is ``None`` both for a receiver's first-ever rotation
+    (it was signing under the epoch-less legacy derivation) and is otherwise
+    whatever :func:`mint_key_epoch` last produced for this receiver -- either
+    way :func:`receiver_signing_key` accepts it directly. The epoch itself is
+    ``secrets.token_hex``, not a counter: unguessable and non-enumerable, so
+    observing one epoch (a receiver necessarily does, indirectly, since it is
+    mixed into the key it verifies with) discloses nothing about any other
+    receiver's or artifact's epoch.
+    """
+    return {
+        "epoch": secrets.token_hex(16),
+        "previous_epoch": previous_epoch,
+        "rotated_at": now,
+    }
+
+
+def _within_overlap(rotated_at: str, now: str, overlap_s: int) -> bool:
+    """True while ``now`` is still inside ``overlap_s`` seconds of ``rotated_at``.
+
+    Parses both as the ISO 8601 timestamps this module and ``main._now()``
+    produce; a malformed or missing timestamp is treated as "not in the
+    window" (fail toward the single, current-epoch key) rather than raising,
+    since a persisted record from a build that predates this field simply has
+    no ``rotated_at`` to compare.
+    """
+    if overlap_s <= 0 or not rotated_at or not now:
+        return False
+    try:
+        then = datetime.fromisoformat(rotated_at)
+        current = datetime.fromisoformat(now)
+    except ValueError:
+        return False
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    elapsed = (current - then).total_seconds()
+    return 0 <= elapsed < overlap_s
+
+
+def active_signing_keys(
+    webhook_key: str,
+    artifact_id: str,
+    url: str,
+    record: dict | None,
+    *,
+    now: str,
+    overlap_s: int,
+) -> list[str]:
+    """The signing key(s) currently valid for one receiver, current key first.
+
+    With no epoch record (never rotated -- the common case), this is exactly
+    :func:`receiver_signing_key`'s legacy epoch-less key, one entry. Right
+    after a rotation, a second entry -- the *previous* epoch's key -- is
+    appended for :data:`DEFAULT_KEY_OVERLAP_S` seconds (configurable via
+    ``HUB_WEBHOOK_KEY_OVERLAP_S``), so a receiver that has not yet picked up
+    the new key keeps verifying deliveries during the grace period. Past the
+    window, only the current key is returned and the previous one is dead,
+    exactly as if it had never existed.
+    """
+    if not record:
+        return [receiver_signing_key(webhook_key, artifact_id, url)]
+    keys = [receiver_signing_key(webhook_key, artifact_id, url, record.get("epoch"))]
+    if _within_overlap(str(record.get("rotated_at") or ""), now, overlap_s):
+        keys.append(
+            receiver_signing_key(
+                webhook_key, artifact_id, url, record.get("previous_epoch")
+            )
+        )
+    return keys
 
 
 def sign_body(body: bytes, secret: str) -> str:
-    """Value for :data:`SIGNATURE_HEADER` over ``body``.
+    """Value for :data:`SIGNATURE_HEADER` (or :data:`PREVIOUS_SIGNATURE_HEADER`)
+    over ``body``.
 
     Exposed so a receiver implementation (and the tests) can recompute it
     exactly the way deliveries produce it.
@@ -313,6 +457,31 @@ class WebhookDispatcher:
         self._sleep: Callable[[float], None] = time.sleep
         self._post: Callable[[str, bytes, dict], int] = self._http_post
         self._resolver: Callable[[str], list[str]] = _resolve_host_ips
+        #: Injectable "now" for the key-rotation overlap check (SEC-100-006);
+        #: same pattern as ``_sleep``/``_post``/``_resolver`` above.
+        self._clock: Callable[[], str] = _iso_now
+        #: How long a just-rotated receiver's previous key stays valid.
+        #: ``main.py`` cannot pass ``settings.webhook_key_overlap_s`` into the
+        #: constructor call it already owns without this class reaching outside
+        #: its assigned lines, so the API layer syncs it in via
+        #: :meth:`configure_key_overlap_s` on every webhook-management request
+        #: instead; this default matches the documented config default so
+        #: behaviour is correct even before that first sync.
+        self._key_overlap_s: int = DEFAULT_KEY_OVERLAP_S
+        #: Runtime cache of each receiver's current key-epoch record, keyed by
+        #: ``(artifact_id, url)``. The durable copy lives in the artifact's
+        #: meta file (``ArtifactMeta.webhook_key_epochs``); this is a plain
+        #: rebuildable cache in the same spirit as the store's own in-process
+        #: LRUs (see CLAUDE.md, "container has no permanent disk"). It starts
+        #: empty on every process start and is (re)seeded by
+        #: :meth:`seed_epoch` whenever the API layer reads or rotates a
+        #: receiver's record, so it is current for any receiver an owner has
+        #: touched since the last restart; an untouched, previously-rotated
+        #: receiver signs with its legacy epoch-less key until the next time
+        #: its owner looks at or rotates it, which is a false negative (an
+        #: old-but-still-registered key), never a false positive.
+        self._epochs: dict[tuple[str, str], dict] = {}
+        self._epochs_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -339,13 +508,59 @@ class WebhookDispatcher:
             thread.join(timeout=5)
 
     def signing_key_for(self, artifact_id: str, url: str) -> str:
-        """The key this receiver's deliveries for this artifact are signed with.
+        """The *current* key this receiver's deliveries are signed with.
 
         Exposed so the API layer can report it to the artifact's owner, who
         is the one who has to configure the receiver with it. See
-        :func:`receiver_signing_key` for why it is per receiver.
+        :func:`receiver_signing_key` for why it is per receiver. Consults the
+        seeded epoch cache (:meth:`seed_epoch`) so the value reflects the most
+        recent rotation this process knows about; with nothing seeded it is
+        the original epoch-less key, unchanged from before rotation existed.
         """
-        return receiver_signing_key(self._secret, artifact_id, url)
+        record = self._epochs.get((artifact_id, url))
+        return self.key_for_epoch(artifact_id, url, record.get("epoch") if record else None)
+
+    def key_for_epoch(self, artifact_id: str, url: str, epoch: str | None) -> str:
+        """The key for one specific epoch of one receiver (current or previous).
+
+        A thin, public wrapper around :func:`receiver_signing_key` so callers
+        outside this module (the rotate-key API route) never need to reach
+        into ``self._secret`` directly to report a just-minted or
+        still-in-grace-period key.
+        """
+        return receiver_signing_key(self._secret, artifact_id, url, epoch)
+
+    def seed_epoch(self, artifact_id: str, url: str, record: dict | None) -> None:
+        """Prime (or clear) the live epoch cache for one receiver.
+
+        Called by the API layer every time it reads or rotates a receiver's
+        persisted record (``ArtifactMeta.webhook_key_epochs``), so the very
+        next delivery -- whichever route triggers it -- already signs with
+        the current epoch. ``record=None`` drops any cached entry, matching a
+        receiver that was never rotated or whose persisted record disappeared
+        (e.g. its URL was removed and a different one registered later).
+        """
+        key = (artifact_id, url)
+        with self._epochs_lock:
+            if record:
+                self._epochs[key] = dict(record)
+            else:
+                self._epochs.pop(key, None)
+
+    def epoch_record_for(self, artifact_id: str, url: str) -> dict | None:
+        """The cached epoch record for one receiver, or ``None`` if unseeded."""
+        record = self._epochs.get((artifact_id, url))
+        return dict(record) if record else None
+
+    def configure_key_overlap_s(self, seconds: int) -> None:
+        """Sync the rotation grace period from ``Settings.webhook_key_overlap_s``.
+
+        Idempotent and cheap enough to call on every webhook-management
+        request (see the comment on ``self._key_overlap_s`` in
+        :meth:`__init__` for why it is synced this way rather than passed to
+        the constructor).
+        """
+        self._key_overlap_s = max(0, int(seconds))
 
     # ------------------------------------------------------------------ #
     # producing
@@ -430,15 +645,32 @@ class WebhookDispatcher:
         # id stable across attempts. Sent as headers as well as in the body so
         # a receiver can dedupe without parsing -- and so Slack deliveries,
         # whose body is a different shape entirely, carry them too.
+        #
+        # SEC-100-006: signing key(s) come from active_signing_keys(), which
+        # consults the epoch this dispatcher has cached for (artifact, url)
+        # (seeded by the API layer -- see seed_epoch()). The primary header
+        # always carries the *current* epoch's signature; right after a
+        # rotation a second header carries the *previous* epoch's signature
+        # too, for HUB_WEBHOOK_KEY_OVERLAP_S seconds, so a receiver that has
+        # not yet picked up the new key does not start failing verification
+        # the instant the owner rotates it.
+        keys = active_signing_keys(
+            self._secret,
+            event.artifact_id,
+            url,
+            self._epochs.get((event.artifact_id, url)),
+            now=self._clock(),
+            overlap_s=self._key_overlap_s,
+        )
         headers = {
             "Content-Type": "application/json",
             "User-Agent": USER_AGENT,
-            SIGNATURE_HEADER: sign_body(
-                body, self.signing_key_for(event.artifact_id, url)
-            ),
+            SIGNATURE_HEADER: sign_body(body, keys[0]),
             EVENT_ID_HEADER: event.event_id,
             DELIVERY_ID_HEADER: event.delivery_id_for(url),
         }
+        if len(keys) > 1:
+            headers[PREVIOUS_SIGNATURE_HEADER] = sign_body(body, keys[1])
         for attempt in range(self._max_attempts):
             if attempt:
                 delay = min(2**attempt, MAX_BACKOFF_S)

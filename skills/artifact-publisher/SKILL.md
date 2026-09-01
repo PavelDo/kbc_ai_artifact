@@ -949,6 +949,33 @@ attacker can use to forge a valid signature byte by byte. Use the *raw request
 body bytes*, not a re-serialized JSON object: any change in key order or
 whitespace changes the HMAC.
 
+### Rotate a receiver's key
+
+A leaked key no longer means re-registering under a new URL. `POST
+/api/artifacts/{id}/webhooks/{receiver_id}/rotate-key` (owner-only) mints an
+independent key for one receiver, leaving its URL and every other receiver
+untouched. `receiver_id` is the `id` field `GET .../webhooks` reports for
+that URL (also given as `rotate_key_url`, ready to use as-is):
+
+```bash
+hub -X POST "$HUB/api/artifacts/$ID/webhooks/$RECEIVER_ID/rotate-key"
+```
+
+The response carries the new `signing_key`, `rotated_at`, and
+`overlap_seconds` — for that many seconds after `rotated_at` (default 600,
+config `HUB_WEBHOOK_KEY_OVERLAP_S`), deliveries to this receiver are signed
+*twice*: the new key as `X-Hub-Signature-256` and the previous key as
+`X-Hub-Signature-256-Previous`, so update the receiver's configured key
+whenever convenient inside that window without dropping any delivery in
+between. A verifier that only ever checks `X-Hub-Signature-256` needs no
+change at all — that header always carries the current key's signature.
+Past the window `X-Hub-Signature-256-Previous` stops being sent and the
+previous key verifies nothing.
+
+Both `GET .../webhooks` and the rotate response are `Cache-Control:
+no-store` — a signing key is a credential, never something to let a shared
+or browser cache hold onto.
+
 ### Delivery is best-effort
 
 The delivery queue is in-memory: a hub restart drops whatever was pending. The

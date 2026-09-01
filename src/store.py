@@ -338,6 +338,60 @@ def _clean_invitations(raw: object) -> list[dict]:
     return cleaned
 
 
+def _clean_webhook_key_epoch_record(entry: object) -> dict | None:
+    """Normalize one receiver's epoch record, or ``None`` if it is unusable.
+
+    A usable record needs a non-empty string ``epoch`` — that is the value
+    :func:`src.webhooks.receiver_signing_key` mixes into the derivation, so
+    without it there is nothing to rotate to. ``previous_epoch`` may
+    legitimately be ``None`` (the receiver's first-ever rotation, out of the
+    epoch-less legacy state) or a non-empty string; anything else is coerced
+    to ``None`` rather than dropping the whole record, since the current
+    epoch is still perfectly usable without it — it just means a rotation in
+    flight would stop offering the previous key's grace period early rather
+    than accepting a forged one. ``rotated_at`` is coerced to a string the
+    same tolerant way every other timestamp field on this class is.
+    """
+    if not isinstance(entry, dict):
+        return None
+    epoch = entry.get("epoch")
+    if not isinstance(epoch, str) or not epoch:
+        return None
+    previous_epoch = entry.get("previous_epoch")
+    if not isinstance(previous_epoch, str) or not previous_epoch:
+        previous_epoch = None
+    return {
+        "epoch": epoch,
+        "previous_epoch": previous_epoch,
+        "rotated_at": str(entry.get("rotated_at") or ""),
+    }
+
+
+def _clean_webhook_key_epochs(raw: object) -> dict[str, dict]:
+    """Normalize the webhook receiver key-rotation map read from meta.
+
+    Keyed by receiver URL, so an entry survives only under a non-empty string
+    key; the value goes through :func:`_clean_webhook_key_epoch_record` and is
+    dropped entirely rather than kept half-shaped, exactly like
+    :func:`_clean_invitations` drops an invitation it cannot use. Missing
+    (every meta file written before SEC-100-006) or non-dict input becomes an
+    empty map -- the same "no epoch on record" state a receiver that has never
+    been rotated is already in, so :func:`src.webhooks.receiver_signing_key`
+    falls back to its original epoch-less derivation and an old-shape
+    persisted receiver keeps verifying without any migration step.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, dict] = {}
+    for url, entry in raw.items():
+        if not isinstance(url, str) or not url:
+            continue
+        record = _clean_webhook_key_epoch_record(entry)
+        if record is not None:
+            cleaned[url] = record
+    return cleaned
+
+
 @dataclass
 class ArtifactMeta:
     """Artifact-level state: who owns it, who may contribute, where head points.
@@ -439,6 +493,22 @@ class ArtifactMeta:
     # deleted; 0 (or absent, for every older meta file) means "nothing beyond
     # what exists", which is exactly what max(existing) already gives.
     version_high_water: int = 0
+    # SEC-100-006: per-receiver signing-key rotation. Keyed by webhook URL (an
+    # entry only exists for a URL currently or formerly in ``webhooks`` that
+    # has been rotated at least once); value shaped
+    #   {"epoch": str, "previous_epoch": str | None, "rotated_at": str}
+    # — see :func:`src.webhooks.mint_key_epoch`. No key *material* is ever
+    # stored here, only the random epoch marker src.webhooks.receiver_signing_key
+    # mixes into its derivation, so a leaked meta file no more discloses a
+    # receiver's key than it already would have via ``webhooks`` + the hub's
+    # own secret. Absent (every meta file written before this field existed,
+    # and every receiver that has never been rotated) means "derive the
+    # original epoch-less key" — the exact behaviour this field's absence
+    # already had, so an old-shape persisted receiver keeps verifying without
+    # a migration. Declared last, after ``version_high_water``, for the same
+    # reason ``invitations`` is: positional ArtifactMeta(...) construction
+    # elsewhere keeps meaning what it meant before this field existed.
+    webhook_key_epochs: dict[str, dict] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Normalize the enum-ish fields so an unknown value can never leak in."""
@@ -472,6 +542,7 @@ class ArtifactMeta:
             ]
         else:
             self.webhooks = []
+        self.webhook_key_epochs = _clean_webhook_key_epochs(self.webhook_key_epochs)
         self.invitations = _clean_invitations(self.invitations)
 
     @property
@@ -548,6 +619,7 @@ class ArtifactMeta:
             "schema": self.schema,
             "invitations": self.invitations,
             "version_high_water": self.version_high_water,
+            "webhook_key_epochs": self.webhook_key_epochs,
         }
         return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -640,6 +712,11 @@ class ArtifactMeta:
                 and high_water > 0
                 else 0
             ),
+            # SEC-100-006: absent (every meta file written before this field
+            # existed) becomes an empty map in __post_init__, which is exactly
+            # the "never rotated" state — the receiver keeps verifying under
+            # its original epoch-less key with no migration needed.
+            webhook_key_epochs=data.get("webhook_key_epochs"),
         )
 
 

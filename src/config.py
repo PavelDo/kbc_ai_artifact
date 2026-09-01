@@ -125,6 +125,15 @@ class Settings:
     # without limit; past the ceiling the newest delivery is dropped with a
     # log line rather than blocking the request that produced it.
     webhook_queue_max: int = 1000
+    # SEC-100-006: how long, in seconds, a receiver's previous signing key
+    # stays valid after the owner rotates it (HUB_WEBHOOK_KEY_OVERLAP_S).
+    # During this window a delivery carries both the current signature
+    # (X-Hub-Signature-256) and the previous one
+    # (X-Hub-Signature-256-Previous), so a receiver that has not yet picked
+    # up the freshly rotated key does not immediately start failing
+    # verification. 0 disables the grace period — rotation takes effect
+    # immediately for every subsequent delivery.
+    webhook_key_overlap_s: int = 600
     # Guest invitations (0.7.0)
     # How many invitations one artifact may hold at once
     # (HUB_MAX_INVITATIONS_PER_ARTIFACT). Each entry is a named capability
@@ -211,6 +220,7 @@ def load_settings() -> Settings:
         webhook_max_attempts=_int_env("HUB_WEBHOOK_MAX_ATTEMPTS", 3),
         max_webhooks_per_artifact=_int_env("HUB_MAX_WEBHOOKS_PER_ARTIFACT", 5),
         webhook_queue_max=_int_env("HUB_WEBHOOK_QUEUE_MAX", 1000),
+        webhook_key_overlap_s=_int_env("HUB_WEBHOOK_KEY_OVERLAP_S", 600),
         max_invitations_per_artifact=_int_env(
             "HUB_MAX_INVITATIONS_PER_ARTIFACT", 20
         ),
