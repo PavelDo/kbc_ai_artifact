@@ -966,17 +966,63 @@ def _record_view(app_obj: FastAPI | None, artifact_id: str, kind: str) -> None:
         logger.warning("Could not record a %s view of %s: %s", kind, artifact_id, exc)
 
 
-#: Request headers, in order of preference, that a trusted proxy may use to
-#: name the real client. ``X-Real-IP`` is what our own nginx sets;
-#: ``X-Forwarded-For`` is the standard fallback and is read first-entry-only
-#: (see :func:`_first_forwarded`), which is the hop closest to the client.
-_FORWARDED_CLIENT_HEADERS = ("x-real-ip", "x-forwarded-for")
+#: Either address flavour, as :mod:`ipaddress` hands them back.
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 
 def _peer_ip(request: Request) -> str:
     """The address the TCP connection actually came from, or ``"unknown"``."""
     client = request.client
     return client.host if client is not None else "unknown"
+
+
+def _unmapped(address: IPAddress) -> IPAddress:
+    """An IPv4-mapped IPv6 address as plain IPv4; anything else unchanged.
+
+    SEC-100-003. A dual-stack listener reports an IPv4 peer as
+    ``::ffff:10.0.0.5``, and that is *not* a member of ``10.0.0.0/8`` as far
+    as :mod:`ipaddress` is concerned. Without this an operator who configured
+    ``HUB_TRUSTED_PROXY_CIDRS`` perfectly correctly would still have every
+    forwarded address ignored, with nothing to distinguish that from the
+    headers simply not arriving. Normalizing in the bucket key too means the
+    two spellings of one address cannot become two brute-force budgets.
+    """
+    mapped = getattr(address, "ipv4_mapped", None)
+    return mapped if mapped is not None else address
+
+
+def _parse_client_address(raw: str | None) -> IPAddress | None:
+    """One forwarded chain entry as a canonical address, or None if it is junk.
+
+    SEC-100-003. Everything this returns ends up as the key of a persisted
+    ``counters`` row, so an entry that is not an address must be dropped
+    rather than passed through: before this the caller chose that key, its
+    contents and its length outright. Tolerates the three shapes real proxies
+    emit around an address — surrounding whitespace, an ``a.b.c.d:port``
+    suffix, and a bracketed ``[v6]`` or ``[v6]:port`` literal — and rejects
+    anything else.
+    """
+    if not raw:
+        return None
+    candidate = raw.strip()
+    if candidate.startswith("["):
+        closing = candidate.find("]")
+        if closing == -1:
+            return None
+        candidate = candidate[1:closing]
+    elif candidate.count(":") == 1:
+        # Exactly one colon means "IPv4 with a port": a bare IPv6 literal
+        # always carries at least two, so this cannot eat one of those.
+        candidate = candidate.split(":", 1)[0]
+    try:
+        return _unmapped(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def _is_trusted_proxy(address: IPAddress) -> bool:
+    """True when ``address`` sits in one of ``HUB_TRUSTED_PROXY_CIDRS``."""
+    return any(address in network for network in settings.trusted_proxy_cidrs)
 
 
 def _forwarded_client_trusted(request: Request) -> bool:
@@ -999,13 +1045,58 @@ def _forwarded_client_trusted(request: Request) -> bool:
     """
     if not settings.trust_forwarded_headers or not settings.trusted_proxy_cidrs:
         return False
-    try:
-        peer = ipaddress.ip_address(_peer_ip(request))
-    except ValueError:
+    peer = _parse_client_address(_peer_ip(request))
+    if peer is None:
         # Not an IP literal at all (a unix socket, a test transport): there is
         # no way to place it in a network, so it is not a trusted proxy.
         return False
-    return any(peer in network for network in settings.trusted_proxy_cidrs)
+    return _is_trusted_proxy(peer)
+
+
+def _forwarded_chain_client(raw: str | None) -> IPAddress | None:
+    """The rightmost entry of an ``X-Forwarded-For`` chain we did not write.
+
+    SEC-100-003, second half. Every proxy in the path *appends* the peer it
+    accepted the connection from — our own nginx does exactly that with
+    ``$proxy_add_x_forwarded_for`` — so the chain reads oldest-first and the
+    leftmost entry is whatever the original caller chose to send. Reading it
+    was the bug: a guesser who prepended a different value each time got a
+    fresh brute-force budget every attempt, which is the finding restated.
+
+    So walk from the right instead, past the hops our own infrastructure
+    added (the entries inside ``HUB_TRUSTED_PROXY_CIDRS``), and stop at the
+    first entry neither we nor a trusted proxy vouched for: that is the
+    closest thing to a real client this request carries. Unparsable entries
+    are skipped rather than returned, and a chain that is nothing but trusted
+    proxies (or nothing but junk) yields None, leaving the caller on the peer
+    address.
+
+    Note the corollary for operators: *every* hop's network has to be in
+    ``HUB_TRUSTED_PROXY_CIDRS``, not just the one that opens the connection.
+    Name only nginx's network and the walk stops at the platform proxy, so
+    every reader shares that one bucket — safe, but no better than leaving
+    the setting empty.
+
+    Only the last ``HUB_MAX_FORWARDED_CHAIN_ENTRIES`` entries are examined, so
+    a caller cannot buy an unbounded number of address parses with one very
+    long header.
+    """
+    if not raw:
+        return None
+    # Clamped at zero because a negative maxsplit means "split everything" to
+    # str.rsplit — a typo in HUB_MAX_FORWARDED_CHAIN_ENTRIES must not quietly
+    # turn the cap off, which is the one thing it exists to prevent.
+    cap = max(settings.max_forwarded_chain_entries, 0)
+    # rsplit stops after `cap` splits, so the leftmost element is the whole
+    # unexamined remainder of the chain rather than a single entry; drop it.
+    entries = raw.rsplit(",", cap)
+    if len(entries) > cap:
+        entries = entries[1:]
+    for entry in reversed(entries):
+        address = _parse_client_address(entry)
+        if address is not None and not _is_trusted_proxy(address):
+            return address
+    return None
 
 
 def _client_ip(request: Request) -> str:
@@ -1014,9 +1105,19 @@ def _client_ip(request: Request) -> str:
     Until SEC-100-003 this returned ``X-Real-IP`` whenever it was present. The
     header is attacker-supplied, so a password guesser reset their own
     brute-force budget simply by changing it — a budget of one still allowed
-    unlimited attempts. The header is now honoured only from a peer inside a
-    configured trusted-proxy network (:func:`_forwarded_client_trusted`);
-    otherwise the bucket key is the peer address, which nobody can choose.
+    unlimited attempts. Forwarded addresses are now honoured only from a peer
+    inside a configured trusted-proxy network
+    (:func:`_forwarded_client_trusted`); otherwise the bucket key is the peer
+    address, which nobody can choose.
+
+    Order of preference, once the peer is trusted: ``X-Real-IP`` first,
+    because our own nginx sets it from the connection it accepted and it is a
+    single address needing no chain walk; then the rightmost entry of
+    ``X-Forwarded-For`` that is not itself a trusted proxy (see
+    :func:`_forwarded_chain_client` for why the *rightmost*). Either way the
+    value has to parse as an IP address, and what is returned is that address
+    canonicalized — a caller cannot make the key arbitrary text, nor make it
+    long enough to bloat the persisted ``counters`` table.
 
     Even then this identity is only ever a bucket key: a forged value can
     split an attacker's own budget, never grant access or identify anybody.
@@ -1024,12 +1125,19 @@ def _client_ip(request: Request) -> str:
     :func:`_unlock_throttled`) is what bounds an attacker who *can* change
     addresses cheaply.
     """
+    peer = _peer_ip(request)
     if _forwarded_client_trusted(request):
-        for header in _FORWARDED_CLIENT_HEADERS:
-            forwarded = _first_forwarded(request.headers.get(header))
-            if forwarded:
-                return forwarded
-    return _peer_ip(request)
+        forwarded = _parse_client_address(request.headers.get("x-real-ip"))
+        if forwarded is None:
+            forwarded = _forwarded_chain_client(
+                request.headers.get("x-forwarded-for")
+            )
+        if forwarded is not None:
+            return str(forwarded)
+    parsed_peer = _parse_client_address(peer)
+    # A peer that is not an address literal (a unix socket, a test transport)
+    # is still a fine bucket key: it is short, fixed, and nobody can choose it.
+    return str(parsed_peer) if parsed_peer is not None else peer
 
 
 def _version_rate_limited() -> JSONResponse:
