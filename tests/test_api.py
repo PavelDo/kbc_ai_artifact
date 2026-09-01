@@ -971,6 +971,121 @@ def test_publish_git_username_with_markdown_is_422(api: Api) -> None:
     assert "git_url" in resp.json()["detail"]
 
 
+class TestFrozenDocumentsFreezeModeration:
+    """A frozen document blocked new comments but not the state of old ones.
+
+    "Final" and "trashed" are advertised as freezing contributions, yet
+    resolve, reopen and an author's withdrawal all still rewrote the
+    discussion afterwards -- so the frozen record was not actually fixed.
+    """
+
+    def test_resolving_a_thread_on_a_final_document_is_409(self, api: Api) -> None:
+        artifact_id = _publish_markdown(api, "# One")
+        thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+        assert _policy(api, artifact_id, status="final").status_code == 200
+
+        resp = api.client.post(
+            f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+            json={"resolved": True},
+            headers=AUTH_HEADERS,
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"] == "document is final"
+
+    def test_reopening_a_thread_on_a_final_document_is_409(self, api: Api) -> None:
+        artifact_id = _publish_markdown(api, "# One")
+        thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+        assert (
+            api.client.post(
+                f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+                json={"resolved": True},
+                headers=AUTH_HEADERS,
+            ).status_code
+            == 200
+        )
+        assert _policy(api, artifact_id, status="final").status_code == 200
+
+        resp = api.client.post(
+            f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+            json={"resolved": False},
+            headers=AUTH_HEADERS,
+        )
+        assert resp.status_code == 409, resp.text
+
+    def test_resolving_on_a_trashed_document_says_trashed(self, api: Api) -> None:
+        artifact_id = _publish_markdown(api, "# One")
+        thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+        assert (
+            api.client.delete(
+                f"/api/artifacts/{artifact_id}", headers=AUTH_HEADERS
+            ).status_code
+            == 200
+        )
+
+        resp = api.client.post(
+            f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+            json={"resolved": True},
+            headers=AUTH_HEADERS,
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"] == "document is trashed"
+
+    def test_the_owner_can_still_delete_a_thread_on_a_final_document(
+        self, api: Api
+    ) -> None:
+        """Deliberately not frozen: removal must stay possible.
+
+        Freezing this would mean a comment that has to come off a finished
+        document -- a leaked secret, someone's personal data -- never could,
+        short of destroying the whole document.
+        """
+        artifact_id = _publish_markdown(api, "# One")
+        thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+        assert _policy(api, artifact_id, status="final").status_code == 200
+
+        resp = api.client.delete(
+            f"/api/artifacts/{artifact_id}/comments/{thread_id}",
+            headers=AUTH_HEADERS,
+        )
+        assert resp.status_code == 200, resp.text
+
+    def test_an_author_cannot_withdraw_their_thread_once_frozen(
+        self, api: Api
+    ) -> None:
+        """Withdrawal is a contribution-shaped change; owner moderation is not."""
+        artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+        authored = _comment(api, artifact_id, exact="One", headers=OTHER_AUTH_HEADERS)
+        assert authored.status_code == 201, authored.text
+        thread_id = authored.json()["id"]
+        assert _policy(api, artifact_id, status="final").status_code == 200
+
+        resp = api.client.delete(
+            f"/api/artifacts/{artifact_id}/comments/{thread_id}",
+            headers=OTHER_AUTH_HEADERS,
+        )
+        assert resp.status_code == 409, resp.text
+
+    def test_a_draft_document_still_allows_all_of_it(self, api: Api) -> None:
+        artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+        authored = _comment(api, artifact_id, exact="One", headers=OTHER_AUTH_HEADERS)
+        thread_id = authored.json()["id"]
+        assert (
+            api.client.post(
+                f"/api/artifacts/{artifact_id}/comments/{thread_id}/resolve",
+                json={"resolved": True},
+                headers=AUTH_HEADERS,
+            ).status_code
+            == 200
+        )
+        assert (
+            api.client.delete(
+                f"/api/artifacts/{artifact_id}/comments/{thread_id}",
+                headers=OTHER_AUTH_HEADERS,
+            ).status_code
+            == 200
+        )
+
+
 def test_a_rejected_reply_does_not_linger_in_the_thread(
     api: Api, monkeypatch
 ) -> None:

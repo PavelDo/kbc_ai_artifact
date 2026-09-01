@@ -6892,6 +6892,10 @@ def reply_to_comment(
         "A guest (X-Artifact-Guest) may resolve and reopen the threads they "
         "opened themselves, and only those — an invitation never carries "
         "moderation authority over anybody else's thread.\n\n"
+        "**Frozen documents refuse this.** A 'final' or trashed document "
+        "freezes the state of its discussion as well as its content, so "
+        "resolving and reopening are 409 there, exactly like a new comment "
+        "or reply.\n\n"
         + COMMENT_PASSWORD_NOTE + "\n\n" + COMMENT_TARGET_NOTE
     ),
     responses={
@@ -6913,7 +6917,8 @@ def reply_to_comment(
         409: {
             "description": (
                 "The thread is already resolved (or already open, when "
-                "reopening)."
+                "reopening), or the document is frozen — 'final' or trashed "
+                "freezes thread moderation too."
             )
         },
         429: RESP_COMMENT_MOD_429,
@@ -6956,6 +6961,14 @@ def resolve_comment(
                 "or reopen it"
             ),
         )
+    if meta.is_frozen():
+        # Same gate as a new comment or reply. Resolving and reopening are
+        # not new content, but they change the state of the discussion a
+        # frozen document is supposed to have fixed -- leaving them open
+        # meant "final" froze what could be added and not what the record
+        # said. Checked after authorization so a caller who may not moderate
+        # at all still learns that first.
+        return _document_frozen(meta, "thread moderation")
 
     wanted = True if body is None else bool(body.resolved)
     if thread.resolved == wanted:
@@ -7004,6 +7017,12 @@ def resolve_comment(
         "(withdrawing a comment); anyone else gets a 403. Irreversible.\n\n"
         "A guest (X-Artifact-Guest) may withdraw the threads they opened "
         "themselves, and only those.\n\n"
+        "**On a frozen document only the owner may delete.** A 'final' or "
+        "trashed document freezes an author's withdrawal along with every "
+        "other contribution (409), but deliberately not the owner's: a "
+        "comment that has to come off a finished record — a leaked secret, "
+        "someone's personal data — must stay removable without destroying "
+        "the whole document.\n\n"
         + COMMENT_PASSWORD_NOTE + "\n\n" + COMMENT_TARGET_NOTE
     ),
     responses={
@@ -7017,6 +7036,13 @@ def resolve_comment(
             )
         },
         404: RESP_THREAD_404,
+        409: {
+            "description": (
+                "The document is frozen ('final' or trashed) and the caller "
+                "is not its owner, so this withdrawal is refused. The owner "
+                "may still delete."
+            )
+        },
         429: RESP_COMMENT_MOD_429,
         502: {
             "description": (
@@ -7059,6 +7085,15 @@ def delete_comment(
                 "this comment"
             ),
         )
+    # Deliberately narrowed rather than frozen outright. Removal is the one
+    # comment mutation that has to survive a frozen document: a comment that
+    # must come off a finished record -- a leaked secret, someone's personal
+    # data -- would otherwise be unremovable short of destroying the whole
+    # artifact. An author *withdrawing* their thread is a different act,
+    # contribution-shaped like a reply, so that freezes with everything else
+    # and only the owner's moderation remains.
+    if meta.is_frozen() and (caller is None or caller.key != meta.owner_key):
+        return _document_frozen(meta, "withdrawing your own comment")
 
     if not comments.delete(meta.id, thread_id):
         # delete() reports False both when nothing matched and when a backend

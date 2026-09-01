@@ -288,7 +288,15 @@ A `title` can only be set together with new content (422 if sent alone).
 
 **`DELETE /api/artifacts/{id}` is soft.** It moves the artifact to the trash:
 its public link answers 404 immediately, new versions/comments answer 409,
-but nothing is erased and `POST .../restore` undoes it on the same URL. Only
+but nothing is erased and `POST .../restore` undoes it on the same URL.
+
+**What "frozen" (`final` or trashed) blocks.** New versions, new comments and
+replies, resolving or reopening a thread, and an author withdrawing their own
+comment — all 409. The state of the discussion is frozen along with the
+content, so a finished record does not keep changing. The one exception is
+the **owner** deleting a comment thread, which stays available on purpose: a
+comment that has to come off a finished document must be removable without
+destroying the document. Only
 `DELETE /api/artifacts/{id}/purge` is permanent — see *Behavioral rules*
 below for when to prefer which.
 

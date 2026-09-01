@@ -47,6 +47,11 @@ your side.**
   pending notifications without limit; past a configurable ceiling
   (`HUB_WEBHOOK_QUEUE_MAX`) the newest is dropped, and publishing is never held
   up waiting for one.
+- Finalising a document now freezes its discussion too. Resolving, reopening
+  and withdrawing a comment used to keep working on a document marked final or
+  moved to the trash, so a "finished" record kept changing. The owner can still
+  delete a comment thread — a comment that has to come off a finished document
+  must stay removable.
 - A comment thread now has a size ceiling of its own: 500 replies and 2 MB.
   Individual comments were capped, but nothing capped the thread they pile up
   in, and a thread is rewritten whole on every reply and re-read on every

@@ -409,27 +409,34 @@ are missing. Everything else has a documented default, overridable via env.
 ## Deployment to Keboola
 
 The app is deployed from the public GitHub repository
-`padak/kbc_ai_artifact` as a Keboola Data App:
+`padak/kbc_ai_artifact` as a Keboola Data App. For production, name the
+release tag explicitly — `--git-branch` defaults to
+`main`, which is a moving target:
 
 ```bash
 kbagent data-app create \
   --project artifacts \
   --git-repo https://github.com/padak/kbc_ai_artifact \
+  --git-branch v0.9.0 \
   --git-public
 ```
 
-**Pin production to an immutable ref, not a moving branch.** The command
-above (and the platform's default git integration) tracks a branch —
-typically `main` — and the runner re-clones that branch on every container
-start (a fresh deploy, a restart, or a wake from auto-suspend). That means a
-push to `main` after review, or simply a container restart picking up a newer
-commit than the one last verified, can change what is actually running
-without a corresponding, deliberate deploy action. For production, deploy
-from an immutable ref instead: cut a tagged release (CLAUDE.md's deploy flow
+**Why the tag is not optional in production.** The runner re-clones the
+configured ref on every container start — a fresh deploy, a restart, or a
+wake from auto-suspend — not only when you deploy. Left on a branch, a push
+to `main` after review, or simply a restart landing on a newer commit than
+the one last verified, changes what is actually running with no deliberate
+deploy action behind it. A tag makes a given deployment stay tied to the
+exact commit that was reviewed and versioned. CLAUDE.md's deploy flow
 already tags the commit and cuts a GitHub release for every user-visible
-change — see *Contributing* below) and point the git ref at that tag or its
-commit SHA rather than at `main`, so a given deployment stays reproducibly
-tied to the exact commit that was reviewed and versioned.
+change (see *Contributing* below), so the tag to pass always exists.
+
+Pass the tag itself, not a commit SHA: this is a clone ref, and git's
+`--branch` resolves a branch or a tag only — the same constraint the
+service's own `git_ref` has. To pin a specific commit, tag it first.
+
+Omitting `--git-branch` (tracking `main`) is fine for a development or
+staging app where following the branch is the point.
 
 Secrets are set with `kbagent data-app secrets-set` and never committed to
 the repository:
