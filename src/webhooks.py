@@ -228,9 +228,10 @@ class WebhookDispatcher:
         self._queue: queue.Queue[tuple[str, WebhookEvent] | None] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._stopping = threading.Event()
-        #: Injection points for tests: no real sleeping, no real HTTP.
+        #: Injection points for tests: no real sleeping, no real HTTP, no real DNS.
         self._sleep: Callable[[float], None] = time.sleep
         self._post: Callable[[str, bytes, dict], int] = self._http_post
+        self._resolver: Callable[[str], list[str]] = _resolve_host_ips
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -336,6 +337,24 @@ class WebhookDispatcher:
                         event.kind,
                     )
                     return False
+            # Re-resolve and re-check the destination immediately before *every*
+            # attempt: the host was validated at registration, but DNS can
+            # rebind to an internal/metadata address between then and delivery
+            # (and between retries). Residual TOCTOU: httpx re-resolves when it
+            # opens the connection a moment later, and the installed sync client
+            # offers no SNI-preserving IP pin, so this narrows the window rather
+            # than closing it. A blocked destination drops the delivery — never
+            # raised into the caller.
+            if not self._destination_allowed(url):
+                logger.warning(
+                    "Dropping webhook delivery of %s for artifact %s to %s: host "
+                    "resolves to a private, loopback, link-local, reserved or "
+                    "metadata address",
+                    event.kind,
+                    event.artifact_id,
+                    _safe_url(url),
+                )
+                return False
             try:
                 status = self._post(url, body, headers)
             except Exception as exc:  # noqa: BLE001 - network errors are normal
@@ -365,9 +384,48 @@ class WebhookDispatcher:
         )
         return False
 
+    def _destination_allowed(self, url: str) -> bool:
+        """False when ``url``'s host positively resolves to a blocked address.
+
+        Mirrors :func:`validate_webhook_url`'s checks, but runs at delivery time
+        with the dispatcher's (injectable) resolver so a rebind after
+        registration is caught. Never raises.
+
+        A blocked hostname (metadata/internal names) or a name/literal that
+        resolves to a private, loopback, link-local, reserved or metadata
+        address returns ``False`` and the delivery is dropped. A host that
+        cannot be resolved *now* (``OSError``/no addresses) is allowed through:
+        the registration guard already required it to resolve to a public
+        address, an unresolvable name cannot be connected to at all (so it is
+        not an SSRF vector — the POST would simply fail), and dropping only on a
+        positively-blocked answer is what defends the rebind-to-internal case.
+        """
+        hostname = (urlparse(url).hostname or "").strip().rstrip(".").lower()
+        if not hostname:
+            return False
+        if hostname in _BLOCKED_HOSTNAMES or hostname.endswith(".internal"):
+            return False
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            try:
+                candidates = self._resolver(hostname)
+            except OSError:
+                return True
+        else:
+            candidates = [hostname]
+        if not candidates:
+            return True
+        return not any(_ip_is_blocked(ip) for ip in candidates)
+
     def _http_post(self, url: str, body: bytes, headers: dict) -> int:
-        """The real POST. Replaced wholesale in tests."""
-        with httpx.Client(timeout=self._timeout_s) as client:
+        """The real POST. Replaced wholesale in tests.
+
+        ``follow_redirects=False`` so a 3xx cannot bounce the signed payload to
+        an unvalidated (possibly internal) host — the redirect target would skip
+        the delivery-time SSRF re-check entirely.
+        """
+        with httpx.Client(timeout=self._timeout_s, follow_redirects=False) as client:
             response = client.post(url, content=body, headers=headers)
         return int(response.status_code)
 

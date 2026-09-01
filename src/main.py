@@ -84,8 +84,11 @@ from src.pages import (
     visual_diff_page,
 )
 from src.security import (
+    KEY_LABEL_UNLOCK_COOKIE,
+    KEY_LABEL_WEBHOOK,
     CookieSigner,
     check_password,
+    derive_key,
     hash_password,
     new_artifact_id,
 )
@@ -201,11 +204,14 @@ THREAD_ID_DESC = (
 #: because the review UI and everyone holding a capability URL know an artifact
 #: by its share id, while agents and owners address it by the internal one.
 COMMENT_TARGET_ID_DESC = (
-    "Either identifier of the artifact: the internal id from the publish "
-    "response, or the public share id that appears in its /a/{...} URLs. The "
-    "internal id is tried first; a share id that has been rotated away no "
-    "longer resolves, and neither does the bare artifact id of an artifact "
-    "whose link was rotated."
+    "Either identifier of the artifact: the public share id that appears in "
+    "its /a/{...} URLs, or — for the artifact's own owner, authenticated with "
+    "a Storage token — the internal id from the publish response. The share id "
+    "is resolved first and exactly as every other public path resolves one: a "
+    "share id that has been rotated away no longer works, and neither does the "
+    "bare internal id of an artifact whose link was rotated, except for that "
+    "owner. Everyone else gets 404 for a revoked identifier, so rotating the "
+    "link revokes comment writes too."
 )
 
 #: Description attached to every ``invitation_id`` path parameter.
@@ -250,10 +256,24 @@ GUEST_WRITE_NOTE = (
 #: Paragraph appended to every comment-write route: which id the path takes.
 COMMENT_TARGET_NOTE = (
     "**Either identifier works in the path** on this route, unlike the rest of "
-    "/api/*: the internal artifact id (tried first) or the public share id "
-    "that /a/{...} URLs carry. Capability-URL holders, the review UI and "
+    "/api/*: the public share id that /a/{...} URLs carry (resolved first) or "
+    "the internal artifact id. Capability-URL holders, the review UI and "
     "invited guests only ever saw the share id, so refusing it here would "
-    "make them unable to address the artifact they are looking at."
+    "make them unable to address the artifact they are looking at. The share "
+    "id is resolved with the same rules as every public path, so rotating the "
+    "link (POST /api/artifacts/{id}/rotate-link) revokes writes through the "
+    "old link as well as reads; the internal id keeps working only for the "
+    "artifact's own owner, authenticated with a Storage token."
+)
+
+#: Sentence appended to every comment-write route: the reader password applies.
+COMMENT_PASSWORD_NOTE = (
+    "**Password-protected artifacts.** The discussion is part of the "
+    "protected document, so a write is gated exactly like a read: send the "
+    "X-Artifact-Password header (or hold the unlock cookie from POST "
+    "/a/{id}/unlock), or the answer is 401. This holds for guests too — an "
+    "invitation is a grant to comment, never a way around the reader password "
+    "— and for the owner, who reads through the same gate."
 )
 
 #: Reused ``responses`` entries, so the same failure never gets two wordings.
@@ -262,14 +282,25 @@ RESP_COMMENT_401 = {
     "description": (
         "Storage token missing or rejected by the stack — or, when an "
         "X-Artifact-Guest header was sent, an invitation that is unknown to "
-        "this artifact, revoked, or whose secret does not verify. The three "
-        "guest cases are deliberately indistinguishable."
+        "this artifact, revoked, or whose secret does not verify (the three "
+        "guest cases are deliberately indistinguishable) — or the artifact is "
+        "password-protected and no valid X-Artifact-Password header or unlock "
+        "cookie came with the request."
     )
 }
 RESP_COMMENTS_429 = {
     "description": (
-        "This project — or this invitation — reached "
-        "HUB_MAX_COMMENTS_PER_DAY comments and replies on this artifact today."
+        "A budget for this artifact is spent: either this project or this "
+        "invitation reached HUB_MAX_COMMENTS_PER_DAY comments and replies on "
+        "it today, or this client address made "
+        "HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR failed password or invitation "
+        "attempts on it this hour."
+    )
+}
+RESP_COMMENT_MOD_429 = {
+    "description": (
+        "This client address made HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR failed "
+        "password or invitation attempts on this artifact in the current hour."
     )
 }
 RESP_TOKEN_401 = {"description": "Storage token missing or rejected by the stack."}
@@ -289,6 +320,15 @@ RESP_UNLOCK_429 = {
     "description": (
         "Too many failed password attempts for this artifact from this "
         "client address in the current hour (HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR)."
+    )
+}
+RESP_GUEST_429 = {
+    "description": (
+        "Too many failed password *or* invitation attempts for this artifact "
+        "from this client address in the current hour "
+        "(HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR, counted separately for each). "
+        "Verifying an invitation secret is as expensive as verifying a "
+        "password, so rejected credentials are budgeted the same way."
     )
 }
 RESP_VERSIONS_429 = {
@@ -419,6 +459,7 @@ _hydrate_lock = threading.Lock()
 COUNTER_SUBMISSIONS = "submissions"
 COUNTER_COMMENTS = "comments"
 COUNTER_UNLOCK_FAILURES = "unlock_failures"
+COUNTER_GUEST_FAILURES = "guest_failures"
 
 _fallback_counts: dict[tuple[str, str, str], int] = {}
 _fallback_lock = threading.Lock()
@@ -566,6 +607,39 @@ def _record_unlock_failure(
     )
 
 
+def _guest_throttled(
+    app_obj: FastAPI | None, artifact_id: str, client_ip: str
+) -> bool:
+    """True when this (artifact, client) burnt its failed-invitation budget.
+
+    Checking an invitation secret runs the same full PBKDF2 as a password, and
+    ``GET /a/{id}/guest`` is public, so a known invitation id would otherwise
+    be a free CPU-exhaustion primitive as well as an offline-free oracle. The
+    budget is the unlock budget (``HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR``) in its
+    own scope, so guest probing and password guessing cannot spend each
+    other's allowance.
+    """
+    count = _read_counter(
+        app_obj,
+        COUNTER_GUEST_FAILURES,
+        _counter_key(artifact_id, client_ip),
+        _utc_hour(),
+    )
+    return count >= settings.max_unlock_attempts_per_hour
+
+
+def _record_guest_failure(
+    app_obj: FastAPI | None, artifact_id: str, client_ip: str
+) -> None:
+    """Count one *failed* guest verification against the hourly budget."""
+    _bump_counter(
+        app_obj,
+        COUNTER_GUEST_FAILURES,
+        _counter_key(artifact_id, client_ip),
+        _utc_hour(),
+    )
+
+
 def _record_view(app_obj: FastAPI | None, artifact_id: str, kind: str) -> None:
     """Count one successful read of an artifact. Never raises into serving.
 
@@ -641,7 +715,15 @@ async def lifespan(app: FastAPI):
         settings.cache_dir,
         settings.cache_max_entries,
     )
-    app.state.signer = CookieSigner(settings.secret_key)
+    # Neither consumer of the master secret ever sees it raw: each gets its own
+    # key derived under a distinct label (see security.derive_key). A webhook
+    # receiver necessarily learns the key it verifies signatures with, and must
+    # not thereby be able to mint unlock cookies. Switching to a derived key
+    # invalidates unlock cookies issued by an older build — that is expected and
+    # harmless: they are short-lived, and a reader simply unlocks once more.
+    app.state.signer = CookieSigner(
+        derive_key(settings.secret_key, KEY_LABEL_UNLOCK_COOKIE)
+    )
     app.state.hydrated = False
     statedb = StateDB(
         backend,
@@ -653,7 +735,7 @@ async def lifespan(app: FastAPI):
     webhooks = WebhookDispatcher(
         settings.webhook_timeout_s,
         settings.webhook_max_attempts,
-        settings.secret_key,
+        derive_key(settings.secret_key, KEY_LABEL_WEBHOOK),
     )
     app.state.webhooks = webhooks
     try:
@@ -1356,30 +1438,42 @@ def _public_meta_of(request: Request, public_id: str) -> ArtifactMeta | None:
     return request.app.state.store.get_meta(artifact_id)
 
 
-def _comment_target_of(request: Request, path_id: str) -> ArtifactMeta | None:
-    """Resolve the identifier in a comment-write path, internal id first.
+def _comment_target_of(
+    request: Request, path_id: str, caller: Owner | None = None
+) -> ArtifactMeta | None:
+    """Resolve the identifier in a comment-write path, *share id first*.
 
     The comment write routes are the one place where both halves of an
-    artifact's identity pair are legitimate. An agent or an owner holds the
-    internal id (it is what the publish response and ``/api/artifacts`` hand
-    them); the review UI, a capability-URL holder and every invited guest only
-    ever saw the **share id**, because that is what ``/a/{...}`` carries. Trying
-    the internal id first keeps the owner path a single index lookup and makes
-    the share id a fallback rather than a second namespace.
+    artifact's identity pair are legitimate. The review UI, a capability-URL
+    holder and every invited guest only ever saw the **share id**, because that
+    is what ``/a/{...}`` carries; an owner also holds the internal id (it is
+    what the publish response and ``/api/artifacts`` hand them).
 
-    Answers ``None`` for anything neither lookup resolves — including a share id
-    that has been rotated away, which is exactly the revocation
-    :meth:`~src.store.ArtifactStore.resolve_share` exists to enforce.
+    The share id is therefore resolved the way every other public ``/a/`` path
+    resolves one — through :meth:`~src.store.ArtifactStore.resolve_share`, which
+    answers ``None`` for a rotated-away link, for the bare internal id of a
+    rotated artifact, and for an artifact in the trash. Looking the internal id
+    up first (as this helper used to) quietly defeated that: because a fresh
+    artifact's share id *is* its internal id, the original public identifier
+    kept working for comment writes forever, and rotation stopped being
+    revocation for anybody who had seen the link.
+
+    The internal id survives only as an **owner** fallback, and only for a
+    token-authenticated caller who owns the artifact — the API ergonomics an
+    agent depends on, with none of the public reach. A guest, a stranger's
+    token and an anonymous caller all get ``None`` (a 404) for it.
     """
     ensure_hydrated(request.app)
     store = request.app.state.store
-    meta = store.get_meta(path_id)
-    if meta is not None:
-        return meta
     internal_id = store.resolve_share(path_id)
-    if internal_id is None:
+    if internal_id is not None:
+        return store.get_meta(internal_id)
+    if caller is None:
         return None
-    return store.get_meta(internal_id)
+    meta = store.get_meta(path_id)
+    if meta is None or meta.owner_key != caller.key:
+        return None
+    return meta
 
 
 # ------------------------------------------------------------ guest invitations
@@ -1440,6 +1534,39 @@ def _verify_guest(meta: ArtifactMeta, credential: tuple[str, str]) -> dict:
             return invitation
         break
     raise _guest_refused()
+
+
+def _verify_guest_checked(
+    request: Request, meta: ArtifactMeta, credential: tuple[str, str]
+) -> dict:
+    """:func:`_verify_guest` behind the same failed-attempt budget as unlock.
+
+    Every route that accepts an ``X-Artifact-Guest`` credential goes through
+    here rather than calling :func:`_verify_guest` directly. Only *failures*
+    are counted, so an invited guest working normally is never affected, while
+    somebody grinding secrets against a known invitation id gets 429 long
+    before they have spent much of the hub's CPU on PBKDF2.
+
+    Buckets are keyed by the *internal* artifact id, so rotating the link (or
+    addressing the artifact by its other identifier) does not hand an attacker
+    a fresh budget.
+    """
+    client_ip = _client_ip(request)
+    if _guest_throttled(request.app, meta.id, client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "too many rejected invitation credentials for this artifact "
+                f"from your address; at most "
+                f"{settings.max_unlock_attempts_per_hour} failed attempts are "
+                "allowed per hour"
+            ),
+        )
+    try:
+        return _verify_guest(meta, credential)
+    except HTTPException:
+        _record_guest_failure(request.app, meta.id, client_ip)
+        raise
 
 
 def _guest_identity(invitation: dict) -> dict:
@@ -2028,7 +2155,7 @@ def _content_fields(body: PublishBody | UpdateBody | VersionBody) -> list[str]:
 
 
 def strip_git_userinfo(git_url: str) -> str:
-    """Remove ``user:password@`` userinfo from a git URL.
+    """Remove every credential-bearing part of a git URL: userinfo, query, fragment.
 
     A submitted ``https://user:token@github.com/org/repo`` used to be stored
     verbatim in the version envelope and echoed back through public metadata
@@ -2037,18 +2164,29 @@ def strip_git_userinfo(git_url: str) -> str:
     envelope kept the original — so it is stripped here, before validation,
     storage or any response. Private clones do not need it: they authenticate
     with the separate, request-scoped ``git_token``/``git_username`` fields.
+
+    The query string and fragment go the same way, and for the same reason: a
+    secret hides just as well in ``?token=...`` (or ``#token=...``) as it does
+    in the userinfo, and the stored envelope and the public git provenance
+    (``/a/{id}/meta``, ``/a/{id}/versions``) would carry it verbatim. A clone
+    URL needs neither component, so dropping both costs nothing and closes the
+    remaining leak.
     """
     parsed = urlsplit(git_url)
-    if not parsed.netloc or "@" not in parsed.netloc:
+    if not parsed.netloc:
+        # Not a URL with an authority (e.g. an scp-style or relative form);
+        # there is nothing to reliably split off, so leave it to validation.
         return git_url
-    host = parsed.netloc.rsplit("@", 1)[1]
-    return urlunsplit(
-        (parsed.scheme, host, parsed.path, parsed.query, parsed.fragment)
-    )
+    host = parsed.netloc.rsplit("@", 1)[-1]
+    return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
 
 
 def _normalize_git_url(body: PublishBody | UpdateBody | VersionBody) -> None:
-    """Strip userinfo from ``body.git_url`` in place, before anything uses it."""
+    """Scrub ``body.git_url`` in place, before anything uses it.
+
+    Runs before validation, cloning, storage and every response, so no route
+    ever sees the userinfo, query or fragment the caller submitted.
+    """
     if body.git_url is not None:
         body.git_url = strip_git_userinfo(str(body.git_url))
 
@@ -2875,8 +3013,10 @@ def context(request: Request) -> dict:
                 "exactly one of html, markdown, git_url",
                 "git_ref, git_path, git_token and git_username are only valid "
                 "together with git_url (422 otherwise)",
-                "userinfo in git_url (https://user:pass@host/...) is stripped "
-                "before the URL is validated, cloned, stored or returned",
+                "userinfo (https://user:pass@host/...), the query string and "
+                "the fragment are stripped from git_url before the URL is "
+                "validated, cloned, stored or returned — a clone URL needs "
+                "none of them, and each can carry a secret",
                 "PUT accepts the same fields, all optional, plus clear_password, "
                 "accept_versions/accept_versions_mode, contributors, "
                 "comments_mode and status; a title is only valid together "
@@ -2970,11 +3110,18 @@ def context(request: Request) -> dict:
                 "{'kind': 'guest', 'name': ...}."
             ),
             "comment_addressing": (
-                "The four comment-write routes accept either the internal "
-                "artifact id or the public share id in their path (internal "
+                "The four comment-write routes accept either the public share "
+                "id or the internal artifact id in their path (share id "
                 "first), because the review UI and every capability-URL "
-                "holder only ever saw the share id. Every other /api/* route "
-                "takes the internal id only."
+                "holder only ever saw the share id. The share id resolves "
+                "under the public rules, so a rotated-away link cannot write "
+                "either; the internal id works only for the artifact's own "
+                "owner. Every other /api/* route takes the internal id only."
+            ),
+            "comment_password_gate": (
+                "On a password-protected artifact, writing a comment needs "
+                "the same X-Artifact-Password header (or unlock cookie) that "
+                "reading it does — for guests and for the owner alike."
             ),
             "comment_rate_limit": (
                 f"{settings.max_comments_per_day} comments and replies per "
@@ -3130,6 +3277,12 @@ def context(request: Request) -> dict:
             "unlocks never count. An unlock cookie is bound to the password "
             "that issued it, so changing or clearing the password revokes "
             "every cookie immediately.",
+            "Guest invitation credentials (X-Artifact-Guest) are throttled "
+            "the same way and on the same budget size: after "
+            f"{settings.max_unlock_attempts_per_hour} rejected credentials "
+            "per artifact per client address per hour the answer is 429. "
+            "Verifying an invitation secret costs a full PBKDF2, so an "
+            "unthrottled public probe would be a CPU-exhaustion primitive.",
             "A version published from a private repository (one that needed "
             "git_token) reports git.private true in public metadata and "
             "history, and its git.url is withheld.",
@@ -3496,6 +3649,36 @@ def unlock_artifact(
     return response
 
 
+# Publisher-controlled HTML served as a *top-level* document, not inside the
+# wrapper page's sandboxed iframe. GET /a/{id} isolates artifact HTML with
+# <iframe sandbox="allow-scripts ..."> (no allow-same-origin), so its scripts
+# never touch the hub's origin. /raw and /source have no such wrapper, so the
+# equivalent isolation has to come from the response itself: the CSP `sandbox`
+# directive applies the very same sandbox flags to a top-level document,
+# dropping it into a unique opaque origin. That is what stops a malicious
+# artifact opened by a signed-in admin/reviewer from reading the hub-origin
+# sessionStorage where their Keboola Storage token lives, or its cookies.
+#
+# Deliberately WITHOUT allow-same-origin — granting it would hand the document
+# the hub's origin back and undo the whole protection.
+#
+# The body is never touched: machine clients (curl, fetch, agents) don't
+# execute JavaScript and ignore these headers, so they still get the exact
+# stored bytes.
+SANDBOX_CSP = "sandbox allow-scripts allow-popups allow-forms allow-downloads"
+
+
+def _sandboxed_html(html: str) -> HTMLResponse:
+    """Serve publisher HTML as an opaque-origin, non-sniffed document."""
+    return HTMLResponse(
+        html,
+        headers={
+            "Content-Security-Policy": SANDBOX_CSP,
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @app.get(
     "/a/{artifact_id}/raw",
     tags=["public"],
@@ -3506,6 +3689,14 @@ def unlock_artifact(
         "fallback — meant for machine consumption. These are the bytes GET "
         "/a/{id} embeds in its sandboxed iframe; served here unwrapped, so "
         "anything that renders them does so in its own context.\n\n"
+        "Because this is publisher-controlled HTML served as a top-level "
+        "document, the response carries `Content-Security-Policy: sandbox "
+        "allow-scripts allow-popups allow-forms allow-downloads` (plus "
+        "`X-Content-Type-Options: nosniff`). A browser therefore renders it in "
+        "a unique opaque origin — the same isolation the wrapper page gets "
+        "from its sandboxed iframe — so artifact scripts cannot reach hub "
+        "origin storage or cookies. Machine clients ignore these headers and "
+        "receive the exact stored bytes, unchanged.\n\n"
         + PASSWORD_GATE_NOTE
         + "\n\nA protected "
         "artifact without a valid password answers 401 as JSON, never as a "
@@ -3546,7 +3737,7 @@ def read_raw(
     if envelope is None:
         return _not_found(public_id)
     _record_view(request.app, meta.id, "raw")
-    return HTMLResponse(envelope.html)
+    return _sandboxed_html(envelope.html)
 
 
 @app.get(
@@ -3558,7 +3749,16 @@ def read_raw(
         "markdown-sourced artifacts, or the original HTML (as text/html) for "
         "html and git-html artifacts. Markdown rendered from a git repository "
         "has no retained source: that answers 404 with a JSON pointer back to "
-        "the repository, ref and commit.\n\n" + PASSWORD_GATE_NOTE
+        "the repository, ref and commit.\n\n"
+        "The HTML answer is publisher-controlled markup served as a top-level "
+        "document, so — exactly like /a/{id}/raw — it carries "
+        "`Content-Security-Policy: sandbox allow-scripts allow-popups "
+        "allow-forms allow-downloads` and `X-Content-Type-Options: nosniff`. "
+        "Browsers render it in a unique opaque origin (the isolation the "
+        "wrapper page gets from its sandboxed iframe), while machine clients "
+        "ignore the headers and receive the exact stored bytes. The Markdown "
+        "answer is not executable and is served without that CSP.\n\n"
+        + PASSWORD_GATE_NOTE
     ),
     responses={
         200: {
@@ -3607,7 +3807,9 @@ def read_source(
         )
     if envelope.source_type in ("html", "git-html"):
         _record_view(request.app, meta.id, "source")
-        return HTMLResponse(envelope.html)
+        # Executable publisher HTML at top level — same opaque-origin sandbox
+        # as /raw. (The Markdown branch above needs none: it is inert text.)
+        return _sandboxed_html(envelope.html)
     return JSONResponse(
         status_code=404,
         content={
@@ -4203,7 +4405,10 @@ def export_vault(
         "the (non-secret) invitation id.\n\n"
         "A missing, malformed, revoked or wrong credential all answer the same "
         "401, deliberately: telling them apart would make this an oracle over "
-        "somebody else's invitation."
+        "somebody else's invitation. Checking a credential runs a full PBKDF2, "
+        "so *failed* checks are rate-limited per artifact and client address "
+        "the way failed passwords are — grinding secrets against a known "
+        "invitation id answers 429, not 401."
     ),
     responses={
         200: {
@@ -4218,7 +4423,7 @@ def export_vault(
             )
         },
         404: RESP_NOT_FOUND,
-        429: RESP_UNLOCK_429,
+        429: RESP_GUEST_429,
         502: RESP_HUB_502,
     },
 )
@@ -4245,7 +4450,7 @@ def guest_identity(
                 f"{GUEST_HEADER} header, shaped '{{invitation_id}}.{{secret}}'"
             ),
         )
-    invitation = _verify_guest(meta, credential)
+    invitation = _verify_guest_checked(request, meta, credential)
     return JSONResponse(
         {
             "id": meta.share_id,
@@ -4889,7 +5094,10 @@ def restore_artifact(
                 "the token, the hub's own Storage is unavailable, or the "
                 "delete only partially succeeded — some stored files could "
                 "not be removed, so the artifact is still readable and the "
-                "call must be retried."
+                "call must be retried. The same 502 covers a partial comment "
+                "erasure: the artifact went, but at least one comment thread "
+                "still has files in Storage ('comment_threads_failed' says "
+                "how many); retry the purge to finish the job."
             )
         },
     },
@@ -4931,7 +5139,32 @@ def purge_artifact(
         )
     # Comment threads live in their own files; without this they would outlive
     # the artifact as orphaned Storage files nothing can ever reach again.
-    threads = request.app.state.comments.delete_all_for(artifact_id)
+    threads, failed_threads = request.app.state.comments.delete_all_for(artifact_id)
+    if failed_threads:
+        # Same honesty rule as the artifact files above: some comment files are
+        # still in Storage, so the erasure the owner asked for did not fully
+        # happen. Reporting success would tell them a discussion is gone while
+        # it is still readable by anything that can reach those files.
+        logger.error(
+            "Partial purge of artifact %s: %d comment thread(s) still have "
+            "Storage files",
+            artifact_id,
+            failed_threads,
+        )
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "comment threads not fully deleted",
+                "detail": (
+                    f"The artifact was erased, but {failed_threads} of its "
+                    "comment threads could not be: some stored comment files "
+                    "remain. Retry the purge to finish erasing them."
+                ),
+                "id": artifact_id,
+                "comment_threads_deleted": threads,
+                "comment_threads_failed": failed_threads,
+            },
+        )
     # Same reasoning for the state sidecar: view rows and rate-limit counters
     # keyed by this artifact have nothing left to describe. Best effort — a
     # sidecar failure must not turn a completed purge into an error.
@@ -5937,6 +6170,27 @@ def _comment_writer(request: Request) -> tuple[Owner | None, tuple[str, str] | N
     return owner, None
 
 
+def _comment_gate(request: Request, meta: ArtifactMeta) -> JSONResponse | None:
+    """The reader gate a comment write must clear, or ``None`` when it did.
+
+    The review surface of a password-protected artifact is part of that
+    artifact: ``GET /a/{id}/comments`` needs the password to be read, and
+    ``GET /a/{id}/guest`` already says in so many words that an invitation is
+    a grant to comment, *not* a way around the reader password. Writing was
+    the hole — a guest credential alone let somebody read and write the whole
+    discussion of a protected document.
+
+    The policy is exactly the read policy of ``/a/{id}/raw``: the password (or
+    an unlock cookie) is required from *everyone*, with no exemption for a
+    token-authenticated owner, because the read path grants none either. It
+    answers the read path's 401, and ``reader_allowed`` itself raises the
+    read path's 429 once the failed-attempt budget is spent.
+    """
+    if reader_allowed(meta, request):
+        return None
+    return _password_required()
+
+
 def _comment_author(
     caller: Owner | None, invitation: dict | None
 ) -> tuple[dict, str]:
@@ -5990,7 +6244,7 @@ def _may_moderate_thread(
         "'anyone' (the default); 'allowlist' restricts it to the artifact's "
         "contributors and 'off' closes it. The owner may always comment "
         "unless the artifact is final.\n\n" + GUEST_WRITE_NOTE + "\n\n"
-        + COMMENT_TARGET_NOTE
+        + COMMENT_PASSWORD_NOTE + "\n\n" + COMMENT_TARGET_NOTE
     ),
     responses={
         201: {
@@ -6031,10 +6285,15 @@ def create_comment(
 ) -> Response:
     """Open a thread anchored to a quoted passage of one version."""
     caller, credential = _comment_writer(request)
-    meta = _comment_target_of(request, artifact_id)
+    meta = _comment_target_of(request, artifact_id, caller)
     if meta is None:
         return _not_found(artifact_id)
-    invitation = _verify_guest(meta, credential) if credential else None
+    locked = _comment_gate(request, meta)
+    if locked is not None:
+        return locked
+    invitation = (
+        _verify_guest_checked(request, meta, credential) if credential else None
+    )
 
     if meta.is_frozen():
         return _document_frozen(meta, "new comments")
@@ -6098,7 +6357,7 @@ def create_comment(
         "thread applies: 'comments_mode' decides who may write, the owner may "
         "always reply unless the artifact is final, and replies count against "
         "the same per-project daily cap.\n\n" + GUEST_WRITE_NOTE + "\n\n"
-        + COMMENT_TARGET_NOTE
+        + COMMENT_PASSWORD_NOTE + "\n\n" + COMMENT_TARGET_NOTE
     ),
     responses={
         201: {
@@ -6135,10 +6394,15 @@ def reply_to_comment(
 ) -> Response:
     """Append one reply to an existing thread."""
     caller, credential = _comment_writer(request)
-    meta = _comment_target_of(request, artifact_id)
+    meta = _comment_target_of(request, artifact_id, caller)
     if meta is None:
         return _not_found(artifact_id)
-    invitation = _verify_guest(meta, credential) if credential else None
+    locked = _comment_gate(request, meta)
+    if locked is not None:
+        return locked
+    invitation = (
+        _verify_guest_checked(request, meta, credential) if credential else None
+    )
 
     if meta.is_frozen():
         return _document_frozen(meta, "new comments")
@@ -6194,7 +6458,7 @@ def reply_to_comment(
         "A guest (X-Artifact-Guest) may resolve and reopen the threads they "
         "opened themselves, and only those — an invitation never carries "
         "moderation authority over anybody else's thread.\n\n"
-        + COMMENT_TARGET_NOTE
+        + COMMENT_PASSWORD_NOTE + "\n\n" + COMMENT_TARGET_NOTE
     ),
     responses={
         200: {
@@ -6218,6 +6482,7 @@ def reply_to_comment(
                 "reopening)."
             )
         },
+        429: RESP_COMMENT_MOD_429,
         502: {
             "description": (
                 "The caller's Keboola stack could not be reached to verify "
@@ -6234,10 +6499,15 @@ def resolve_comment(
 ) -> Response:
     """Owner or thread author closes a thread — or reopens it."""
     caller, credential = _comment_writer(request)
-    meta = _comment_target_of(request, artifact_id)
+    meta = _comment_target_of(request, artifact_id, caller)
     if meta is None:
         return _not_found(artifact_id)
-    invitation = _verify_guest(meta, credential) if credential else None
+    locked = _comment_gate(request, meta)
+    if locked is not None:
+        return locked
+    invitation = (
+        _verify_guest_checked(request, meta, credential) if credential else None
+    )
 
     comments = request.app.state.comments
     thread = comments.get(meta.id, thread_id)
@@ -6290,7 +6560,8 @@ def resolve_comment(
         "artifact owner (moderation) and to the thread's own author "
         "(withdrawing a comment); anyone else gets a 403. Irreversible.\n\n"
         "A guest (X-Artifact-Guest) may withdraw the threads they opened "
-        "themselves, and only those.\n\n" + COMMENT_TARGET_NOTE
+        "themselves, and only those.\n\n"
+        + COMMENT_PASSWORD_NOTE + "\n\n" + COMMENT_TARGET_NOTE
     ),
     responses={
         200: {"description": "Thread deleted."},
@@ -6303,10 +6574,14 @@ def resolve_comment(
             )
         },
         404: RESP_THREAD_404,
+        429: RESP_COMMENT_MOD_429,
         502: {
             "description": (
                 "The caller's Keboola stack could not be reached to verify "
-                "the token, or the hub's own Storage is unavailable."
+                "the token, the hub's own Storage is unavailable, or the "
+                "delete only partially succeeded — some stored files of the "
+                "thread could not be removed, so it is still readable and the "
+                "call must be retried."
             )
         },
     },
@@ -6318,10 +6593,15 @@ def delete_comment(
 ) -> Response:
     """Owner moderates, or an author withdraws their own thread."""
     caller, credential = _comment_writer(request)
-    meta = _comment_target_of(request, artifact_id)
+    meta = _comment_target_of(request, artifact_id, caller)
     if meta is None:
         return _not_found(artifact_id)
-    invitation = _verify_guest(meta, credential) if credential else None
+    locked = _comment_gate(request, meta)
+    if locked is not None:
+        return locked
+    invitation = (
+        _verify_guest_checked(request, meta, credential) if credential else None
+    )
 
     comments = request.app.state.comments
     thread = comments.get(meta.id, thread_id)
@@ -6337,7 +6617,32 @@ def delete_comment(
             ),
         )
 
-    comments.delete(meta.id, thread_id)
+    if not comments.delete(meta.id, thread_id):
+        # delete() reports False both when nothing matched and when a backend
+        # delete failed with files left behind. Re-reading tells the two apart:
+        # a failed erasure keeps the thread listable, a concurrent delete does
+        # not. Claiming "deleted" over a thread that is still readable is the
+        # one answer this route must never give.
+        if comments.get(meta.id, thread_id) is None:
+            return _thread_not_found(artifact_id, thread_id)
+        logger.error(
+            "Partial delete of comment thread %s of artifact %s: some Storage "
+            "files remain",
+            thread_id,
+            meta.id,
+        )
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "comment thread not fully deleted",
+                "detail": (
+                    "Some stored files of this comment thread could not be "
+                    "removed; the thread is still readable. Retry the delete."
+                ),
+                "id": artifact_id,
+                "thread_id": thread_id,
+            },
+        )
     _, writer_key = _comment_author(caller, invitation)
     logger.info(
         "Deleted comment thread %s of artifact %s (by %s)",

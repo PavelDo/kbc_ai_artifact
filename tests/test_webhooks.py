@@ -51,6 +51,9 @@ def make_dispatcher(statuses: list, *, max_attempts: int = 3):
     slept: list[float] = []
     dispatcher._post = recorder
     dispatcher._sleep = slept.append
+    # Never touch real DNS in tests: default the delivery-time SSRF guard to a
+    # public answer. Cases that care about rebinding override this per test.
+    dispatcher._resolver = lambda _hostname: ["93.184.216.34"]
     return dispatcher, recorder, slept
 
 
@@ -301,6 +304,93 @@ class TestValidateWebhookUrl:
     def test_rejects_a_url_without_a_hostname(self) -> None:
         with pytest.raises(ValueError):
             validate_webhook_url("https:///hook", resolver=self.public)
+
+
+class TestDeliveryTimeSsrfGuard:
+    """A host that rebinds to a private address between registration and
+    delivery must be caught at delivery, not only at registration."""
+
+    @staticmethod
+    def public(_hostname: str) -> list[str]:
+        return ["93.184.216.34"]
+
+    @staticmethod
+    def private(_hostname: str) -> list[str]:
+        return ["10.0.0.5"]
+
+    def test_rebinding_to_a_private_ip_drops_the_delivery(self) -> None:
+        # Public at registration...
+        assert validate_webhook_url(HOOK_URL, resolver=self.public) == HOOK_URL
+
+        dispatcher, recorder, _ = make_dispatcher([200])
+        # ...private at delivery time.
+        dispatcher._resolver = self.private
+
+        dispatcher.emit([HOOK_URL], an_event())
+        # The item is processed (counted) but never actually POSTed.
+        assert dispatcher.drain() == 1
+        assert recorder.posts == []
+
+    def test_public_at_delivery_still_posts(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher._resolver = self.public
+
+        dispatcher.emit([HOOK_URL], an_event())
+        assert dispatcher.drain() == 1
+        assert len(recorder.posts) == 1
+
+    def test_rebinding_is_re_checked_on_every_retry(self) -> None:
+        # Public on the first attempt, private on the retry: the retry must be
+        # dropped even though the first POST already went out.
+        answers = iter([self.public("h"), self.private("h")])
+        dispatcher, recorder, _ = make_dispatcher([500, 200])
+        dispatcher._resolver = lambda _h: next(answers)
+
+        dispatcher.emit([HOOK_URL], an_event())
+        dispatcher.drain()
+
+        # First attempt posted (got 500), second attempt blocked before posting.
+        assert len(recorder.posts) == 1
+
+    def test_metadata_hostname_is_dropped_at_delivery(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher._resolver = self.public  # would be public, but host is blocked
+
+        dispatcher.emit(["https://metadata.google.internal/x"], an_event())
+        dispatcher.drain()
+
+        assert recorder.posts == []
+
+    def test_http_post_disables_redirects(self, monkeypatch) -> None:
+        captured: dict = {}
+
+        class _FakeResponse:
+            status_code = 204
+
+        class _FakeClient:
+            def __init__(self, **kwargs) -> None:
+                captured.update(kwargs)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc) -> bool:
+                return False
+
+            def post(self, url, content, headers):
+                return _FakeResponse()
+
+        import src.webhooks as webhooks_module
+
+        monkeypatch.setattr(webhooks_module.httpx, "Client", _FakeClient)
+
+        dispatcher = WebhookDispatcher(
+            timeout_s=5, max_attempts=1, sign_secret=SECRET
+        )
+        status = dispatcher._http_post(HOOK_URL, b"{}", {})
+
+        assert status == 204
+        assert captured.get("follow_redirects") is False
 
 
 class TestLifecycle:

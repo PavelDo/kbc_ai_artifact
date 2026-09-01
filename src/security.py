@@ -22,10 +22,42 @@ PBKDF2_ITERATIONS = 200_000
 _COOKIE_SALT = "artifact-unlock"
 _SALT_BYTES = 16
 
+#: Domain-separation labels for :func:`derive_key`. One per consumer of the
+#: master secret; they are part of the wire protocol (changing one invalidates
+#: everything signed under the old label), so they live here as constants.
+KEY_LABEL_UNLOCK_COOKIE = "artifact-unlock-cookie"
+KEY_LABEL_WEBHOOK = "webhook-signature"
+
 
 def new_artifact_id() -> str:
     """Generate a new unguessable artifact ID."""
     return secrets.token_urlsafe(18)
+
+
+def derive_key(secret: str, label: str) -> str:
+    """Derive a labeled subkey from the master secret: HMAC-SHA256(secret, label).
+
+    Domain separation. ``HUB_SECRET_KEY`` is one configured secret, but it
+    backs two *different* trust domains:
+
+    * unlock cookies, which only the hub may mint and verify, and
+    * webhook signatures, which every receiver necessarily learns in order to
+      verify a delivery.
+
+    Handing both consumers the same key collapses those domains into a single
+    signing authority: a webhook receiver could forge an unlock cookie for any
+    artifact (for an unprotected one the cookie scope is the literal ``open``
+    value, so nothing about it is secret). Giving each consumer its own key
+    derived under a distinct ``label`` keeps a compromise of one from
+    conferring anything in the other — the derived keys are independent, and
+    neither reveals the master secret.
+
+    Returns the digest as lowercase hex, so the result is a plain ``str``
+    usable anywhere the raw secret was.
+    """
+    return hmac.new(
+        secret.encode("utf-8"), label.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
 
 
 def hash_password(password: str) -> dict:

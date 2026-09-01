@@ -1,6 +1,8 @@
 """Tests for src.store: envelopes, meta records and the versioned store."""
 
 import json
+import os
+import stat
 import threading
 
 import pytest
@@ -894,6 +896,23 @@ class TestDiskCache:
         head = fresh.get_head("abc123")
         assert head is not None
         assert head.title == "Test Artifact v1"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file-mode semantics only")
+class TestCachePermissions:
+    """The disk cache holds password/webhook secrets; it must be owner-only."""
+
+    def test_cache_dir_is_0700_and_files_are_0600(self, tmp_store, tmp_path):
+        tmp_store.create(_make_meta(), _make_envelope())
+        assert tmp_store.get_head("abc123") is not None
+        cache_dir = tmp_path / "cache"
+
+        assert stat.S_IMODE(cache_dir.stat().st_mode) == 0o700
+
+        cached = list(cache_dir.glob("abc123-*.json"))
+        assert cached, "expected an artifact cache file to have been written"
+        for path in cached:
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 # --------------------------------------------------------------------------

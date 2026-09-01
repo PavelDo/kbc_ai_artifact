@@ -45,6 +45,12 @@ from src.builder import BuiltArtifact
 from src.comments import CommentStore
 from src.config import load_settings
 from src.kbc import BackendError, InMemoryFilesBackend
+from src.security import (
+    KEY_LABEL_UNLOCK_COOKIE,
+    KEY_LABEL_WEBHOOK,
+    CookieSigner,
+    derive_key,
+)
 from src.statedb import StateDB
 from src.store import ArtifactStore
 
@@ -766,6 +772,59 @@ def test_source_returns_original_markdown(api: Api) -> None:
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/markdown")
     assert resp.text == md
+
+
+def test_raw_carries_opaque_origin_sandbox_csp(api: Api) -> None:
+    """Top-level publisher HTML must land in an opaque origin, not the hub's."""
+    artifact_id = _publish_markdown(api, "# Sandboxed")
+    raw = api.client.get(f"/a/{artifact_id}/raw")
+    assert raw.status_code == 200
+    csp = raw.headers["content-security-policy"]
+    assert "sandbox" in csp
+    assert "allow-scripts" in csp
+    # allow-same-origin would hand the document the hub origin back and undo
+    # the isolation entirely.
+    assert "allow-same-origin" not in csp
+    assert raw.headers["x-content-type-options"] == "nosniff"
+
+
+def test_source_html_branch_carries_sandbox_csp(api: Api) -> None:
+    html_doc = "<html><body><h1>Hi</h1></body></html>"
+    resp = api.client.post(
+        "/api/artifacts", json={"html": html_doc}, headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 201
+    artifact_id = resp.json()["id"]
+    source = api.client.get(f"/a/{artifact_id}/source")
+    assert source.status_code == 200
+    csp = source.headers["content-security-policy"]
+    assert "sandbox" in csp
+    assert "allow-same-origin" not in csp
+    assert source.headers["x-content-type-options"] == "nosniff"
+
+
+def test_source_markdown_branch_has_no_sandbox_csp(api: Api) -> None:
+    """Markdown is inert text — it gets no sandbox CSP and stays text/markdown."""
+    artifact_id = _publish_markdown(api, "# Plain\n\ntext")
+    resp = api.client.get(f"/a/{artifact_id}/source")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/markdown")
+    assert "content-security-policy" not in resp.headers
+
+
+def test_sandbox_headers_do_not_alter_raw_bytes(api: Api) -> None:
+    """Headers only: the body stays byte-identical to what was published."""
+    html_doc = "<html><body><h1>Exact</h1><script>void 0;</script></body></html>"
+    resp = api.client.post(
+        "/api/artifacts", json={"html": html_doc}, headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 201
+    artifact_id = resp.json()["id"]
+    raw = api.client.get(f"/a/{artifact_id}/raw")
+    assert raw.status_code == 200
+    assert raw.content == html_doc.encode()
+    source = api.client.get(f"/a/{artifact_id}/source")
+    assert source.content == html_doc.encode()
 
 
 def test_meta_public_shape_has_no_owner_or_password(api: Api) -> None:
@@ -2096,6 +2155,95 @@ def test_trashing_an_artifact_keeps_its_comment_threads(api: Api) -> None:
     assert len(threads) == 1
 
 
+class _DeleteFailingBackend:
+    """Delegates everything to an inner backend, but never deletes.
+
+    Simulates Storage refusing to remove a file: the delete raises, the file
+    stays, and anything that claimed "deleted" would be claiming erasure over
+    content that is still readable.
+    """
+
+    def __init__(self, inner: InMemoryFilesBackend) -> None:
+        self._inner = inner
+
+    def upload(self, name: str, content: bytes, tags: list[str]) -> int:
+        return self._inner.upload(name, content, tags)
+
+    def search_by_tag(self, tag: str):
+        return self._inner.search_by_tag(tag)
+
+    def download(self, file_id: int) -> bytes:
+        return self._inner.download(file_id)
+
+    def delete(self, file_id: int) -> None:
+        raise BackendError("simulated Storage failure")
+
+
+def _break_comment_deletes(api: Api, monkeypatch, tmp_path) -> None:
+    """Point the app's CommentStore at a backend whose deletes always fail.
+
+    Only the comment store is swapped, so the artifact's own files still
+    delete normally — exactly the partial-erasure shape the 502 exists for.
+    """
+    monkeypatch.setattr(
+        main.app.state,
+        "comments",
+        CommentStore(
+            _DeleteFailingBackend(api.backend),
+            tmp_path / "broken-comment-cache",
+            api.settings.cache_max_entries,
+        ),
+    )
+
+
+def test_purge_is_502_when_comment_threads_cannot_be_erased(
+    api: Api, monkeypatch, tmp_path
+) -> None:
+    """Partial comment erasure must not be reported as a completed purge."""
+    artifact_id = _publish_markdown(api, "# One")
+    assert _comment(api, artifact_id, exact="One").status_code == 201
+    _break_comment_deletes(api, monkeypatch, tmp_path)
+
+    resp = api.client.delete(
+        f"/api/artifacts/{artifact_id}/purge", headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 502, resp.text
+    body = resp.json()
+    assert body["error"] == "comment threads not fully deleted"
+    assert body["id"] == artifact_id
+    assert body["comment_threads_deleted"] == 0
+    assert body["comment_threads_failed"] == 1
+    assert "deleted" not in body or body.get("deleted") is not True
+
+    # The 502 is not cosmetic: the thread really is still in Storage.
+    assert len(main.app.state.comments.list_for(artifact_id)) == 1
+
+
+def test_deleting_a_comment_thread_is_502_when_its_files_remain(
+    api: Api, monkeypatch, tmp_path
+) -> None:
+    """A failed backend delete is a 502, not a 404 and not a false success."""
+    artifact_id = _publish_markdown(api, "# One")
+    created = _comment(api, artifact_id, exact="One")
+    assert created.status_code == 201
+    thread_id = created.json()["thread_id"]
+    _break_comment_deletes(api, monkeypatch, tmp_path)
+
+    resp = api.client.delete(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}", headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 502, resp.text
+    body = resp.json()
+    assert body["error"] == "comment thread not fully deleted"
+    assert body["thread_id"] == thread_id
+    assert body["id"] == artifact_id
+
+    # Still readable — which is why a 200 or a 404 would both have been lies.
+    assert main.app.state.comments.get(artifact_id, thread_id) is not None
+    threads = api.client.get(f"/a/{artifact_id}/comments").json()["threads"]
+    assert [thread["id"] for thread in threads] == [thread_id]
+
+
 # --------------------------------------------------------------------------
 # Final status
 # --------------------------------------------------------------------------
@@ -2359,6 +2507,42 @@ def test_comment_threads_survive_a_restart(api: Api, tmp_path) -> None:
 # --------------------------------------------------------------------------
 # Hardening: unlock-cookie revocation and password-attempt throttling
 # --------------------------------------------------------------------------
+
+
+def test_unlock_cookies_are_signed_with_a_derived_key_not_the_raw_secret(
+    api: Api,
+) -> None:
+    """The webhook key must not double as the unlock-cookie key (val-v070).
+
+    A webhook receiver necessarily learns the key its signatures are keyed
+    with. When that was the raw HUB_SECRET_KEY it was also the cookie key, so
+    the receiver could mint an unlock cookie for any artifact.
+    """
+    artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
+    unlocked = api.client.post(
+        f"/a/{artifact_id}/unlock",
+        data={"password": "hunter2"},
+        follow_redirects=False,
+    )
+    assert unlocked.status_code == 303
+    meta = main.app.state.store.get_meta(artifact_id)
+    cookie = api.client.cookies[main.unlock_cookie_name(meta)]
+    scope = main.password_scope(meta)
+
+    secret = api.settings.secret_key
+    cookie_signer = CookieSigner(derive_key(secret, KEY_LABEL_UNLOCK_COOKIE))
+    assert cookie_signer.check(artifact_id, cookie, 3600, scope) is True
+
+    # Neither the raw secret nor the webhook key can verify or forge one.
+    for foreign in (
+        CookieSigner(secret),
+        CookieSigner(derive_key(secret, KEY_LABEL_WEBHOOK)),
+    ):
+        assert foreign.check(artifact_id, cookie, 3600, scope) is False
+        api.client.cookies.set(
+            main.unlock_cookie_name(meta), foreign.make(artifact_id, scope)
+        )
+        assert api.client.get(f"/a/{artifact_id}").status_code == 401
 
 
 def test_unlock_cookie_is_revoked_by_a_password_change(api: Api) -> None:
@@ -2627,6 +2811,66 @@ def test_update_and_version_strip_userinfo_from_the_git_url(
     assert captured["git_url"] == "https://gitlab.com/org/other"
     assert "tok3n" not in submitted.text
     assert "tok3n" not in api.client.get(f"/a/{artifact_id}/versions").text
+
+
+def test_git_url_query_and_fragment_are_stripped_everywhere(
+    api: Api, monkeypatch
+) -> None:
+    """A secret hides in ?token= just as well as in the userinfo (val-v070)."""
+    captured = _stub_build_from_git(monkeypatch)
+    resp = api.client.post(
+        "/api/artifacts",
+        json={"git_url": "https://user:pass@github.com/org/repo?token=SECRET#frag"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+
+    # Nothing credential-bearing reaches the builder, the clone, or storage.
+    assert captured["git_url"] == "https://github.com/org/repo"
+
+    artifact_id = resp.json()["id"]
+    envelope = main.app.state.store.get_head(artifact_id)
+    assert envelope is not None
+    assert envelope.source["git"]["url"] == "https://github.com/org/repo"
+    stored = envelope.to_json().decode("utf-8")
+    assert "SECRET" not in stored
+    assert "pass" not in stored
+
+    # ...nor any response: the publish echo or the public git provenance.
+    for text in (
+        resp.text,
+        api.client.get(f"/a/{artifact_id}/meta").text,
+        api.client.get(f"/a/{artifact_id}/versions").text,
+    ):
+        assert "SECRET" not in text
+        assert "pass" not in text
+        assert "frag" not in text
+
+
+def test_update_and_version_strip_the_git_url_query_and_fragment(
+    api: Api, monkeypatch
+) -> None:
+    captured = _stub_build_from_git(monkeypatch)
+    artifact_id = _publish_markdown(api, "# One")
+
+    updated = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"git_url": "https://gitlab.com/org/repo?token=SECRET#frag"},
+        headers=AUTH_HEADERS,
+    )
+    assert updated.status_code == 200, updated.text
+    assert captured["git_url"] == "https://gitlab.com/org/repo"
+    assert "SECRET" not in updated.text
+
+    submitted = api.client.post(
+        f"/api/artifacts/{artifact_id}/versions",
+        json={"git_url": "https://gitlab.com/org/other?token=SECRET"},
+        headers=AUTH_HEADERS,
+    )
+    assert submitted.status_code == 201, submitted.text
+    assert captured["git_url"] == "https://gitlab.com/org/other"
+    assert "SECRET" not in submitted.text
+    assert "SECRET" not in api.client.get(f"/a/{artifact_id}/versions").text
 
 
 def test_private_git_url_is_withheld_from_public_metadata(
@@ -3578,9 +3822,11 @@ def test_webhook_delivers_a_signed_event_for_a_submitted_version(hooked) -> None
     assert payload["version"] == 2
     assert payload["actor"] == "Other"
     assert payload["url"] == f"https://testserver/a/{artifact_id}"
-    # Signed with the hub's secret, over the exact bytes sent.
+    # Signed with the webhook-specific derived key — never the raw master
+    # secret, which also backs the unlock cookies (see security.derive_key).
+    webhook_key = derive_key(api.settings.secret_key, KEY_LABEL_WEBHOOK)
     expected = hmac.new(
-        api.settings.secret_key.encode("utf-8"), body, hashlib.sha256
+        webhook_key.encode("utf-8"), body, hashlib.sha256
     ).hexdigest()
     assert headers["X-Hub-Signature-256"] == f"sha256={expected}"
     # And nothing secret rode along.
@@ -4124,9 +4370,16 @@ def test_guest_is_frozen_out_of_a_final_or_trashed_artifact(api: Api) -> None:
 
     assert _policy(api, artifact_id, status="draft").status_code == 200
     assert _trash(api, artifact_id).status_code == 200
+    # A guest addresses the artifact by its *public* identifier, and a trashed
+    # artifact does not resolve publicly at all — GET /a/{id}/comments and the
+    # review page it lives in are already 404 here. So the guest sees the same
+    # 404 the rest of the public surface shows, not the owner-facing 409; the
+    # owner, addressing it by the internal id, still gets "document is trashed".
     binned = _guest_comment(api, artifact_id, guest)
-    assert binned.status_code == 409
-    assert binned.json()["error"] == "document is trashed"
+    assert binned.status_code == 404
+    owner_view = _comment(api, artifact_id, exact="Body text")
+    assert owner_view.status_code == 409
+    assert owner_view.json()["error"] == "document is trashed"
 
 
 def test_comments_mode_does_not_gate_a_guest(api: Api) -> None:
@@ -4356,6 +4609,137 @@ def test_guest_comments_through_the_share_id(api: Api) -> None:
     created = _guest_comment(api, share_id, guest)
     assert created.status_code == 201, created.text
     assert created.json()["author"] == {"kind": "guest", "name": "Jana"}
+
+
+# --------------------------------------------------------------------------
+# Comment writes: the password gate, link rotation, and the guest KDF budget
+#
+# The four comment-write routes verified *who* is writing but not whether that
+# writer may see the artifact at all. These tests pin the three consequences.
+# --------------------------------------------------------------------------
+
+
+def test_guest_comment_writes_need_the_reader_password(api: Api) -> None:
+    """An invitation is a grant to comment, never a way past the password.
+
+    GET /a/{id}/guest has always said exactly this; the write routes used to
+    disagree, which handed anyone holding an invitation link the whole review
+    surface — read and write — of a password-protected document.
+    """
+    artifact_id = _publish_markdown(
+        api, "# Secret\n\nBody text here.", password="hunter2"
+    )
+    review_url = _invite(api, artifact_id, "Jana").json()["review_url"]
+    share_id = review_url.split("/a/", 1)[1].split("/", 1)[0]
+    guest = _guest_headers(review_url)
+    unlocked = {**guest, "X-Artifact-Password": "hunter2"}
+
+    locked = _guest_comment(api, share_id, guest)
+    assert locked.status_code == 401
+    assert locked.json()["error"] == "password required"
+
+    created = _guest_comment(api, share_id, unlocked)
+    assert created.status_code == 201, created.text
+    thread_id = created.json()["id"]
+
+    # ...and so is every later write on the thread the guest opened.
+    replies = f"/api/artifacts/{share_id}/comments/{thread_id}/replies"
+    assert api.client.post(
+        replies, json={"body": "Still me."}, headers=guest
+    ).status_code == 401
+    assert api.client.post(
+        replies, json={"body": "Still me."}, headers=unlocked
+    ).status_code == 201
+
+    resolve = f"/api/artifacts/{share_id}/comments/{thread_id}/resolve"
+    assert api.client.post(resolve, headers=guest).status_code == 401
+    assert api.client.post(resolve, headers=unlocked).status_code == 200
+
+    thread = f"/api/artifacts/{share_id}/comments/{thread_id}"
+    assert api.client.delete(thread, headers=guest).status_code == 401
+    assert api.client.delete(thread, headers=unlocked).status_code == 200
+
+
+def test_comment_password_gate_grants_the_owner_no_exemption(api: Api) -> None:
+    """The write gate is the read gate, verbatim — and /a/{id}/raw exempts nobody."""
+    artifact_id = _publish_markdown(
+        api, "# Secret\n\nBody text here.", password="hunter2"
+    )
+    assert _comment(api, artifact_id, exact="Body text").status_code == 401
+
+    unlocked = {**AUTH_HEADERS, "X-Artifact-Password": "hunter2"}
+    assert _comment(
+        api, artifact_id, exact="Body text", headers=unlocked
+    ).status_code == 201
+
+
+def test_rotating_the_link_revokes_comment_writes_through_the_old_id(
+    api: Api,
+) -> None:
+    """Rotation is revocation for writes too, not only for reads.
+
+    A fresh artifact's share id *is* its internal id, so resolving the path by
+    internal id first quietly kept the original public identifier alive for
+    comment writes forever — and rotating the link after a review URL leaked
+    revoked nothing.
+    """
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    review_url = _invite(api, artifact_id, "Jana").json()["review_url"]
+    guest = _guest_headers(review_url)
+    stale = review_url.split("/a/", 1)[1].split("/", 1)[0]
+    assert stale == artifact_id, "the share id starts out equal to the internal id"
+
+    fresh = _rotate(api, artifact_id).json()["share_id"]
+    assert fresh != stale
+
+    # The leaked link is dead, for the guest and for any other project holding it.
+    assert _guest_comment(api, stale, guest).status_code == 404
+    assert _comment(
+        api, stale, exact="Body text", headers=OTHER_AUTH_HEADERS
+    ).status_code == 404
+
+    # The new share id is what everybody writes through now.
+    assert _guest_comment(api, fresh, guest).status_code == 201
+    assert _comment(
+        api, fresh, exact="Body text", headers=OTHER_AUTH_HEADERS
+    ).status_code == 201
+
+    # The internal id survives for the artifact's own owner: API ergonomics,
+    # with none of the public reach — an agent addresses what it published.
+    assert _comment(api, artifact_id, exact="Body text").status_code == 201
+
+
+def test_guest_credential_checks_are_throttled(api: Api, monkeypatch) -> None:
+    """Verifying an invitation costs a full PBKDF2, so failures are budgeted.
+
+    Without this, a known invitation id on the public GET /a/{id}/guest is a
+    free CPU-exhaustion primitive: probes cost the hub 200k iterations each and
+    the prober nothing, and they do not even spend a comment slot.
+    """
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    review_url = _invite(api, artifact_id, "Jana").json()["review_url"]
+    guest = _guest_headers(review_url)
+    invitation_id = guest["X-Artifact-Guest"].split(".", 1)[0]
+    wrong = {"X-Artifact-Guest": f"{invitation_id}.not-the-secret"}
+    _low_unlock_limit(api, monkeypatch, limit=2)
+
+    assert api.client.get(f"/a/{artifact_id}/guest", headers=wrong).status_code == 401
+    # Successful checks never count, so the invited guest keeps working.
+    assert api.client.get(f"/a/{artifact_id}/guest", headers=guest).status_code == 200
+    assert _guest_comment(api, artifact_id, guest).status_code == 201
+
+    assert api.client.get(f"/a/{artifact_id}/guest", headers=wrong).status_code == 401
+    blocked = api.client.get(f"/a/{artifact_id}/guest", headers=wrong)
+    assert blocked.status_code == 429
+    assert "invitation" in blocked.json()["detail"]
+
+    # One budget covers every route that verifies a guest credential.
+    assert _guest_comment(api, artifact_id, wrong).status_code == 429
+
+    # Another client address has its own budget (X-Real-IP, as nginx sets it).
+    assert api.client.get(
+        f"/a/{artifact_id}/guest", headers={**wrong, "X-Real-IP": "10.0.0.9"}
+    ).status_code == 401
 
 
 # --------------------------------------------------------------------------

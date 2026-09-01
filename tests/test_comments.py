@@ -1,6 +1,8 @@
 """Tests for src.comments: threads, selectors and the comment store."""
 
 import json
+import os
+import stat
 
 import pytest
 
@@ -74,6 +76,19 @@ def _cold_store(backend, tmp_path, settings) -> CommentStore:
 
 def _files_tagged(backend, tag: str) -> list:
     return [info for info, _ in backend.files.values() if tag in info.tags]
+
+
+class _FailingDeleteBackend(InMemoryFilesBackend):
+    """In-memory backend whose delete raises for a chosen set of file ids."""
+
+    def __init__(self, fail_ids: set[int] | None = None) -> None:
+        super().__init__()
+        self.fail_ids: set[int] = set(fail_ids or set())
+
+    def delete(self, file_id: int) -> None:
+        if file_id in self.fail_ids:
+            raise BackendError(f"boom deleting {file_id}")
+        super().delete(file_id)
 
 
 # --------------------------------------------------------------------------
@@ -499,7 +514,7 @@ class TestDelete:
         cmt_store.create(_make_thread("t2"))
         cmt_store.create(_make_thread("t3", artifact_id="other"))
 
-        assert cmt_store.delete_all_for(ARTIFACT) == 2
+        assert cmt_store.delete_all_for(ARTIFACT) == (2, 0)
         assert cmt_store.list_for(ARTIFACT) == []
         # Only the other artifact's thread is left indexed...
         assert cmt_store.count() == 1
@@ -507,7 +522,7 @@ class TestDelete:
         assert len(_files_tagged(backend, tag_cmt_artifact("other"))) == 1
 
     def test_delete_all_for_unknown_artifact_is_zero(self, cmt_store):
-        assert cmt_store.delete_all_for("nothing-here") == 0
+        assert cmt_store.delete_all_for("nothing-here") == (0, 0)
 
     def test_delete_all_for_purges_the_disk_cache(self, cmt_store, tmp_path):
         cmt_store.create(_make_thread("t1"))
@@ -515,6 +530,66 @@ class TestDelete:
         assert list(cache_dir.glob("cmt.*.json"))
         cmt_store.delete_all_for(ARTIFACT)
         assert list(cache_dir.glob("cmt.*.json")) == []
+
+    def test_delete_reports_false_when_the_backend_delete_fails(
+        self, tmp_path, settings
+    ):
+        """A failed backend delete must not be reported as a successful erase."""
+        backend = _FailingDeleteBackend()
+        store = CommentStore(
+            backend=backend,
+            cache_dir=tmp_path / "cache",
+            cache_max_entries=settings.cache_max_entries,
+        )
+        store.create(_make_thread("t1"))
+        # The thread's single file cannot be deleted.
+        file_id = _files_tagged(backend, tag_cmt_id("t1"))[0].id
+        backend.fail_ids.add(file_id)
+
+        assert store.delete(ARTIFACT, "t1") is False
+        # The file is still in Storage and the thread is still listable — no
+        # false erasure.
+        assert len(_files_tagged(backend, tag_cmt_id("t1"))) == 1
+        assert [t.id for t in store.list_for(ARTIFACT)] == ["t1"]
+
+    def test_delete_all_for_reports_failed_threads(self, tmp_path, settings):
+        """delete_all_for returns (deleted, failed) and keeps failed threads."""
+        backend = _FailingDeleteBackend()
+        store = CommentStore(
+            backend=backend,
+            cache_dir=tmp_path / "cache",
+            cache_max_entries=settings.cache_max_entries,
+        )
+        store.create(_make_thread("t1"))
+        store.create(_make_thread("t2"))
+        # t2's file will refuse to delete.
+        t2_file = _files_tagged(backend, tag_cmt_id("t2"))[0].id
+        backend.fail_ids.add(t2_file)
+
+        deleted, failed = store.delete_all_for(ARTIFACT)
+        assert (deleted, failed) == (1, 1)
+        # t1 is gone; t2 survives and stays listable for a retry.
+        assert _files_tagged(backend, tag_cmt_id("t1")) == []
+        assert [t.id for t in store.list_for(ARTIFACT)] == ["t2"]
+
+
+# --------------------------------------------------------------------------
+# disk-cache permissions (POSIX): plaintext-secret cache must be owner-only
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file-mode semantics only")
+class TestCachePermissions:
+    def test_cache_dir_is_0700_and_files_are_0600(self, cmt_store, tmp_path):
+        cmt_store.create(_make_thread("t1"))
+        cache_dir = tmp_path / "cache"
+
+        assert stat.S_IMODE(cache_dir.stat().st_mode) == 0o700
+
+        cached = list(cache_dir.glob("cmt.*.json"))
+        assert cached, "expected a comment cache file to have been written"
+        for path in cached:
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 # --------------------------------------------------------------------------

@@ -668,6 +668,30 @@ class TestGitHostSsrfGuard:
     def test_public_ip_not_blocked(self):
         assert not _ip_is_blocked("140.82.112.3")
 
+    def test_clone_time_recheck_blocks_dns_rebinding(self, settings, monkeypatch):
+        """Host is public at the pre-check, private at the clone-time re-check.
+
+        build_from_git re-resolves and re-validates immediately before the clone
+        subprocess, so a rebind after the initial _check_git_host must raise a
+        BuildError and never reach the clone.
+        """
+        answers = iter([["140.82.112.3"], ["10.0.0.5"]])
+
+        def flipping_resolver(_hostname):
+            return next(answers)
+
+        monkeypatch.setattr(builder_module, "_resolve_host_ips", flipping_resolver)
+
+        def _must_not_clone(*args, **kwargs):
+            raise AssertionError("clone must not run after a blocked re-resolve")
+
+        monkeypatch.setattr(builder_module, "_clone", _must_not_clone)
+
+        with pytest.raises(BuildError, match="private"):
+            build_from_git(
+                "https://evil.example.com/r.git", None, None, None, settings
+            )
+
     def test_build_from_git_blocks_private_resolution(self, monkeypatch, settings):
         monkeypatch.setattr(
             builder_module, "_resolve_host_ips", lambda h: ["10.0.0.9"]

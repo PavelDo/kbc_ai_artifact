@@ -332,6 +332,16 @@ install -d ~/.claude/agents && curl -fsSL "$HUB/agent" -o ~/.claude/agents/artif
 install -d ~/.claude/skills/artifact-publisher && curl -fsSL "$HUB/skill" -o ~/.claude/skills/artifact-publisher/SKILL.md
 ```
 
+**Before you install:** both files are fetched over TLS from the same hub you
+already trust with your data, but neither endpoint is version-pinned, signed,
+or digest-checked — each is a mutable document that can change between one
+download and the next. Review the downloaded file before your agent loads it
+(the `/agent` file in particular grants Bash/Read/WebFetch tool access once
+installed), and re-review it any time you re-run either command. Treat it
+like any other code you install: where possible, pin to a released version
+from the project's GitHub releases and keep that copy under your own version
+control, rather than always tracking the live endpoint.
+
 ## Local development
 
 ```bash
@@ -363,7 +373,7 @@ are missing. Everything else has a documented default, overridable via env.
 |---|---|---|
 | `HUB_STORAGE_TOKEN` | *required* | Storage API token for the host project (where serving envelopes live) |
 | `HUB_STACK_URL` | *required* | Base URL of the host project's Keboola stack |
-| `HUB_SECRET_KEY` | *required* | Secret used to sign password-unlock cookies |
+| `HUB_SECRET_KEY` | *required* | Master secret. Two independent subkeys are derived from it by HMAC-SHA256 over a label (see `src/security.py`'s `derive_key`): one signs password-unlock cookies, the other signs webhook deliveries — so disclosing the webhook key to a receiver never exposes the cookie-signing key |
 | `HUB_PUBLIC_BASE_URL` | unset | Absolute base URL used when building returned artifact URLs, if the app can't infer it from the request |
 | `HUB_CACHE_DIR` | `/tmp/artifact-cache` | Local disk LRU cache directory (not a source of truth) |
 | `HUB_MAX_HTML_BYTES` | `15728640` (15 MB) | Max size of built HTML per artifact |
@@ -404,13 +414,28 @@ kbagent data-app create \
   --git-public
 ```
 
+**Pin production to an immutable ref, not a moving branch.** The command
+above (and the platform's default git integration) tracks a branch —
+typically `main` — and the runner re-clones that branch on every container
+start (a fresh deploy, a restart, or a wake from auto-suspend). That means a
+push to `main` after review, or simply a container restart picking up a newer
+commit than the one last verified, can change what is actually running
+without a corresponding, deliberate deploy action. For production, deploy
+from an immutable ref instead: cut a tagged release (CLAUDE.md's deploy flow
+already tags the commit and cuts a GitHub release for every user-visible
+change — see *Contributing* below) and point the git ref at that tag or its
+commit SHA rather than at `main`, so a given deployment stays reproducibly
+tied to the exact commit that was reviewed and versioned.
+
 Secrets are set with `kbagent data-app secrets-set` and never committed to
 the repository:
 
 - `HUB_STORAGE_TOKEN` — a Storage token scoped to the host project, minted
   with `kbagent token create ... --can-read-all-file-uploads`
 - `HUB_STACK_URL` — the host project's stack URL
-- `HUB_SECRET_KEY` — a random secret for signing unlock cookies
+- `HUB_SECRET_KEY` — a random master secret; the unlock-cookie and webhook
+  signing keys are both derived from it (see *Configuration* above), never
+  used directly
 
 The nginx-to-app contract (nginx listens on `8888` and proxies to uvicorn on
 `:8050`) is defined in `keboola-config/` (`keboola-config/nginx/sites/default.conf`,
@@ -428,6 +453,23 @@ the serving envelope, and unlocking one sets a signed cookie (via
 to the current password's own hash, so a cookie signed under a since-changed
 password no longer verifies, and an unlock on one artifact does not unlock
 another.
+
+**Known boundary: ownership is the project, not the individual token.**
+Every owner-only route (update, trash, restore, purge, rotate-link,
+invitations, stats, promote, head) authorizes by verifying the caller's
+Storage token against the stack and checking that it resolves to the same
+`(stack, project)` pair that originally published the artifact — it does not
+inspect the token's scope, role, or whether it was meant to be read-only.
+Concretely: **any** valid Storage token belonging to the owning project
+carries full destructive owner authority over every artifact that project
+owns, regardless of what that particular token's permissions were intended
+to allow. This is a known, intentional boundary of the current design, not
+an oversight — pick a project for artifact administration whose *every*
+token holder you would trust with purge/rotate/promote power, rather than
+handing out a narrowly-scoped token expecting the hub to enforce that
+narrower scope on its own. A future release may add token-scope or
+SSO-based finer-grained control; today, the project boundary is the whole
+boundary.
 
 **Capability revocation (0.7.0).** `POST /api/artifacts/{id}/rotate-link`
 mints a fresh public share id and the previous one — plus the bare internal

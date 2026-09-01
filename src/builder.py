@@ -1040,6 +1040,14 @@ def build_from_git(
         logger.info(
             "Cloning %s (ref=%r, authenticated=%s)", _scrub(url), ref, bool(git_token)
         )
+        # Re-resolve and re-validate immediately before the clone subprocess to
+        # narrow the DNS-rebinding TOCTOU window: the host passed _check_git_host
+        # above, but DNS can rebind to an internal/metadata address between that
+        # check and git's own resolution. This shrinks the window to the gap
+        # between here and git's connect; it cannot fully close it, because git
+        # (libcurl) resolves the hostname independently and true IP pinning is
+        # out of scope. Any blocked address here rejects with BuildError.
+        _check_git_host(url, allow_private=settings.git_allow_private_hosts)
         _clone(
             url,
             ref,

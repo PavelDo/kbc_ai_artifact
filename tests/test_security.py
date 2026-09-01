@@ -4,7 +4,15 @@ import hashlib
 import string
 import time
 
-from src.security import CookieSigner, check_password, hash_password, new_artifact_id
+from src.security import (
+    KEY_LABEL_UNLOCK_COOKIE,
+    KEY_LABEL_WEBHOOK,
+    CookieSigner,
+    check_password,
+    derive_key,
+    hash_password,
+    new_artifact_id,
+)
 
 
 class TestPasswordHashing:
@@ -64,6 +72,81 @@ class TestNewArtifactId:
         artifact_id = new_artifact_id()
         assert artifact_id
         assert set(artifact_id) <= allowed
+
+
+class TestDeriveKey:
+    """Domain separation between the consumers of HUB_SECRET_KEY."""
+
+    SECRET = "master-secret-key-for-tests-only-0123456789"
+
+    def test_labels_yield_different_keys(self):
+        cookie_key = derive_key(self.SECRET, KEY_LABEL_UNLOCK_COOKIE)
+        webhook_key = derive_key(self.SECRET, KEY_LABEL_WEBHOOK)
+        assert cookie_key != webhook_key
+
+    def test_neither_derived_key_is_the_master_secret(self):
+        for label in (KEY_LABEL_UNLOCK_COOKIE, KEY_LABEL_WEBHOOK):
+            derived = derive_key(self.SECRET, label)
+            assert derived != self.SECRET
+            assert self.SECRET not in derived
+
+    def test_is_deterministic_hex_sha256(self):
+        derived = derive_key(self.SECRET, KEY_LABEL_WEBHOOK)
+        assert derived == derive_key(self.SECRET, KEY_LABEL_WEBHOOK)
+        assert len(derived) == 64
+        assert set(derived) <= set(string.hexdigits.lower())
+
+    def test_a_different_master_secret_yields_a_different_key(self):
+        assert derive_key("secret-a", KEY_LABEL_WEBHOOK) != derive_key(
+            "secret-b", KEY_LABEL_WEBHOOK
+        )
+
+    def test_a_cookie_signed_with_the_cookie_key_verifies(self):
+        signer = CookieSigner(derive_key(self.SECRET, KEY_LABEL_UNLOCK_COOKIE))
+        value = signer.make("artifact-1", "open")
+        assert signer.check("artifact-1", value, max_age_s=3600, scope="open")
+
+    def test_the_webhook_key_cannot_forge_or_verify_an_unlock_cookie(self):
+        """A webhook receiver learns the webhook key — and gains nothing by it.
+
+        Before domain separation both consumers shared HUB_SECRET_KEY, so any
+        receiver could mint an unlock cookie for any artifact (for an
+        unprotected one the scope is the literal "open" value, so nothing about
+        it is secret).
+        """
+        cookie_signer = CookieSigner(
+            derive_key(self.SECRET, KEY_LABEL_UNLOCK_COOKIE)
+        )
+        webhook_signer = CookieSigner(derive_key(self.SECRET, KEY_LABEL_WEBHOOK))
+        cookie = cookie_signer.make("artifact-1", "open")
+
+        # The webhook key neither verifies a real cookie...
+        assert (
+            webhook_signer.check(
+                "artifact-1", cookie, max_age_s=3600, scope="open"
+            )
+            is False
+        )
+        # ...nor forges one the hub would accept.
+        forged = webhook_signer.make("artifact-1", "open")
+        assert (
+            cookie_signer.check(
+                "artifact-1", forged, max_age_s=3600, scope="open"
+            )
+            is False
+        )
+
+    def test_the_raw_master_secret_cannot_forge_an_unlock_cookie(self):
+        cookie_signer = CookieSigner(
+            derive_key(self.SECRET, KEY_LABEL_UNLOCK_COOKIE)
+        )
+        forged = CookieSigner(self.SECRET).make("artifact-1", "open")
+        assert (
+            cookie_signer.check(
+                "artifact-1", forged, max_age_s=3600, scope="open"
+            )
+            is False
+        )
 
 
 class TestCookieSigner:

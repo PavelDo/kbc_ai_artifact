@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
@@ -80,6 +81,46 @@ _TAG_VER_PREFIX = "artifact-ver-"
 _SAFE_ID_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 )
+
+# The disk cache holds plaintext-sensitive JSON — meta records carry the
+# password and guest-invitation PBKDF2 records and semi-secret webhook URLs —
+# under predictable file names, so it must never be world-readable. The cache
+# directory is created/forced to 0o700 and every cache file written 0o600
+# (owner-only). Enforced on POSIX; a no-op-ish best effort elsewhere.
+CACHE_DIR_MODE = 0o700
+CACHE_FILE_MODE = 0o600
+
+
+def _harden_cache_dir(cache_dir: Path) -> None:
+    """Create ``cache_dir`` if needed and force it to owner-only (0o700) perms.
+
+    ``mkdir(mode=...)`` is masked by the process umask and leaves an existing
+    directory's perms untouched, so an explicit ``chmod`` is what actually
+    guarantees the mode. The chmod is best effort (logged, not raised): the
+    disk cache is optional and the app degrades gracefully without it.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        cache_dir.chmod(CACHE_DIR_MODE)
+    except OSError as exc:
+        logger.warning("Cannot set cache dir perms on %s: %s", cache_dir, exc)
+
+
+def _write_private_bytes(tmp: Path, raw: bytes) -> None:
+    """Write ``raw`` to ``tmp`` atomically-preparable, with owner-only perms.
+
+    The file is created via ``os.open`` with an explicit 0o600 create mode and
+    then ``chmod``-ed, because the create mode is masked by the umask. Callers
+    ``os.replace`` the temp file onto the final name afterwards; ``replace``
+    keeps the inode (and therefore the 0o600 perms) intact.
+    """
+    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, CACHE_FILE_MODE)
+    try:
+        os.write(fd, raw)
+    finally:
+        os.close(fd)
+    os.chmod(tmp, CACHE_FILE_MODE)
+
 
 _SOURCE_TYPES = ("html", "markdown", "git-html", "git-markdown")
 
@@ -818,7 +859,7 @@ class ArtifactStore:
         self._meta_memory: OrderedDict[tuple[str, int], ArtifactMeta] = OrderedDict()
         self._lock = threading.Lock()
         try:
-            self._cache_dir.mkdir(parents=True, exist_ok=True)
+            _harden_cache_dir(self._cache_dir)
         except OSError as exc:  # Disk cache is optional — degrade gracefully.
             logger.warning("Cannot create cache dir %s: %s", self._cache_dir, exc)
 
@@ -2084,9 +2125,9 @@ class ArtifactStore:
             return
         tmp = path.parent / f"{path.name}.tmp"
         try:
-            self._cache_dir.mkdir(parents=True, exist_ok=True)
-            tmp.write_bytes(raw)
-            tmp.replace(path)
+            _harden_cache_dir(self._cache_dir)
+            _write_private_bytes(tmp, raw)
+            os.replace(tmp, path)
         except OSError as exc:
             logger.warning("Cannot write disk cache %s: %s", path, exc)
             try:

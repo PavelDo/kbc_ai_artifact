@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -91,6 +92,43 @@ _CACHE_PREFIX = "cmt."
 _SAFE_ID_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 )
+
+# The disk cache holds plaintext comment-thread JSON under predictable file
+# names, so it must never be world-readable. The cache directory is
+# created/forced to 0o700 and every cache file written 0o600 (owner-only),
+# exactly like :mod:`src.store`. Enforced on POSIX; best effort elsewhere.
+CACHE_DIR_MODE = 0o700
+CACHE_FILE_MODE = 0o600
+
+
+def _harden_cache_dir(cache_dir: Path) -> None:
+    """Create ``cache_dir`` if needed and force it to owner-only (0o700) perms.
+
+    ``mkdir(mode=...)`` is masked by the umask and leaves an existing
+    directory's perms untouched, so the explicit ``chmod`` is what guarantees
+    the mode. Best effort (logged, not raised): the disk cache is optional.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        cache_dir.chmod(CACHE_DIR_MODE)
+    except OSError as exc:
+        logger.warning("Cannot set cache dir perms on %s: %s", cache_dir, exc)
+
+
+def _write_private_bytes(tmp: Path, raw: bytes) -> None:
+    """Write ``raw`` to ``tmp`` with owner-only (0o600) perms.
+
+    Created via ``os.open`` with an explicit 0o600 create mode and then
+    ``chmod``-ed (the create mode is masked by the umask). The caller
+    ``os.replace``-s onto the final name afterwards, which keeps the inode and
+    therefore the 0o600 perms.
+    """
+    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, CACHE_FILE_MODE)
+    try:
+        os.write(fd, raw)
+    finally:
+        os.close(fd)
+    os.chmod(tmp, CACHE_FILE_MODE)
 
 
 def tag_cmt_artifact(artifact_id: str) -> str:
@@ -415,7 +453,7 @@ class CommentStore:
         self._memory: OrderedDict[tuple[str, int], CommentThread] = OrderedDict()
         self._lock = threading.Lock()
         try:
-            self._cache_dir.mkdir(parents=True, exist_ok=True)
+            _harden_cache_dir(self._cache_dir)
         except OSError as exc:  # Disk cache is optional — degrade gracefully.
             logger.warning("Cannot create cache dir %s: %s", self._cache_dir, exc)
 
@@ -573,16 +611,47 @@ class CommentStore:
     # ---------------------------------------------------------------- delete
 
     def delete(self, artifact_id: str, thread_id: str) -> bool:
-        """Delete every file of one thread. False when there was nothing to delete."""
+        """Delete every backend file of one thread, truthfully.
+
+        Mirrors :meth:`src.store.ArtifactStore.delete`'s honest semantics.
+        Returns ``True`` only when at least one matching file existed *and*
+        every matching backend file was confirmed deleted. If any backend
+        delete fails the file still exists in Storage, so the index entry is
+        kept and this returns ``False`` — never a success claim over a thread
+        that is still there (and still listable via :meth:`list_for`).
+
+        Return contract for the API layer:
+
+        * ``True``  — the thread was fully erased.
+        * ``False`` — either nothing matched (unknown thread / wrong artifact),
+          or a backend delete failed and files remain. A failure after files
+          were found is a confirmed-erasure failure the API maps to HTTP 502;
+          "nothing matched" is an ordinary 404. The two are distinguishable
+          because a genuine erasure failure is also logged as a warning here.
+        """
         files = self._backend.search_by_tag(tag_cmt_id(thread_id))
-        deleted = False
+        found = False
+        all_ok = True
         for info in files:
             if _tag_value(info.tags, _TAG_CMT_ARTIFACT_PREFIX) != artifact_id:
                 # A thread ID belongs to exactly one artifact; a mismatch means
                 # the caller asked about the wrong artifact.
                 continue
-            self._delete_file(artifact_id, info.id)
-            deleted = True
+            found = True
+            if not self._delete_file_confirmed(artifact_id, info.id):
+                all_ok = False
+
+        if not found:
+            return False
+        if not all_ok:
+            logger.warning(
+                "Partial delete of comment thread %s of artifact %s: some "
+                "Storage files remain; keeping the index entry to avoid a "
+                "false 'deleted' claim",
+                thread_id,
+                artifact_id,
+            )
+            return False
 
         with self._lock:
             threads = self._index.get(artifact_id)
@@ -592,27 +661,70 @@ class CommentStore:
                     self._memory.pop((artifact_id, file_id), None)
                 if not threads:
                     self._index.pop(artifact_id, None)
-        return deleted
+        return True
 
-    def delete_all_for(self, artifact_id: str) -> int:
-        """Delete every thread of an artifact. Returns the thread count removed.
+    def delete_all_for(self, artifact_id: str) -> tuple[int, int]:
+        """Delete every thread of an artifact. Returns ``(deleted, failed)``.
 
         Called when the artifact itself is deleted, so its comments do not
         outlive it as orphaned Storage files.
+
+        Return contract for the API layer:
+
+        * ``deleted`` — number of threads whose *every* backend file was
+          confirmed deleted.
+        * ``failed``  — number of threads that still have at least one file in
+          Storage because a backend delete failed (each such thread is also
+          logged as a warning).
+
+        A non-zero ``failed`` means the erasure was only partial and the API
+        must surface it as HTTP 502 — some comment files remain. The in-memory
+        index and per-file disk cache are cleared only for threads that were
+        fully deleted; a thread that still has files keeps its index entry so
+        it stays listable and a retry can finish the job.
         """
         files = self._backend.search_by_tag(tag_cmt_artifact(artifact_id))
-        thread_ids: set[str] = set()
+        per_thread: dict[str, list[int]] = {}
         for info in files:
             thread_id = _tag_value(info.tags, _TAG_CMT_ID_PREFIX)
-            if thread_id:
-                thread_ids.add(thread_id)
-            self._delete_file(artifact_id, info.id)
+            if not thread_id:
+                # An orphaned file (no thread tag) is still cleaned up, but it
+                # is not a thread, so it does not enter the (deleted, failed)
+                # thread accounting.
+                self._delete_file(artifact_id, info.id)
+                continue
+            per_thread.setdefault(thread_id, []).append(info.id)
+
+        deleted = 0
+        failed = 0
+        fully_deleted: list[str] = []
+        for thread_id, file_ids in per_thread.items():
+            thread_ok = True
+            for file_id in file_ids:
+                if not self._delete_file_confirmed(artifact_id, file_id):
+                    thread_ok = False
+            if thread_ok:
+                deleted += 1
+                fully_deleted.append(thread_id)
+            else:
+                failed += 1
+                logger.warning(
+                    "Could not fully delete comment thread %s of artifact %s; "
+                    "some Storage files remain",
+                    thread_id,
+                    artifact_id,
+                )
 
         with self._lock:
-            self._index.pop(artifact_id, None)
-            self._forget_memory_locked(artifact_id)
-        self._purge_disk_cache(artifact_id)
-        return len(thread_ids)
+            threads = self._index.get(artifact_id)
+            if threads is not None:
+                for thread_id in fully_deleted:
+                    file_id = threads.pop(thread_id, None)
+                    if file_id is not None:
+                        self._memory.pop((artifact_id, file_id), None)
+                if not threads:
+                    self._index.pop(artifact_id, None)
+        return (deleted, failed)
 
     def _delete_superseded(
         self, artifact_id: str, thread_id: str, keep_file_id: int
@@ -642,6 +754,29 @@ class CommentStore:
                 exc,
             )
         self._delete_disk_cache(artifact_id, file_id)
+
+    def _delete_file_confirmed(self, artifact_id: str, file_id: int) -> bool:
+        """Delete one Storage file, returning whether the backend confirmed it.
+
+        Mirrors :meth:`src.store.ArtifactStore._delete_file_confirmed`: unlike
+        :meth:`_delete_file` it reports failure so callers that must not claim a
+        thread was erased over a still-present file (:meth:`delete`,
+        :meth:`delete_all_for`) can react. The disk cache copy is dropped either
+        way — it is pure cache.
+        """
+        ok = True
+        try:
+            self._backend.delete(file_id)
+        except BackendError as exc:
+            ok = False
+            logger.warning(
+                "Cannot delete comment file %s of artifact %s: %s",
+                file_id,
+                artifact_id,
+                exc,
+            )
+        self._delete_disk_cache(artifact_id, file_id)
+        return ok
 
     # ------------------------------------------------------------------ load
 
@@ -746,9 +881,9 @@ class CommentStore:
             return
         tmp = path.parent / f"{path.name}.tmp"
         try:
-            self._cache_dir.mkdir(parents=True, exist_ok=True)
-            tmp.write_bytes(raw)
-            tmp.replace(path)
+            _harden_cache_dir(self._cache_dir)
+            _write_private_bytes(tmp, raw)
+            os.replace(tmp, path)
         except OSError as exc:
             logger.warning("Cannot write disk cache %s: %s", path, exc)
             try:
