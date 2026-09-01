@@ -1,3 +1,3 @@
 #!/bin/bash
 set -Eeuo pipefail
-cd /app && uv sync
+cd /app && uv sync --frozen

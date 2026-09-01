@@ -6,5 +6,5 @@ __pycache__/
 .env.local
 logs/
 .pytest_cache/
-uv.lock
 _review/
+*.egg-info/
