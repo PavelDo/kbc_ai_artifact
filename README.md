@@ -455,7 +455,8 @@ are missing. Everything else has a documented default, overridable via env.
 | `HUB_REAP_ABORTED_PUBLISH_AFTER_S` | `3600` | A meta record with no version is a publish that died between its two writes; startup deletes such records once older than this, so they cannot be a publish still in flight (`0` disables) |
 | `HUB_MAX_PROPOSED_VERSIONS` | `50` | Per-artifact cap on retained proposed versions; the oldest proposals above this are pruned (proposals are never served as head, so this is always safe) |
 | `HUB_TRUST_FORWARDED_HEADERS` | `false` | Trust `X-Forwarded-Host`/`X-Forwarded-Proto` to name the public origin when `HUB_PUBLIC_BASE_URL` is unset — only for local development behind a proxy; a direct client can forge these headers |
-| `HUB_TRUSTED_PROXY_CIDRS` | empty | Comma-separated CIDR networks whose members may name the real client in `X-Real-IP` / `X-Forwarded-For`. Honoured only together with `HUB_TRUST_FORWARDED_HEADERS`, and only when the direct peer is inside one of them; empty means a forwarded client address is never believed and every caller buckets by the peer address. A malformed entry fails at startup. See *Deployment to Keboola* |
+| `HUB_TRUSTED_PROXY_CIDRS` | empty | Comma-separated CIDR networks of **every** proxy hop in front of the hub, whose members may name the real client in `X-Real-IP` / `X-Forwarded-For`. Honoured only together with `HUB_TRUST_FORWARDED_HEADERS`, and only when the direct peer is inside one of them; empty means a forwarded client address is never believed and every caller buckets by the peer address. A malformed entry fails at startup. See *Deployment to Keboola* |
+| `HUB_MAX_FORWARDED_CHAIN_ENTRIES` | `16` | How many `X-Forwarded-For` entries the client-address walk examines, counted from the right. The header is caller-supplied and arbitrarily long; this bounds the parsing one request can buy. Real paths are three hops, so raising it is rarely useful |
 | `HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR` | `30` | Failed password-unlock (and guest-invitation) attempts allowed per (artifact, client address) per UTC hour before the gate answers 429 (each attempt costs a full PBKDF2 verification) |
 | `HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR` | `500` | The same budget again, per artifact across *all* addresses together — a backstop nobody can rotate away by changing address. Set well above any real audience of one document; it stops industrial guessing, not individual readers |
 | `HUB_MAX_SMALL_REQUEST_BYTES` | `262144` (256 KB) | Largest inbound request body accepted by every route that does not carry a document — comments, replies, invitations, the unlock form, webhook management, policy-only updates. Enforced from the ASGI layer, before authentication, locking, JSON parsing or PBKDF2 (413 above it). The document routes (publish, update, submit a version) instead get `max(HUB_MAX_HTML_BYTES, HUB_MAX_ENVELOPE_BYTES)` plus 1 MB of JSON-envelope head-room, so raising either content limit raises what they accept |
@@ -535,19 +536,35 @@ That is now enforced rather than assumed, in two places:
 **Tell the hub which proxy to believe.** The brute-force budgets behind the
 artifact password gate and the guest-invitation gate are keyed on the client
 address, and behind the platform proxy the only address the app sees on the
-connection is the proxy's. The real one arrives in `X-Real-IP` — but that
-header is equally easy for a direct caller to write, so the hub believes it
-only when the connection came from a network you named:
+connection is the proxy's. The real one arrives in `X-Real-IP` /
+`X-Forwarded-For` — but those headers are equally easy for a direct caller to
+write, so the hub believes them only when the connection came from a network
+you named:
 
 ```bash
 kbagent data-app secrets-set --secrets-file <file>   # HUB_TRUST_FORWARDED_HEADERS=1
-                                                     # HUB_TRUSTED_PROXY_CIDRS=10.0.0.0/8
+                                                     # HUB_TRUSTED_PROXY_CIDRS=10.0.0.0/8,198.51.100.0/24
 ```
 
-Set `HUB_TRUSTED_PROXY_CIDRS` to the proxy's network (and
+Set `HUB_TRUSTED_PROXY_CIDRS` to the networks of your proxies (and
 `HUB_TRUST_FORWARDED_HEADERS=1`, which both this and the public-origin
 headers require). Multiple networks are comma-separated; a malformed entry
 fails at startup rather than being skipped.
+
+**List every hop, not just the nearest one.** Each proxy in the path
+*appends* the address it accepted the connection from — nginx does this with
+`$proxy_add_x_forwarded_for` — so `X-Forwarded-For` arrives oldest-first and
+its **leftmost** entry is whatever the original caller chose to send. The hub
+therefore reads the chain from the **right**, skipping entries that are
+themselves inside `HUB_TRUSTED_PROXY_CIDRS`, and takes the first entry left
+over as the client. If a hop's network is missing from the list, the walk
+stops at that hop and every reader behind it shares its bucket — safe, but no
+better than leaving the setting empty. Every candidate must also parse as an
+IP address (a `host:port` or `[v6]:port` form is accepted, an IPv4-mapped
+IPv6 address is folded back to its IPv4 form); anything else is ignored and
+the hub falls back to the connection's own address. Only the last
+`HUB_MAX_FORWARDED_CHAIN_ENTRIES` entries are looked at, so a very long
+header costs no more than a short one.
 
 **If you leave it unset, nothing breaks** — the hub falls back to the address
 the connection actually came from, which behind the proxy is the proxy

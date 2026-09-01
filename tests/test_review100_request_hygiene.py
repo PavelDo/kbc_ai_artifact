@@ -6,7 +6,9 @@ has decided whether to talk to them at all:
 
 * ``SEC-100-003`` — the password/guest brute-force budget was keyed on
   ``X-Real-IP``, a header the caller writes, so changing it handed the caller
-  a fresh budget.
+  a fresh budget. (The forwarded-address half of the same finding — walking
+  ``X-Forwarded-For`` from the right, and validating every candidate as an
+  address — has its own module, ``test_review100_forwarded_ip.py``.)
 * ``SEC-100-004`` — nothing bounded an inbound body before it was read,
   JSON-decoded and validated, so a three-megabyte comment on a nonexistent
   artifact was fully parsed on the way to its 404.

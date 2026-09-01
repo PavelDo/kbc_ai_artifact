@@ -174,6 +174,15 @@ class Settings:
     # everything buckets by the peer address, which is safe but coarse behind
     # a proxy, since every caller then shares the proxy's bucket.
     trusted_proxy_cidrs: tuple[IPNetwork, ...] = ()
+    # How many X-Forwarded-For entries the client-address walk examines,
+    # counted from the right (env HUB_MAX_FORWARDED_CHAIN_ENTRIES).
+    # SEC-100-003: the header is caller-supplied and arbitrarily long, and the
+    # walk parses one address per entry, so an unbounded chain would let a
+    # single request buy thousands of parses. Sixteen is far more hops than
+    # any real path — client, platform proxy, nginx is three — and a chain
+    # that reaches the cap without finding an untrusted entry simply falls
+    # back to the peer address, which is the safe answer anyway.
+    max_forwarded_chain_entries: int = 16
     # Which tokens of the owning project may run a *destructive* route — soft
     # delete, purge, rotate-link, version delete, webhook key rotation
     # (env HUB_DESTRUCTIVE_TOKEN_POLICY). SEC-075-011: ownership is a
@@ -365,6 +374,7 @@ def load_settings() -> Settings:
         max_proposed_versions=_int_env("HUB_MAX_PROPOSED_VERSIONS", 50),
         trust_forwarded_headers=_bool_env("HUB_TRUST_FORWARDED_HEADERS", False),
         trusted_proxy_cidrs=_cidr_env("HUB_TRUSTED_PROXY_CIDRS"),
+        max_forwarded_chain_entries=_int_env("HUB_MAX_FORWARDED_CHAIN_ENTRIES", 16),
         destructive_token_policy=destructive_policy,
         destructive_token_ids=destructive_token_ids,
         max_unlock_attempts_per_hour=_int_env(
