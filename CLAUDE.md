@@ -85,6 +85,38 @@ isn't, that's a bug**, not a case to special-case around with local state.
 - No tokens or secrets in git, ever — not in code, tests, fixtures, or commit
   messages.
 
+## Known residual risks
+
+These are documented, accepted design decisions from the v0.10.0 security
+review — not bugs to silently "fix" by tightening code without a design
+discussion. If you touch the areas below, preserve the documented behavior
+and keep the README/comment cross-references intact.
+
+- **`SEC-075-005` / `SEC-075-006` — resolver-to-connect DNS TOCTOU for
+  outbound git and webhook traffic.** `_check_git_host` (`src/builder.py`)
+  and the webhook URL validation (`src/webhooks.py`) resolve a hostname and
+  reject private/loopback/link-local/reserved/metadata addresses, but git
+  (via libcurl) and `httpx` each resolve the hostname again, independently,
+  at connect time. Neither client supports pinning the connection to an
+  already-validated IP, so this cannot be closed in application code with
+  the current clients — it needs an egress policy/proxy in front of the
+  container (see the "Network egress" part of README.md's *Security model*).
+  Do not attempt to "fix" this with more application-side re-checks; another
+  re-check only narrows the window, it does not close it.
+- **`SEC-075-011` — any valid token of the owning project has full
+  destructive authority.** `require_owner`/`_owner_only` (`src/auth.py`,
+  `src/main.py`) check only that a token resolves to the same
+  `(stack, project)` pair as the artifact's owner — never the token's scope
+  or role. This is intentional: see README.md's *Security model* "Known
+  boundary" paragraph for the accepted design and the mitigation advice
+  (use a dedicated project or a narrowly issued token for publishing).
+- **`SEC-100-005` — git redirects are disabled, not eliminated as an SSRF
+  vector.** `_clone` (`src/builder.py`) runs with
+  `-c http.followRedirects=false`, so a redirect to an unvalidated host now
+  fails the clone instead of being silently followed. This closes the
+  redirect-specific gap; the underlying resolver TOCTOU above it is not
+  closed by this and is tracked separately as `SEC-075-006`.
+
 ## Architecture map
 
 | Module | Responsibility |

@@ -312,22 +312,28 @@ data URIs so the resulting artifact stays a single, self-contained document.
 ### Publish from a private git repository
 
 Add `git_token` — a personal access token for the git host (GitHub PAT, GitLab
-token, …) — to clone a repository that is not public:
+token, …) — to clone a repository that is not public. Treat `git_token`
+exactly like the Storage token above: never write its literal value into a
+`-d` string or any other command argument. Have `jq` read it from its own
+environment with `env.GIT_TOKEN` — only the variable *name* appears in the
+program text, never the value — and pipe the JSON to curl on stdin instead of
+building it inline:
 
 ```bash
-hub -X POST "$HUB/api/artifacts" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "git_url": "https://github.com/org/private-repo",
-    "git_ref": "main",
-    "git_path": "docs/report.md",
-    "git_token": "your-github-pat"
-  }'
+export GIT_TOKEN="…"   # your git host PAT
+jq -n --arg url "https://github.com/org/private-repo" \
+      --arg ref "main" \
+      --arg path "docs/report.md" \
+      '{git_url: $url, git_ref: $ref, git_path: $path, git_token: env.GIT_TOKEN}' \
+  | hub -X POST "$HUB/api/artifacts" \
+      -H "Content-Type: application/json" \
+      --data-binary @-
 ```
 
 `git_username` is optional and defaults to `x-access-token`, which is what
 GitHub PATs and GitLab deploy tokens expect. Set it only for hosts that
-require a real username.
+require a real username (add it the same way, with a plain `--arg` since a
+username is not a secret).
 
 **Transient credentials.** Exactly like your Storage token, `git_token` is
 used only for the clone inside that one request: it is never written to the

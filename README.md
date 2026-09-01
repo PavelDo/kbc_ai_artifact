@@ -268,11 +268,6 @@ hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{"git_url": "https://github.com/org/repo", "git_ref": "main", "git_path": "docs/report.md"}'
 
-# Publish from a private git repo (git_token is transient — see below)
-hub -X POST "$HUB/api/artifacts" \
-  -H "Content-Type: application/json" \
-  -d '{"git_url": "https://github.com/org/private-repo", "git_path": "docs/report.md", "git_token": "your-github-pat"}'
-
 # Read (public, no token)
 hub "$HUB/a/<id>/raw"
 
@@ -288,6 +283,24 @@ hub -X DELETE "$HUB/api/artifacts/<id>"
 Add `"password": "secret"` to any publish/update body to protect the
 artifact; readers then need `X-Artifact-Password: secret` (machines) or the
 web unlock form (browsers).
+
+Publishing from a private git repo needs a `git_token` (a PAT for the git
+host), which is transient — see *Security model* below. Never splice it into
+a literal `-d` string; that puts the value in `curl`'s own argv for the
+process's lifetime, the same problem `hub` above avoids for the Storage
+token. Build the body with `jq` instead, reading the token from its own
+environment via `env.GIT_TOKEN` — only the variable *name* appears in the
+program text — and pipe the JSON to curl on stdin:
+
+```bash
+export GIT_TOKEN="…"   # a PAT for the git host, read-only / single-repo scope
+jq -n --arg url "https://github.com/org/private-repo" \
+      --arg path "docs/report.md" \
+      '{git_url: $url, git_path: $path, git_token: env.GIT_TOKEN}' \
+  | hub -X POST "$HUB/api/artifacts" \
+      -H "Content-Type: application/json" \
+      --data-binary @-
+```
 
 ### Versioning (curl)
 
@@ -515,12 +528,39 @@ Concretely: **any** valid Storage token belonging to the owning project
 carries full destructive owner authority over every artifact that project
 owns, regardless of what that particular token's permissions were intended
 to allow. This is a known, intentional boundary of the current design, not
-an oversight — pick a project for artifact administration whose *every*
-token holder you would trust with purge/rotate/promote power, rather than
-handing out a narrowly-scoped token expecting the hub to enforce that
-narrower scope on its own. A future release may add token-scope or
-SSO-based finer-grained control; today, the project boundary is the whole
-boundary.
+an oversight (tracked as `SEC-075-011`) — pick a project for artifact
+administration whose *every* token holder you would trust with
+purge/rotate/promote power, rather than handing out a narrowly-scoped token
+expecting the hub to enforce that narrower scope on its own. A future
+release may add token-scope or SSO-based finer-grained control; today, the
+project boundary is the whole boundary. **Mitigation:** use a dedicated
+Keboola project for artifact publishing (or a token issued only for that
+purpose, in a project that holds nothing else sensitive) rather than
+reusing a broadly-scoped production project's token — any token of that
+project can purge every artifact it owns.
+
+**Network egress: git and webhook hostname checks are best-effort, not a
+guarantee (`SEC-075-005`, `SEC-075-006`).** Before cloning a `git_url` and
+before delivering a webhook, the hub resolves the target hostname and
+rejects it if any resolved address is loopback, private (RFC1918/ULA),
+link-local, reserved, or a known cloud-metadata address
+(`169.254.169.254`, `*.internal`) — see `HUB_GIT_ALLOW_PRIVATE_HOSTS` below.
+This check is re-run immediately before the git clone subprocess to narrow
+the window, and the git clone itself now runs with
+`-c http.followRedirects=false` (`SEC-100-005`) so a redirect to an
+unvalidated host is refused instead of silently followed. None of that
+closes the gap completely: both git (via libcurl) and the webhook HTTP
+client (`httpx`) resolve the hostname a second time, independently, at
+connect time — a DNS answer that changes between the hub's validation and
+that second resolution (DNS rebinding) is a resolver-to-connect
+time-of-check/time-of-use gap this application cannot close with its
+current clients, because neither client exposes a way to pin the connection
+to the IP address the hub already validated. **The reliable control is
+operational, not this application:** run the hub's container behind an
+egress policy or resolver-aware outbound proxy that denies connections to
+loopback, RFC1918/ULA, link-local, cluster/service, and cloud-metadata
+ranges regardless of what hostname validation concluded. Treat the
+in-application hostname check as defense in depth, not the boundary.
 
 **Capability revocation (0.7.0).** `POST /api/artifacts/{id}/rotate-link`
 mints a fresh public share id and the previous one — plus the bare internal

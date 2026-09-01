@@ -200,15 +200,18 @@ Add `git_token` (a PAT for the git host) and optionally `git_username`
 tokens):
 
 Build the body with `jq` reading `$GIT_TOKEN` from its own environment —
-never splice a secret into a literal shell string — and pipe it to curl on
-stdin (see *Handling secrets in shell* above for why):
+never splice a secret into a literal shell string, and never pass it through
+`jq --arg` either, since that puts the value in `jq`'s own argv (visible to
+`ps` for the process's lifetime, same as the `curl -H` problem above). Have
+`jq` look the variable up itself with `env.GIT_TOKEN` — only the *name*
+`GIT_TOKEN` appears in the program text, never the value — and pipe the
+result to curl on stdin (see *Handling secrets in shell* above for why):
 
 ```bash
 jq -n --arg url "https://github.com/org/private-repo" \
       --arg ref "main" \
       --arg path "docs/report.md" \
-      --arg token "$GIT_TOKEN" \
-      '{git_url: $url, git_ref: $ref, git_path: $path, git_token: $token}' \
+      '{git_url: $url, git_ref: $ref, git_path: $path, git_token: env.GIT_TOKEN}' \
   | hub -X POST "$HUB/api/artifacts" \
       -H "Content-Type: application/json" \
       --data-binary @-

@@ -785,7 +785,13 @@ def _clone(
     helper (:data:`_ASKPASS_SCRIPT`) reading a curated environment, so the token
     never appears in ``argv``, process listings, or the persisted URL.
     """
-    args = ["git", "clone", "--depth", "1"]
+    # SEC-100-005: disable git's default of following an HTTP redirect. Without
+    # this, `_check_git_host` validates only the *original* hostname and git
+    # itself would silently follow a redirect to an unvalidated destination
+    # (including a private/internal address) during the clone -- the SSRF
+    # guard would never see the real target. The `-c` override must precede
+    # the subcommand to apply as a one-off config for this invocation only.
+    args = ["git", "-c", "http.followRedirects=false", "clone", "--depth", "1"]
     if blob_limit_bytes and blob_limit_bytes > 0:
         # Partial clone: ask the server to withhold blobs larger than the hard
         # repo cap. Servers without partial-clone support merely warn and send
@@ -819,6 +825,7 @@ def _clone(
         return
     reason = _last_line(result.stderr, token) or _last_line(result.stdout, token)
     lowered = (result.stderr or "").lower()
+    detail = f" git said: {reason}" if reason else ""
     if "could not read username" in lowered or "authentication failed" in lowered:
         hint = (
             "The supplied git_token was rejected, or git_username is wrong for "
@@ -830,7 +837,19 @@ def _clone(
         raise BuildError(
             f"Could not clone the repository: it is private or does not exist. {hint}"
         )
-    detail = f" git said: {reason}" if reason else ""
+    if re.search(r"returned error: 3\d\d", lowered):
+        # SEC-100-005: with -c http.followRedirects=false above, git turns a
+        # blocked redirect into an ordinary HTTP-status failure -- git's own
+        # stderr never uses the word "redirect" -- so this is the case where
+        # the remote tried to send the clone somewhere _check_git_host never
+        # validated. Name the real cause instead of falling through to the
+        # generic message below; `reason`/`detail` are already scrubbed via
+        # `_last_line` -> `_scrub`, so no credential or internal detail leaks.
+        raise BuildError(
+            "Could not clone the repository: the remote responded with an "
+            f"HTTP redirect, which this service does not follow for security "
+            f"reasons.{detail}"
+        )
     if ref:
         raise BuildError(
             f"Could not clone the repository at ref {ref!r}. Only branch and tag "
@@ -1082,6 +1101,18 @@ def build_from_git(
         # between here and git's connect; it cannot fully close it, because git
         # (libcurl) resolves the hostname independently and true IP pinning is
         # out of scope. Any blocked address here rejects with BuildError.
+        #
+        # SEC-075-006 (accepted residual risk): this hostname re-validation is
+        # a best-effort application-layer check, not a guarantee. It cannot be
+        # closed here with the current client (git/libcurl resolves on its own
+        # at connect time, after this function returns), and the same gap
+        # applies to outbound webhook delivery (SEC-075-005, see
+        # src/webhooks.py). The reliable control is operational: an egress
+        # policy/proxy in front of this container that denies loopback,
+        # RFC1918/ULA, link-local, cluster and cloud-metadata ranges outright,
+        # regardless of what hostname validation concluded. See the "Network
+        # egress" section of README.md for the operator-facing statement of
+        # this control.
         _check_git_host(url, allow_private=settings.git_allow_private_hosts)
         _clone(
             url,
