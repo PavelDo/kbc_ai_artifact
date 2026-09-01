@@ -25,6 +25,7 @@ transient Storage outage cannot put the app into a crash loop.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import json
 import logging
@@ -479,6 +480,47 @@ settings: Settings = load_settings()
 #: Guards the lazy re-hydration retry so concurrent requests do not all hammer
 #: Storage at once after a failed startup hydration.
 _hydrate_lock = threading.Lock()
+
+#: One lock per artifact, created on first use and kept for the life of the
+#: process. Every mutating ``/api/artifacts/{id}...`` route reads the artifact,
+#: decides, then writes -- through *separate* store locks -- so two requests
+#: on one artifact could interleave between the decision and the write and
+#: both act on a state that was no longer true: two promotions of one
+#: proposal both firing, two deletes jointly removing the last live version,
+#: a submission landing on a document finalized a moment earlier. This
+#: serializes whole routes per artifact instead. Sound because this process
+#: is the only writer (see CLAUDE.md, "Exactly one instance"); with a second
+#: instance it would be no protection at all. The registry never shrinks --
+#: it is bounded by the artifacts this process ever mutates, a few dozen
+#: bytes each.
+_artifact_locks: dict[str, threading.Lock] = {}
+_artifact_locks_guard = threading.Lock()
+
+
+def _artifact_lock(artifact_id: str) -> threading.Lock:
+    """The lock serializing mutations of one artifact."""
+    with _artifact_locks_guard:
+        lock = _artifact_locks.get(artifact_id)
+        if lock is None:
+            lock = _artifact_locks[artifact_id] = threading.Lock()
+        return lock
+
+
+def _serialized_per_artifact(route):
+    """Route decorator: hold the artifact's lock for the whole handler.
+
+    Applied directly above ``def``, so it is the innermost wrapper and the
+    one FastAPI registers; ``functools.wraps`` keeps the signature, which is
+    what FastAPI reads to resolve path, body and dependency parameters.
+    Dependencies (``require_owner`` and its token-verify HTTP call) run
+    before the handler is invoked, so they stay outside the lock; only the
+    read-decide-write body is inside it.
+    """
+    @functools.wraps(route)
+    def serialized(*args, **kwargs):
+        with _artifact_lock(kwargs["artifact_id"]):
+            return route(*args, **kwargs)
+    return serialized
 
 # --------------------------------------------------------------------------
 # Rate-limit counters
@@ -5045,6 +5087,7 @@ def publish_artifact(
         },
     },
 )
+@_serialized_per_artifact
 def update_artifact(
     body: UpdateBody,
     request: Request,
@@ -5289,6 +5332,7 @@ def list_artifacts(
         },
     },
 )
+@_serialized_per_artifact
 def delete_artifact(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -5361,6 +5405,7 @@ def delete_artifact(
         },
     },
 )
+@_serialized_per_artifact
 def restore_artifact(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -5459,6 +5504,7 @@ def restore_artifact(
         },
     },
 )
+@_serialized_per_artifact
 def purge_artifact(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -5663,6 +5709,7 @@ def read_webhook_keys(
         },
     },
 )
+@_serialized_per_artifact
 def rotate_link(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -5844,6 +5891,7 @@ def artifact_stats(
         },
     },
 )
+@_serialized_per_artifact
 def create_invitation(
     body: InvitationBody,
     request: Request,
@@ -5995,6 +6043,7 @@ def list_invitations(
         },
     },
 )
+@_serialized_per_artifact
 def revoke_invitation(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -6116,6 +6165,7 @@ def revoke_invitation(
         },
     },
 )
+@_serialized_per_artifact
 def submit_version(
     body: VersionBody,
     request: Request,
@@ -6269,6 +6319,7 @@ def submit_version(
         },
     },
 )
+@_serialized_per_artifact
 def promote_version(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -6367,6 +6418,7 @@ def promote_version(
         },
     },
 )
+@_serialized_per_artifact
 def delete_version(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
@@ -6487,6 +6539,7 @@ def delete_version(
         },
     },
 )
+@_serialized_per_artifact
 def set_head(
     body: HeadBody,
     request: Request,

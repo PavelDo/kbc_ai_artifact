@@ -47,6 +47,16 @@ your side.**
   pending notifications without limit; past a configurable ceiling
   (`HUB_WEBHOOK_QUEUE_MAX`) the newest is dropped, and publishing is never held
   up waiting for one.
+- Two requests changing the same document at the same moment can no longer
+  act on a state that has just stopped being true. Every change to a document
+  now waits for the previous one to finish: two promotions of one proposal
+  fire once, two deletions cannot remove the last live version between them,
+  a document cannot be finalised underneath a submission already in flight,
+  and nothing can land in a document while it is being erased.
+- A deleted version's number is retired with it. Deleting the newest version
+  used to hand its number to whatever was submitted next, so every link,
+  comment and comparison that named it silently pointed at different content
+  — including after a restart.
 - The service now states its deployment shape plainly and watches for it
   being broken: one hub is one container, serving one organisation. Its index,
   locks and state snapshots are built for exactly one writer, so if a second

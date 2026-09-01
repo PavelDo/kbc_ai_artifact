@@ -6050,3 +6050,234 @@ def test_every_live_surface_shares_one_copy_of_the_poller(api: Api) -> None:
         body = api.client.get(path).text
         assert body.count(marker) == 1, path
         assert pages._LIVE_JS in body, path
+
+
+# --------------------------------------------------------------------------
+# Check-then-act races between concurrent requests on one artifact
+# --------------------------------------------------------------------------
+
+
+def _pause_inside(target, name: str):
+    """Make the first call of ``target.<name>`` block until told to go on.
+
+    Returns ``(entered, release)`` events. The first caller sets ``entered``
+    just before the real method would run and waits for ``release``; every
+    later call goes straight through. This freezes one request *between* its
+    check and its act, which is exactly where a second request must not be
+    allowed to slip in.
+    """
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+    real = getattr(target, name)
+    first = threading.Lock()
+    armed = [True]
+
+    def paused(*args, **kwargs):
+        with first:
+            fire = armed[0]
+            armed[0] = False
+        if fire:
+            entered.set()
+            release.wait(timeout=5)
+        return real(*args, **kwargs)
+
+    setattr(target, name, paused)
+    return entered, release
+
+
+def _in_thread(fn):
+    """Run ``fn`` in a thread; returns (thread, box) where box[0] is the result."""
+    import threading
+
+    box: list = []
+    thread = threading.Thread(target=lambda: box.append(fn()))
+    thread.start()
+    return thread, box
+
+
+class TestConcurrentMutationsAreSerializedPerArtifact:
+    """Every mutating route reads, decides, then writes -- across separate
+    locks. Two requests on one artifact can interleave between the decision
+    and the write, so both act on a state that is no longer true. These
+    tests freeze one request at that seam and let the other run.
+    """
+
+    def test_two_updates_do_not_lose_each_others_fields(self, api: Api) -> None:
+        """REL-075-005: whole-object rewrites overwrite unrelated newer fields."""
+        artifact_id = _publish_markdown(api, "# One")
+        store = main.app.state.store
+        entered, release = _pause_inside(store, "save_meta")
+
+        first, box1 = _in_thread(
+            lambda: _policy(api, artifact_id, password="hunter2").status_code
+        )
+        assert entered.wait(timeout=5)
+        second, box2 = _in_thread(
+            lambda: _policy(api, artifact_id, accept_versions_mode="anyone").status_code
+        )
+        # Give the second request its chance to slip in before releasing.
+        second.join(timeout=0.5)
+        release.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        assert box1 == [200] and box2 == [200], (box1, box2)
+
+        meta = store.get_meta(artifact_id)
+        assert meta.password is not None, "the password update was lost"
+        assert meta.accept_versions_mode == "anyone", "the accept-mode update was lost"
+
+    def test_two_promotions_of_one_proposal_act_once(self, hooked) -> None:
+        """COR-075-007: both promotions observe 'proposed' and both fire."""
+        api, posts, dispatcher = hooked
+        artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+        assert _register_hook(api, artifact_id, [HOOK]).status_code == 200
+        assert _submit_version(api, artifact_id, "# Two", headers=OTHER_AUTH_HEADERS).status_code == 201
+        dispatcher.drain()
+        posts.clear()
+        store = main.app.state.store
+        entered, release = _pause_inside(store, "set_status")
+
+        def promote():
+            return api.client.post(
+                f"/api/artifacts/{artifact_id}/versions/2/promote", headers=AUTH_HEADERS
+            ).status_code
+
+        first, box1 = _in_thread(promote)
+        assert entered.wait(timeout=5)
+        second, box2 = _in_thread(promote)
+        second.join(timeout=0.5)
+        release.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert sorted(box1 + box2) == [200, 409], (box1, box2)
+        dispatcher.drain()
+        assert len(posts) == 1, "the promotion side effect fired twice"
+
+    def test_concurrent_deletes_cannot_remove_the_last_live_version(self, api: Api) -> None:
+        """COR-075-008: each delete sees the *other* version as still live."""
+        artifact_id = _publish_markdown(api, "# One")
+        assert _submit_version(api, artifact_id, "# Two").status_code == 201
+        store = main.app.state.store
+        # Past the store's own last-live check, before the file goes.
+        entered, release = _pause_inside(store, "_delete_file_confirmed")
+
+        def delete(version: int):
+            return api.client.delete(
+                f"/api/artifacts/{artifact_id}/versions/{version}", headers=AUTH_HEADERS
+            ).status_code
+
+        first, box1 = _in_thread(lambda: delete(1))
+        assert entered.wait(timeout=5)
+        second, box2 = _in_thread(lambda: delete(2))
+        second.join(timeout=0.5)
+        release.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        live = [
+            row["version"] for row in store.list_versions(artifact_id)
+            if row.get("status") == "live"
+        ]
+        assert live, f"both deletes succeeded ({box1}, {box2}); no live version is left"
+        assert 200 in box1 + box2 and 409 in box1 + box2, (box1, box2)
+
+    def test_finalizing_waits_for_an_in_flight_submission(self, api: Api) -> None:
+        """COR-075-002: the policy check and the upload are not one step."""
+        artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+        store = main.app.state.store
+        # After the frozen/contributor checks passed, before the version lands.
+        entered, release = _pause_inside(store, "add_version_next")
+
+        submit, box_submit = _in_thread(
+            lambda: _submit_version(api, artifact_id, "# Two", headers=OTHER_AUTH_HEADERS).status_code
+        )
+        assert entered.wait(timeout=5)
+        finalize, box_final = _in_thread(
+            lambda: _policy(api, artifact_id, status="final").status_code
+        )
+        # The finalize must not complete while a submission it has to be
+        # ordered against is between its check and its write.
+        finalize.join(timeout=0.5)
+        assert box_final == [], "the document was finalized under an in-flight submission"
+        release.set()
+        submit.join(timeout=5)
+        finalize.join(timeout=5)
+        assert box_submit == [201] and box_final == [200], (box_submit, box_final)
+
+    def test_a_submission_cannot_land_in_an_artifact_being_purged(self, api: Api) -> None:
+        """COR-075-009: nothing fences writes against an in-progress purge."""
+        artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+        store = main.app.state.store
+        entered, release = _pause_inside(store, "delete")
+
+        purge, box_purge = _in_thread(
+            lambda: api.client.delete(f"/api/artifacts/{artifact_id}/purge", headers=AUTH_HEADERS).status_code
+        )
+        assert entered.wait(timeout=5)
+        submit, box_submit = _in_thread(
+            lambda: _submit_version(api, artifact_id, "# Two", headers=OTHER_AUTH_HEADERS).status_code
+        )
+        submit.join(timeout=0.5)
+        release.set()
+        purge.join(timeout=5)
+        submit.join(timeout=5)
+
+        assert box_purge == [200], box_purge
+        assert box_submit == [404], f"a version landed in a purged artifact: {box_submit}"
+        assert api.backend.search_by_tag(f"artifact-id-{artifact_id}") == [], (
+            "the purge left a version file behind"
+        )
+
+    def test_pinning_and_deleting_the_same_version_stay_consistent(self, api: Api) -> None:
+        """COR-075-006: the head can be pinned to a version being deleted."""
+        artifact_id = _publish_markdown(api, "# One")
+        assert _submit_version(api, artifact_id, "# Two").status_code == 201
+        store = main.app.state.store
+        entered, release = _pause_inside(store, "_delete_file_confirmed")
+
+        delete, box_delete = _in_thread(
+            lambda: api.client.delete(f"/api/artifacts/{artifact_id}/versions/2", headers=AUTH_HEADERS).status_code
+        )
+        assert entered.wait(timeout=5)
+        pin, box_pin = _in_thread(
+            lambda: api.client.put(
+                f"/api/artifacts/{artifact_id}/head",
+                json={"mode": "pinned", "version": 2},
+                headers=AUTH_HEADERS,
+            ).status_code
+        )
+        pin.join(timeout=0.5)
+        release.set()
+        delete.join(timeout=5)
+        pin.join(timeout=5)
+
+        meta = store.get_meta(artifact_id)
+        existing = {row["version"] for row in store.list_versions(artifact_id)}
+        if meta.head_mode == "pinned":
+            assert meta.head_version in existing, (
+                f"head pinned to deleted version {meta.head_version}; {box_delete}, {box_pin}"
+            )
+
+
+def test_a_deleted_newest_version_number_is_never_reused(api: Api) -> None:
+    """COR-075-004: the next number is max(existing)+1, so deleting the newest
+    hands its number to different content -- and every link, comment anchor
+    and diff that named it now points at something else."""
+    artifact_id = _publish_markdown(api, "# One")
+    assert _submit_version(api, artifact_id, "# Two").json()["version"] == 2
+    assert api.client.delete(f"/api/artifacts/{artifact_id}/versions/2", headers=AUTH_HEADERS).status_code == 200
+    assert _submit_version(api, artifact_id, "# Three").json()["version"] == 3
+
+    # ...and still not after a restart with an empty index.
+    fresh = ArtifactStore(
+        backend=api.backend,
+        cache_dir=api.settings.cache_dir / "fresh",
+        cache_max_entries=api.settings.cache_max_entries,
+        max_versions=api.settings.max_versions,
+    )
+    fresh.hydrate()
+    assert api.client.delete(f"/api/artifacts/{artifact_id}/versions/3", headers=AUTH_HEADERS).status_code == 200
+    fresh.hydrate()
+    assert fresh.next_version(artifact_id) == 4

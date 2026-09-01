@@ -63,7 +63,10 @@ Two kinds of Storage File back every artifact, both tagged for index rebuild:
   overwritten.
 - **Meta file** `artifact-{id}-meta.json`, tagged `artifact-hub`,
   `artifact-id-{id}`, `artifact-meta`, `artifact-owner-{key}`. Owner, password
-  hash, `accept_versions`, head pointer.
+  hash, `accept_versions`, head pointer, and `version_high_water` — the
+  highest version number ever allocated, written only when the newest
+  version is deleted, so that number is never handed to new content after a
+  restart (`ArtifactStore.delete_version` persists it *before* the file goes).
 
 On startup the in-memory index is rebuilt entirely by listing Storage Files
 tagged `artifact-hub` (`ArtifactStore.hydrate` in `src/store.py`) — there is

@@ -366,6 +366,13 @@ class ArtifactMeta:
     # Declared last so every positional argument keeps the meaning it had
     # before 0.7.0.
     invitations: list[dict] = field(default_factory=list)
+    # Highest version number ever allocated, kept so a number outlives the
+    # version that held it: links, comment anchors and diffs all name versions
+    # by number, and the newest one being deleted must not hand its number to
+    # whatever is submitted next. Only ever written when the newest version is
+    # deleted; 0 (or absent, for every older meta file) means "nothing beyond
+    # what exists", which is exactly what max(existing) already gives.
+    version_high_water: int = 0
 
     def __post_init__(self) -> None:
         """Normalize the enum-ish fields so an unknown value can never leak in."""
@@ -474,6 +481,7 @@ class ArtifactMeta:
             "updated_at": self.updated_at,
             "schema": self.schema,
             "invitations": self.invitations,
+            "version_high_water": self.version_high_water,
         }
         return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -559,6 +567,13 @@ class ArtifactMeta:
             updated_at=data.get("updated_at") or "",
             schema=schema if isinstance(schema, int) else SCHEMA_VERSION,
             invitations=invitations if isinstance(invitations, list) else [],
+            version_high_water=(
+                high_water
+                if isinstance(high_water := data.get("version_high_water"), int)
+                and not isinstance(high_water, bool)
+                and high_water > 0
+                else 0
+            ),
         )
 
 
@@ -825,6 +840,13 @@ class _ArtEntry:
     # allocation picks a distinct number without a half-written slot ever being
     # served. See :meth:`ArtifactStore.add_version_next`.
     reserving: set[int] = field(default_factory=set)
+    # Highest version number ever allocated for this artifact, including ones
+    # since deleted. Seeded from ``ArtifactMeta.version_high_water`` when the
+    # meta record is loaded or saved, raised in memory on every allocation, and
+    # persisted (via the meta record) when the newest version is deleted --
+    # the one event that can make ``max(existing) + 1`` hand an old number to
+    # new content. See :meth:`ArtifactStore.delete_version`.
+    high_water: int = 0
 
     def version_numbers(self) -> list[int]:
         """All known version numbers, ascending; a legacy file counts as v1.
@@ -839,10 +861,10 @@ class _ArtEntry:
 
     def next_free_number(self) -> int:
         """Lowest unused version number, counting reservations and legacy v1."""
-        numbers = set(self.versions) | self.reserving
+        numbers = set(self.versions) | self.reserving | {self.high_water}
         if self.legacy_file_id is not None:
             numbers.add(1)
-        return (max(numbers) + 1) if numbers else 1
+        return max(numbers) + 1 if max(numbers) > 0 else 1
 
 
 class ArtifactStore:
@@ -1025,6 +1047,7 @@ class ArtifactStore:
             entry.meta_file_id = file_id
             self._forget_meta_locked(artifact_id)
             self._remember_meta_locked(artifact_id, file_id, meta)
+            self._seed_high_water_locked(artifact_id, meta)
             # Keep the share index in step with what we just persisted; a
             # rotation drops the previous share id here (that revocation is the
             # whole point of rotating).
@@ -1278,6 +1301,10 @@ class ArtifactStore:
         needs shared state and is out of scope here.
         """
         artifact_id = env.id
+        # Loading the meta record seeds the high-water mark into the index, so
+        # a process that has not read this artifact yet cannot reuse a number
+        # a previous process retired. Cached after the first read.
+        self.get_meta(artifact_id)
         with self._lock:
             entry = self._index.setdefault(artifact_id, _ArtEntry())
             version = entry.next_free_number()
@@ -1300,6 +1327,7 @@ class ArtifactStore:
         with self._lock:
             entry = self._index.setdefault(artifact_id, _ArtEntry())
             entry.reserving.discard(version)
+            entry.high_water = max(entry.high_water, version)
             previous = entry.versions.get(version)
             entry.versions[version] = _VerEntry(
                 file_id=file_id, status=assigned.status, size_bytes=len(raw)
@@ -1441,6 +1469,10 @@ class ArtifactStore:
         allocating with it and a separate :meth:`add_version` is still racy —
         prefer :meth:`add_version_next` for the actual write.
         """
+        # Same seeding as add_version_next: without the meta record loaded, a
+        # fresh process would show max(existing) + 1 and contradict what the
+        # allocation is about to do.
+        self.get_meta(artifact_id)
         entry = self._resolve(artifact_id)
         if entry is None:
             return 1
@@ -1499,6 +1531,19 @@ class ArtifactStore:
                     artifact_id,
                 )
                 return False
+
+        if version == max(numbers):
+            # Deleting the newest version is the one event after which
+            # ``max(existing) + 1`` would hand this number to new content --
+            # and every link, comment anchor and diff that named it would
+            # silently point at something else. Persist the mark *before* the
+            # file goes: if this write fails the version simply stays, whereas
+            # the other order could lose the number across a restart.
+            meta = self.get_meta(artifact_id)
+            if meta is not None and meta.version_high_water < version:
+                self.save_meta(replace(meta, version_high_water=version))
+            with self._lock:
+                entry.high_water = max(entry.high_water, version)
 
         with self._lock:
             ver_entry = entry.versions.get(version)
@@ -2005,7 +2050,14 @@ class ArtifactStore:
             return None
         with self._lock:
             self._remember_meta_locked(artifact_id, file_id, meta)
+            self._seed_high_water_locked(artifact_id, meta)
         return meta
+
+    def _seed_high_water_locked(self, artifact_id: str, meta: ArtifactMeta) -> None:
+        """Carry the persisted high-water mark into the index. Caller holds the lock."""
+        entry = self._index.get(artifact_id)
+        if entry is not None and meta.version_high_water > entry.high_water:
+            entry.high_water = meta.version_high_water
 
     def _too_large(self, size: int | None) -> bool:
         """True when ``size`` exceeds the configured envelope byte bound."""
