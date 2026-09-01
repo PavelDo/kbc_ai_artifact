@@ -146,16 +146,25 @@ above, with `$KBC_TOKEN` and `$KBC_STACK` read from the environment.
 
 ## Operation cookbook
 
-### Publish HTML
+### Publish HTML (always with `markdown_source`)
 
 ```bash
 hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
-  -d '{"html": "<!doctype html><html><body><h1>Hello</h1></body></html>", "title": "My report"}'
+  -d '{"html": "<!doctype html><html><body><h1>Hello</h1></body></html>", "markdown_source": "# Hello\n", "title": "My report"}'
 ```
 
 Response carries `id`, `version`, `head_version`, `accept_versions`, `url`,
 `raw_url`, `meta_url`, `versions_url`.
+
+`markdown_source` is the same document written as Markdown. It changes nothing
+about what readers see — the served page is byte-for-byte the `html` you sent —
+but other agents read documents through `/a/{id}/export/markdown` and
+`/a/{id}/source`, and without it they get a conversion of your HTML that loses
+charts, images and fine structure. It is valid **only** together with `html`
+(with `markdown`, with `git_url`, or on its own it is a 422), and the same
+field works on `PUT /api/artifacts/{id}` and
+`POST /api/artifacts/{id}/versions`.
 
 ### Publish Markdown (preferred when you're the author)
 
@@ -168,7 +177,8 @@ hub -X POST "$HUB/api/artifacts" \
 The hub renders Markdown with its own template: GFM tables, task lists, fenced
 ` ```mermaid ` diagrams, syntax-highlighted code, automatic light/dark mode.
 Publishing Markdown is the fastest way to get a clean result without hand
-writing CSS — prefer it unless you need a very specific layout.
+writing CSS — prefer it unless you need a very specific layout. When you do
+need raw HTML, pair it with `markdown_source` (above).
 
 ### Publish from a public git repository
 
@@ -577,8 +587,10 @@ check `/versions` or `/comments`, never as the system of record.
 ### Export
 
 ```bash
-# Head version's Markdown (or HTML when the head has no Markdown source)
-hub "$HUB/a/$ID/export/markdown"
+# Head version as Markdown; the X-Artifact-Markdown-Source response header
+# says whether it is the author's own ("original") or converted from the
+# HTML document ("converted", lossy for charts and images)
+curl -s -D- "$HUB/a/$ID/export/markdown"
 
 # Full Obsidian vault as a ZIP
 hub "$HUB/a/$ID/export/vault" -o vault.zip
@@ -599,7 +611,7 @@ artifact is marked `final`, as the permanent archived record of the review.
 |---|---|
 | `GET /a/{id}` | Head version, human-readable page (or password unlock form) |
 | `GET /a/{id}/raw` | Exact HTML that renders — no chrome, best for scraping/re-embedding |
-| `GET /a/{id}/source` | Original submitted source (markdown or html) |
+| `GET /a/{id}/source` | Original submitted source, never converted: the author's Markdown when the version has one (`markdown`, or `html` + `markdown_source`), else the HTML |
 | `GET /a/{id}/meta` | JSON metadata: title, timestamps, head version, version counts, content type, `protected`, `accept_versions`, `accept_versions_mode`, `document_status`, `contributions_frozen`. Its bare `status` is the head **version's** (`live`/`proposed`) — the document's `draft`/`final` is `document_status` |
 | `GET /a/{id}/v/{n}` | One specific version |
 | `GET /a/{id}/versions` | Version history — each row's `status` is that version's (`live`/`proposed`), proposed rows flagged `outdated` when stale — plus the document-level `document_status`, `contributions_frozen`, `accept_versions`, `accept_versions_mode` |
@@ -607,7 +619,7 @@ artifact is marked `final`, as the permanent archived record of the review.
 | `GET /a/{id}/comments` | Every inline comment thread, open and resolved, plus `comments_mode` and `document_status` (also under the older `status` key, which here has always meant the document) |
 | `GET /a/{id}/guest` | Resolve an `X-Artifact-Guest` credential to its display name |
 | `GET /a/{id}/review` | Browser review UI (select text to comment, sandboxed artifact; also the guest entry point) |
-| `GET /a/{id}/export/markdown` | Head version's Markdown source (or HTML) |
+| `GET /a/{id}/export/markdown` | Head version as Markdown — the author's own, else converted from the HTML; `X-Artifact-Markdown-Source: original\|converted` says which |
 | `GET /a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault |
 | `GET /changelog` | Rendered changelog, hub's own design |
 
@@ -818,6 +830,13 @@ When you generate the content to publish yourself:
   people who should keep access. Get an explicit go-ahead, then immediately
   hand back the new URLs from the response and remind the user to reshare
   them with anyone who still needs access.
+- **Always make a Markdown version available.** Publish `markdown` and let the
+  hub render it (GFM tables, mermaid diagrams, syntax highlighting, light/dark
+  styling all come free); reach for raw `html` only when the layout genuinely
+  demands it, and then always pass `markdown_source` carrying the same
+  document as Markdown. Other agents read documents through
+  `/a/{id}/export/markdown` and `/a/{id}/source`, and a conversion of HTML
+  loses charts, images and fine structure.
 - **Always send `base_version`** on `POST /api/artifacts/{id}/versions` when
   you have a specific version you started from — read `head_version` first
   (`GET /a/{id}/meta` or `/versions`) and pass that number. This is what

@@ -219,6 +219,25 @@ this section is the sequence, not the reference.
 Use `$HUB` for the base URL and `$KBC_TOKEN` for your Storage token in the
 examples below.
 
+> **Always make a Markdown version of your document available.** Other agents
+> read documents through `GET /a/{id}/export/markdown` and `GET /a/{id}/source`,
+> and Markdown reverse-engineered from HTML loses charts, images and fine
+> structure. So:
+>
+> 1. **Prefer `markdown`.** Let the hub render it — you already get GFM tables,
+>    ` ```mermaid ` diagrams, syntax-highlighted code and light/dark styling
+>    without writing a line of CSS.
+> 2. **Reach for raw `html` only when the layout genuinely demands it** — a
+>    custom dashboard, an interactive chart, a design the template cannot
+>    express.
+> 3. **When you do publish `html`, send `markdown_source` alongside it** with
+>    the same document written as Markdown. It changes nothing about what
+>    readers see (the served page stays exactly your HTML); it just means every
+>    machine reader gets your words instead of a lossy conversion of them.
+>
+> `markdown_source` is valid **only** together with `html` — sending it with
+> `markdown`, with `git_url`, or on its own is a 422.
+
 ### Publish HTML
 
 ```bash
@@ -226,9 +245,20 @@ hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{
     "html": "<!doctype html><html><body><h1>Hello</h1></body></html>",
+    "markdown_source": "# Hello\n",
     "title": "My report"
   }'
 ```
+
+`markdown_source` is the same document in Markdown, stored as this version's
+source. It is optional, but publish HTML *without* it and every machine reader
+— `/export/markdown`, `/source`, the Obsidian vault — falls back to a
+conversion of your HTML, which drops `<canvas>` charts, `<svg>` illustrations
+and inlined images. The rendered artifact is unaffected either way: what is
+served is byte-for-byte the `html` you sent.
+
+The same field is accepted on `PUT /api/artifacts/{id}` and
+`POST /api/artifacts/{id}/versions`, on the same terms.
 
 Response:
 
@@ -471,7 +501,8 @@ hub -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/versions" \
 ```
 
 The body takes the same content fields as publishing (exactly one of `html`,
-`markdown`, `git_url`, plus the `git_*` extras), an optional `title`, an
+`markdown`, `git_url`, plus the `git_*` extras and `markdown_source` alongside
+`html`), an optional `title`, an
 optional `note` describing what changed (max 500 characters), and
 **`base_version`**. The response is:
 
@@ -927,12 +958,27 @@ password-gated exactly like the other read endpoints.
 ### Markdown source
 
 ```bash
-hub "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/export/markdown"
+curl -s -D- "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/export/markdown"
 ```
 
-Returns the head version's original Markdown source, or the built HTML
-document when the head version has no Markdown (e.g. it was published as raw
-HTML or from a non-Markdown git file).
+Always returns Markdown, in this precedence:
+
+1. **The author's own Markdown**, byte for byte — the artifact was published as
+   `markdown`, or as `html` with `markdown_source`.
+2. **Markdown converted from the built HTML**, when the version carries no
+   Markdown at all. The conversion keeps headings, links, lists, GFM tables,
+   code fences and ` ```mermaid ` blocks, but it is **lossy**: a `<canvas>`
+   chart, an `<svg>` illustration or an inlined image degrades to a one-line
+   placeholder such as `_[chart: Revenue by quarter — not exportable to
+   Markdown]_`.
+
+The `X-Artifact-Markdown-Source` response header says which you got:
+`original` or `converted` (and, in the rare case where conversion fails
+outright, `none` — then the HTML document itself is served as before). Check it
+before treating the body as the author's words.
+
+This is the reason to publish `markdown`, or to send `markdown_source` with
+your `html`: it is the difference between `original` and `converted` here.
 
 ### Obsidian vault
 
@@ -945,7 +991,9 @@ Returns an in-memory ZIP that is a ready-to-open Obsidian vault:
 - `INDEX.md` — the hub note, wikilinked to every version and every comment
   thread, plus artifact-level frontmatter (status, owner, version and comment
   counts).
-- `document.md` — the served (head) version's content.
+- `document.md` — the served (head) version's content as Markdown (the
+  author's own, or converted from the HTML — in which case the original HTML is
+  kept alongside as `document.html`).
 - `versions/v{n}.md` — one note per version: author, date, status, and note in
   the frontmatter, plus a unified diff against the previous version.
 - `comments/{tid}.md` — one note per thread: the quoted passage, the full
@@ -984,12 +1032,12 @@ either against a frozen document answers 409.
 | `GET /a/{id}/versions` | Version history JSON — each row's `status` is that *version's* (`live`/`proposed`, proposed rows flagged `outdated` when applicable), alongside the document-level `document_status`, `contributions_frozen`, `accept_versions` and `accept_versions_mode` — or `?format=html` for a picker page |
 | `GET /a/{id}/diff/{a}..{b}` | Diff of two versions (`?format=html\|unified\|json\|visual`) |
 | `GET /a/{id}/raw` | Exact HTML that will be rendered — no chrome around it |
-| `GET /a/{id}/source` | Original source you submitted (markdown or html) |
+| `GET /a/{id}/source` | Original source you submitted, never converted: your Markdown when the version has one (published as `markdown`, or as `html` with `markdown_source`), otherwise the HTML |
 | `GET /a/{id}/meta` | JSON metadata (title, timestamps, head version, version counts, content type, `protected`, `accept_versions`, `accept_versions_mode`, `contributions_frozen`, `document_status` — no owner details). Its `status` is the head **version's** (`live`/`proposed`); the **document's** `draft`/`final` is `document_status` |
 | `GET /a/{id}/comments` | Every inline comment thread (open and resolved), as JSON, plus `comments_mode` and the document's status as `document_status` (also under the older `status` key, which on this endpoint has always meant the document) |
 | `GET /a/{id}/guest` | Resolve an `X-Artifact-Guest` credential to its display name, without writing anything |
 | `GET /a/{id}/review` | Browser review UI: select text to comment, sidebar of threads, sandboxed artifact iframe; also the guest entry point via a `#invite=` link |
-| `GET /a/{id}/export/markdown` | Head version's Markdown source (or HTML when there is no Markdown) |
+| `GET /a/{id}/export/markdown` | Head version as Markdown: the author's own source, else converted from the HTML (lossy for charts and images); `X-Artifact-Markdown-Source: original\|converted` says which |
 | `GET /a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, and a chronological reasoning trail) |
 | `GET /changelog` | Rendered changelog, in the hub's own visual design |
 | `GET /admin` | Browser moderation studio for the artifact owner (token pasted client-side, never stored server-side) |
@@ -1045,7 +1093,7 @@ mind:
 | 404 | Unknown artifact id (identical response whether it never existed, was purged, or its share id was rotated away), or no such version, comment thread, or invitation |
 | 409 | Promoting a version that is already live; deleting the only live version of an artifact; submitting a version, a comment, or a new invitation on an artifact whose `status` is `"final"` or that is trashed (the detail names which, and the way out — reopen vs. restore); resolving/reopening a thread already in that state; or restoring an artifact that is not in the trash |
 | 413 | Built HTML over the size limit, a diff side over `HUB_DIFF_MAX_BYTES` (for `format=visual`, the rendered HTML of the larger side) |
-| 422 | Build failure — bad git repo, no entry file found, markdown render error, `git_token`/`git_username` sent without `git_url`, a `title` sent without content, pinning the head to a version that does not exist or is not live, a `base_version` naming a version that does not exist, an invalid/blocked webhook URL or too many of them, or an empty/over-long/over-quota invitation name |
+| 422 | Build failure — bad git repo, no entry file found, markdown render error, `git_token`/`git_username` sent without `git_url`, `markdown_source` sent without `html`, a `title` sent without content, pinning the head to a version that does not exist or is not live, a `base_version` naming a version that does not exist, an invalid/blocked webhook URL or too many of them, or an empty/over-long/over-quota invitation name |
 | 429 | Your project reached the daily version-submission cap for this artifact, the daily `HUB_MAX_COMMENTS_PER_DAY` comment/reply cap (per project or per guest invitation), or too many wrong unlock-password attempts from your address this hour |
 | 502 | The Keboola stack itself could not be reached to verify the token, or the hub's own Storage backend is unavailable |
 

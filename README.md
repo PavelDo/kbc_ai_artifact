@@ -46,6 +46,12 @@ content, source, or metadata over a small JSON API.
   (`GET/POST /a/{id}/comments`), and `GET /a/{id}/review` is a browser page
   where selecting text opens a comment composer — the artifact renders in a
   sandboxed iframe so its own scripts never see the reviewer's token
+- **Markdown export** (`GET /a/{id}/export/markdown`): always Markdown — the
+  author's own source when the version has one (published as `markdown`, or as
+  `html` with `markdown_source`), otherwise converted from the HTML document,
+  which keeps headings, tables, links, code and mermaid fences but degrades
+  charts and images to a placeholder line. The
+  `X-Artifact-Markdown-Source: original|converted` header reports which
 - **Obsidian vault export** (`GET /a/{id}/export/vault`): a ZIP containing a
   ready-to-open vault — an `INDEX.md` hub, one note per version with its diff,
   one note per comment thread, and a chronological `reasoning.md` timeline —
@@ -89,7 +95,13 @@ content, source, or metadata over a small JSON API.
 ## Architecture
 
 **Publish flow.** A client sends content (`html`, `markdown`, or `git_url`)
-plus a Storage token and stack to `POST /api/artifacts`. The service verifies
+plus a Storage token and stack to `POST /api/artifacts`. Publishers are asked
+to always make a Markdown version available — publish `markdown` and let the
+hub render it, or, when raw `html` is genuinely needed, send the optional
+`markdown_source` alongside it (valid only with `html`; it does not change what
+is rendered). Agents read documents through `/a/{id}/export/markdown` and
+`/a/{id}/source`, and Markdown converted from HTML is lossy for charts and
+images. The service verifies
 the token against the caller's own stack to establish project identity, then
 builds the final HTML (rendering Markdown or cloning+resolving a git repo as
 needed). Two copies are written:
@@ -174,12 +186,12 @@ Public (no auth):
 | GET | `/a/{id}/versions` | Version history JSON (each row's `status` is that version's `live`/`proposed`), plus the document-level `document_status` / `contributions_frozen` / `accept_versions_mode`; proposed rows flagged `outdated`; `?format=html` renders a picker page |
 | GET | `/a/{id}/diff/{a}..{b}` | Diff two versions; `?format=html\|unified\|json\|visual` |
 | GET | `/a/{id}/raw` | Raw built HTML, byte-exact, no iframe (password via `X-Artifact-Password` if protected) |
-| GET | `/a/{id}/source` | Original submitted source (markdown or html) |
+| GET | `/a/{id}/source` | Original submitted source, never converted (the author's Markdown when the version has one, else the HTML) |
 | GET | `/a/{id}/meta` | Public metadata JSON (no owner details); `status` is the head **version's** (`live`/`proposed`), `document_status` is the **document's** (`draft`/`final`), with `contributions_frozen` and `accept_versions_mode` |
 | GET | `/a/{id}/comments` | Every inline comment thread (open and resolved) as JSON, plus `comments_mode` and the document status as `document_status` (also as the legacy `status`, which on this endpoint has always meant the document) |
 | GET | `/a/{id}/guest` | Resolve an `X-Artifact-Guest` credential to its display name |
 | GET | `/a/{id}/review` | Browser review UI: select text to comment, sandboxed artifact iframe; also the guest entry point via a `#invite=` fragment |
-| GET | `/a/{id}/export/markdown` | Head version's Markdown source (or HTML when it has none) |
+| GET | `/a/{id}/export/markdown` | Head version as Markdown: the author's own source when there is one, otherwise converted from the HTML document (lossy for charts and images). `X-Artifact-Markdown-Source: original\|converted` reports which |
 | GET | `/a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, reasoning timeline) |
 | GET | `/changelog` / `/changelog.md` | Rendered changelog (hub's own design) / raw source |
 | GET | `/health` | Liveness check + service version + index stats |
@@ -196,7 +208,7 @@ Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/artifacts` | Publish `{html \| markdown \| git_url[, git_ref, git_path, git_token, git_username], title?, password?, accept_versions?}` → `{id, version, head_version, url, raw_url, meta_url, versions_url, ...}` |
+| POST | `/api/artifacts` | Publish `{html[, markdown_source] \| markdown \| git_url[, git_ref, git_path, git_token, git_username], title?, password?, accept_versions?}` → `{id, version, head_version, url, raw_url, meta_url, versions_url, ...}` |
 | PUT | `/api/artifacts/{id}` | Add a live version and/or change `password` / `clear_password` / `accept_versions_mode` / `contributors` / `comments_mode` / `status` / `webhooks` (owner project only) |
 | GET | `/api/artifacts` | List the caller's project's own artifacts (trashed ones included, with `webhooks_count`); each row's `status` is the document's, mirrored as `document_status` with a derived `contributions_frozen` |
 | DELETE | `/api/artifacts/{id}` | **Soft delete**: move to the trash — public link dies, everything is kept and restorable (owner project only) |
@@ -207,7 +219,7 @@ Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 | POST | `/api/artifacts/{id}/invitations` | Invite a guest to comment `{name}` → one-time `review_url` with the secret in the URL fragment (owner project only) |
 | GET | `/api/artifacts/{id}/invitations` | List an artifact's guest invitations, no secrets (owner project only) |
 | DELETE | `/api/artifacts/{id}/invitations/{iid}` | Revoke one invitation; everyone else's keeps working (owner project only) |
-| POST | `/api/artifacts/{id}/versions` | Submit a version `{html \| markdown \| git_url, title?, note?, base_version?}` — live for the owner, proposed for any other project (409 when `status` is `final` or trashed) |
+| POST | `/api/artifacts/{id}/versions` | Submit a version `{html[, markdown_source] \| markdown \| git_url, title?, note?, base_version?}` — live for the owner, proposed for any other project (409 when `status` is `final` or trashed) |
 | POST | `/api/artifacts/{id}/versions/{n}/promote` | Promote a proposal to live (owner project only) |
 | DELETE | `/api/artifacts/{id}/versions/{n}` | Delete a version (owner), or withdraw your own proposal (contributor) |
 | PUT | `/api/artifacts/{id}/head` | `{"mode": "latest"}` or `{"mode": "pinned", "version": n}` (owner project only) |

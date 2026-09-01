@@ -1903,6 +1903,18 @@ class PublishBody(BaseModel):
             "'markdown' and 'git_url'."
         ),
     )
+    markdown_source: str | None = Field(
+        None,
+        description=(
+            "The same document in Markdown, kept as the version's source. "
+            "Only valid together with 'html' (422 otherwise) and it does not "
+            "change what is served — the rendered document stays exactly the "
+            "HTML you submitted. Supply it whenever you publish HTML: other "
+            "agents read documents through /a/{id}/export/markdown and "
+            "/a/{id}/source, and without it they get a conversion of your "
+            "HTML that loses charts, images and fine structure."
+        ),
+    )
     markdown: str | None = Field(
         None,
         description=(
@@ -2000,6 +2012,18 @@ class UpdateBody(BaseModel):
         description=(
             "Complete HTML document, served as-is. At most one of 'html', "
             "'markdown', 'git_url' may be given."
+        ),
+    )
+    markdown_source: str | None = Field(
+        None,
+        description=(
+            "The same document in Markdown, kept as the version's source. "
+            "Only valid together with 'html' (422 otherwise) and it does not "
+            "change what is served — the rendered document stays exactly the "
+            "HTML you submitted. Supply it whenever you publish HTML: other "
+            "agents read documents through /a/{id}/export/markdown and "
+            "/a/{id}/source, and without it they get a conversion of your "
+            "HTML that loses charts, images and fine structure."
         ),
     )
     markdown: str | None = Field(
@@ -2245,6 +2269,16 @@ class VersionBody(BaseModel):
     }
 
     html: str | None = Field(None, description="Complete HTML document, served as-is.")
+    markdown_source: str | None = Field(
+        None,
+        description=(
+            "The same document in Markdown, kept as this version's source. "
+            "Only valid together with 'html' (422 otherwise); it does not "
+            "change what is served. Always send it when you submit HTML, so "
+            "readers of /a/{id}/export/markdown and /a/{id}/source get your "
+            "own Markdown rather than a lossy conversion of it."
+        ),
+    )
     markdown: str | None = Field(
         None, description="Markdown source, rendered by the built-in template."
     )
@@ -2378,6 +2412,22 @@ def _check_git_credentials(body: PublishBody | UpdateBody | VersionBody) -> None
         )
 
 
+def _check_markdown_source(body: PublishBody | UpdateBody | VersionBody) -> None:
+    """Reject ``markdown_source`` sent without an ``html`` document.
+
+    It is the Markdown *of the submitted HTML*: with 'markdown' or 'git_url'
+    there already is a source, and on its own there is no document it could
+    belong to. Silently ignoring it would leave the caller believing their
+    Markdown had been retained when it had not — so, exactly like a stray git
+    field, this is a hard 422.
+    """
+    if body.markdown_source is not None and body.html is None:
+        raise HTTPException(
+            status_code=422,
+            detail="'markdown_source' is only valid together with 'html'",
+        )
+
+
 def _validate_contributors(keys: list[str]) -> list[str]:
     """Clean and validate a contributor allowlist, or raise 422.
 
@@ -2507,7 +2557,24 @@ def _build(
                         f"{settings.max_html_bytes} bytes"
                     ),
                 )
+            markdown_source = getattr(body, "markdown_source", None)
+            if markdown_source is not None and (
+                len(markdown_source.encode("utf-8")) > settings.max_html_bytes
+            ):
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        "markdown_source is too large; the limit is "
+                        f"{settings.max_html_bytes} bytes"
+                    ),
+                )
             built = builder.build_from_html(body.html, body.title)
+            # Stored under the same "markdown" key the Markdown-authored path
+            # uses, so head_source, the vault and /a/{id}/source all pick it
+            # up with no further change. The *rendering* is untouched: what is
+            # served stays exactly the submitted HTML.
+            if markdown_source is not None:
+                return built, {"markdown": markdown_source}
             return built, {}
 
         if body.markdown is not None:
@@ -2950,7 +3017,11 @@ def context(request: Request) -> dict:
                 "method": "GET",
                 "path": "/a/{id}/source",
                 "auth": "url capability; X-Artifact-Password when protected",
-                "purpose": "original source (markdown or html)",
+                "purpose": (
+                    "original submitted source: the author's Markdown when "
+                    "the version has one (markdown-authored, or html "
+                    "published with markdown_source), else the HTML"
+                ),
             },
             {
                 "method": "GET",
@@ -3025,8 +3096,11 @@ def context(request: Request) -> dict:
                 "path": "/a/{id}/export/markdown",
                 "auth": "url capability",
                 "purpose": (
-                    "head version's markdown source (or its HTML document) as "
-                    "a file attachment"
+                    "head version's Markdown as a file attachment: the "
+                    "author's own source when there is one, otherwise "
+                    "converted from the HTML document; the "
+                    "X-Artifact-Markdown-Source header says which "
+                    "('original' / 'converted')"
                 ),
             },
             {
@@ -3199,6 +3273,14 @@ def context(request: Request) -> dict:
                 "string, rendered by the built-in template (GFM tables, task "
                 "lists, mermaid fences, syntax highlighting)"
             ),
+            "markdown_source": (
+                "string, optional; only valid together with html. The same "
+                "document in Markdown, stored as the version's source and "
+                "served by /a/{id}/source and /a/{id}/export/markdown, so "
+                "other agents read your text instead of a lossy conversion "
+                "of your HTML. It does not change what is rendered: the "
+                "served document stays exactly the html you submitted"
+            ),
             "git_url": "string, https git repository to clone (public, or private with git_token)",
             "git_ref": (
                 "string, optional branch or tag for git_url; a commit id is "
@@ -3227,6 +3309,10 @@ def context(request: Request) -> dict:
             ),
             "rules": [
                 "exactly one of html, markdown, git_url",
+                "markdown_source is only valid together with html (422 "
+                "otherwise); always send it when you publish html, so "
+                "/export/markdown and /a/{id}/source can serve your own "
+                "Markdown rather than a conversion",
                 "git_ref, git_path, git_token and git_username are only valid "
                 "together with git_url (422 otherwise)",
                 "userinfo (https://user:pass@host/...), the query string and "
@@ -3351,9 +3437,14 @@ def context(request: Request) -> dict:
                 "every listing."
             ),
             "export": (
-                "GET /a/{id}/export/markdown downloads the served version's "
-                "source; GET /a/{id}/export/vault downloads a deterministic "
-                "Obsidian vault ZIP of the whole history and discussion."
+                "GET /a/{id}/export/markdown downloads the served version as "
+                "Markdown — the author's own source when the version has one "
+                "(markdown-authored, or html published with markdown_source), "
+                "otherwise converted from the HTML, which is lossy for charts "
+                "and images; the X-Artifact-Markdown-Source header reports "
+                "'original' or 'converted'. GET /a/{id}/export/vault "
+                "downloads a deterministic Obsidian vault ZIP of the whole "
+                "history and discussion."
             ),
         },
         "guests": {
@@ -4042,11 +4133,15 @@ def read_raw(
     tags=["public"],
     summary="Original submitted source",
     description=(
-        "Returns the head version's original Markdown (as text/markdown) for "
-        "markdown-sourced artifacts, or the original HTML (as text/html) for "
-        "html and git-html artifacts. Markdown rendered from a git repository "
-        "has no retained source: that answers 404 with a JSON pointer back to "
-        "the repository, ref and commit.\n\n"
+        "Returns the head version's retained source: the original Markdown "
+        "(as text/markdown) whenever the version has one — markdown-sourced "
+        "artifacts, and HTML published with 'markdown_source' — otherwise the "
+        "original HTML (as text/html) for html and git-html artifacts. "
+        "Markdown rendered from a git repository has no retained source: that "
+        "answers 404 with a JSON pointer back to the repository, ref and "
+        "commit.\n\n"
+        "This route never converts: it serves what was submitted. For "
+        "Markdown of an HTML-only artifact, use /a/{id}/export/markdown.\n\n"
         "The HTML answer is publisher-controlled markup served as a top-level "
         "document, so — exactly like /a/{id}/raw — it carries "
         "`Content-Security-Policy: sandbox allow-scripts allow-popups "
@@ -4085,7 +4180,7 @@ def read_source(
     request: Request,
     artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
 ) -> Response:
-    """The original source: markdown for markdown artifacts, HTML otherwise."""
+    """The retained source: the author's Markdown when there is one, else HTML."""
     public_id = artifact_id
     meta = _public_meta_of(request, public_id)
     if meta is None:
@@ -4764,19 +4859,48 @@ def read_comments(
     "/a/{artifact_id}/export/markdown",
     tags=["public"],
     response_class=MarkdownResponse,
-    summary="Download the head version's source",
+    summary="Download the head version's Markdown",
     description=(
-        "Downloads the served version as a single file: the original Markdown "
-        "for markdown-authored artifacts (text/markdown), or the built HTML "
-        "document otherwise (text/html). The response carries a "
-        "Content-Disposition attachment filename derived from the version's "
-        "title, so a browser 'Save as' lands on something readable.\n\n"
-        + PASSWORD_GATE_NOTE
+        "Downloads the served version as a single Markdown file "
+        "(text/markdown). Precedence: the author's own Markdown when the "
+        "version has one — either because it was authored in Markdown, or "
+        "because an HTML artifact was published with 'markdown_source' — and "
+        "otherwise Markdown converted from the built HTML document.\n\n"
+        "The X-Artifact-Markdown-Source response header says which you got: "
+        "'original' for the author's own text (byte for byte), 'converted' "
+        "for a conversion. A conversion is lossy — a <canvas> chart or an "
+        "<svg> illustration degrades to a one-line placeholder and inlined "
+        "images are dropped — so publishers are asked to always supply "
+        "Markdown. In the rare case where conversion fails outright the "
+        "header says 'none' and the HTML document itself is served "
+        "(text/html), which is what this route used to do for every "
+        "HTML-authored artifact.\n\n"
+        "The response carries a Content-Disposition attachment filename "
+        "derived from the version's title, so a browser 'Save as' lands on "
+        "something readable.\n\n" + PASSWORD_GATE_NOTE
     ),
     responses={
         200: {
-            "description": "The head version's source, as a file attachment.",
+            "description": (
+                "The head version's Markdown, as a file attachment (or the "
+                "HTML document when conversion failed; see "
+                "X-Artifact-Markdown-Source)."
+            ),
             "content": {**CONTENT_MARKDOWN, **CONTENT_HTML},
+            "headers": {
+                "X-Artifact-Markdown-Source": {
+                    "description": (
+                        "'original' (the author's own Markdown, verbatim), "
+                        "'converted' (reverse-engineered from the HTML "
+                        "document) or 'none' (conversion failed; the HTML "
+                        "document is served instead)."
+                    ),
+                    "schema": {
+                        "type": "string",
+                        "enum": ["original", "converted", "none"],
+                    },
+                }
+            },
         },
         401: {
             "description": (
@@ -4797,7 +4921,7 @@ def export_markdown(
     request: Request,
     artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
 ) -> Response:
-    """The head version's source as a downloadable file."""
+    """The head version's Markdown (author's own, or converted) as a file."""
     public_id = artifact_id
     meta = _public_meta_of(request, public_id)
     if meta is None:
@@ -4808,11 +4932,16 @@ def export_markdown(
     if head is None:
         return _not_found(public_id)
 
-    filename, content_type, body = export.head_source(head)
+    filename, content_type, body, kind = export.head_source(head)
     return Response(
         content=body,
         media_type=content_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # Callers care whether they are reading the author's own words or
+            # something reverse-engineered from HTML.
+            "X-Artifact-Markdown-Source": kind,
+        },
     )
 
 
@@ -5064,6 +5193,7 @@ def publish_artifact(
 
     _normalize_git_url(body)
     _check_git_credentials(body)
+    _check_markdown_source(body)
     _require_exactly_one_content(body)
 
     built, source = _build(body)
@@ -5236,6 +5366,7 @@ def update_artifact(
 
     _normalize_git_url(body)
     _check_git_credentials(body)
+    _check_markdown_source(body)
     present = _content_fields(body)
     if len(present) > 1:
         raise HTTPException(
@@ -6345,6 +6476,7 @@ def submit_version(
 
     _normalize_git_url(body)
     _check_git_credentials(body)
+    _check_markdown_source(body)
     _require_exactly_one_content(body)
 
     # A base_version that names nothing would render the "outdated" flag
