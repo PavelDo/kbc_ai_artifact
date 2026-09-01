@@ -6027,9 +6027,24 @@ def revoke_invitation(
         )
 
     if not target.get("revoked"):
-        target["revoked"] = True
-        meta.updated_at = _now()
-        store.save_meta(meta)
+        # A copy, not an in-place flag. store.get_meta answers from cache, so
+        # ``meta`` is the object every later read on this replica gets:
+        # marking the invitation revoked before the save succeeds means a
+        # failed revocation still reads as revoked here, while Storage --
+        # and every other replica -- still honours the guest. The owner is
+        # told 502 and retries, but a restart rehydrates from Storage and
+        # quietly brings the guest back. save_meta uploads before it caches,
+        # so handing it a copy leaves the original untouched on failure.
+        revoked = [
+            {**invitation, "revoked": True}
+            if invitation.get("id") == invitation_id
+            else invitation
+            for invitation in meta.invitations
+        ]
+        candidate = dataclasses.replace(
+            meta, invitations=revoked, updated_at=_now()
+        )
+        store.save_meta(candidate)
         logger.info(
             "Artifact %s revoked guest invitation %s (owner project %s)",
             artifact_id,

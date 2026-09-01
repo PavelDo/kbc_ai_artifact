@@ -971,6 +971,70 @@ def test_publish_git_username_with_markdown_is_422(api: Api) -> None:
     assert "git_url" in resp.json()["detail"]
 
 
+def test_a_failed_revocation_does_not_look_revoked(api: Api, monkeypatch) -> None:
+    """A revocation that could not be persisted must not appear to have taken.
+
+    store.get_meta answers from cache, so setting revoked on the invitation
+    before save_meta succeeds marks it revoked on this replica only. The
+    owner is told 502, so they know to retry -- but a later list on this
+    same replica shows it revoked, and a restart rehydrates from Storage and
+    brings the guest back. A revocation that silently undoes itself is worse
+    than one that plainly failed.
+    """
+    artifact_id = _publish_markdown(api, "# One")
+    minted = api.client.post(
+        f"/api/artifacts/{artifact_id}/invitations",
+        json={"name": "Jana"},
+        headers=AUTH_HEADERS,
+    )
+    assert minted.status_code == 201, minted.text
+    invitation_id = minted.json()["invitation_id"]
+
+    store = main.app.state.store
+    working_save = store.save_meta
+
+    def failing_save(_meta):
+        raise BackendError("storage is down")
+
+    # Restored by hand rather than with monkeypatch.undo(), which would also
+    # roll back the api fixture's own patches (verify_token among them).
+    store.save_meta = failing_save
+    try:
+        refused = api.client.delete(
+            f"/api/artifacts/{artifact_id}/invitations/{invitation_id}",
+            headers=AUTH_HEADERS,
+        )
+        assert refused.status_code == 502, refused.text
+    finally:
+        store.save_meta = working_save
+
+    listed = api.client.get(
+        f"/api/artifacts/{artifact_id}/invitations", headers=AUTH_HEADERS
+    ).json()["invitations"]
+    assert listed[0]["revoked"] is False
+
+
+def test_a_successful_revocation_is_visible_immediately(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    invitation_id = api.client.post(
+        f"/api/artifacts/{artifact_id}/invitations",
+        json={"name": "Jana"},
+        headers=AUTH_HEADERS,
+    ).json()["invitation_id"]
+
+    assert (
+        api.client.delete(
+            f"/api/artifacts/{artifact_id}/invitations/{invitation_id}",
+            headers=AUTH_HEADERS,
+        ).status_code
+        == 200
+    )
+    listed = api.client.get(
+        f"/api/artifacts/{artifact_id}/invitations", headers=AUTH_HEADERS
+    ).json()["invitations"]
+    assert listed[0]["revoked"] is True
+
+
 class TestFrozenDocumentsFreezeModeration:
     """A frozen document blocked new comments but not the state of old ones.
 

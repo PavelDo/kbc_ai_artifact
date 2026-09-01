@@ -56,8 +56,10 @@ your side.**
   Individual comments were capped, but nothing capped the thread they pile up
   in, and a thread is rewritten whole on every reply and re-read on every
   listing.
-- A comment or a resolve that is refused no longer shows up as if it had been
-  accepted until the page is reloaded on another server.
+- A comment, a resolve or a guest-invitation revocation that is refused no
+  longer shows up as if it had been accepted. A revocation that failed to save
+  used to read as revoked on the server that handled it while the guest kept
+  working everywhere else, and came back entirely after a restart.
 - Publishing from git now says plainly that `git_ref` takes a branch or a tag.
   A commit id was documented as accepted but always failed inside git; it is
   now refused with a message that says to tag the commit instead.
