@@ -606,8 +606,9 @@ class CommentStore:
     def get(self, artifact_id: str, thread_id: str) -> CommentThread | None:
         """One thread by ID, or None. An index miss falls back to a tag search.
 
-        Another replica may have written the thread after our last hydrate, so
-        "not in the index" is re-checked against Storage before answering None.
+        The startup index can be incomplete (degraded-mode startup serves with
+        an empty index), so "not in the index" is re-checked against Storage
+        before answering None.
         """
         with self._lock:
             file_id = self._index.get(artifact_id, {}).get(thread_id)
@@ -630,9 +631,9 @@ class CommentStore:
         """Every thread of one artifact, oldest first.
 
         Driven by the artifact tag rather than the index, so a cold process — or
-        one whose index predates another replica's write — still sees everything.
-        A thread whose file is corrupt is skipped with a warning; a Storage
-        failure propagates as :class:`~src.kbc.BackendError`.
+        one that started in degraded mode with an empty index — still sees
+        everything. A thread whose file is corrupt is skipped with a warning;
+        a Storage failure propagates as :class:`~src.kbc.BackendError`.
         """
         newest: dict[str, int] = {}
         for info in self._backend.search_by_tag(tag_cmt_artifact(artifact_id)):

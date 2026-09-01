@@ -1171,8 +1171,10 @@ class ArtifactStore:
     def _resolve(self, artifact_id: str) -> _ArtEntry | None:
         """Index lookup with a Storage fallback for artifacts we never saw.
 
-        Another replica may have written after our last hydrate, so an index
-        miss is re-checked against Storage before we answer "not found".
+        The startup index can be incomplete -- degraded-mode startup (a failed
+        hydration) serves with an empty index and discovers artifacts lazily --
+        so an index miss is re-checked against Storage before we answer "not
+        found", rather than trusting a startup snapshot that may not have run.
         """
         with self._lock:
             entry = self._index.get(artifact_id)
@@ -1196,16 +1198,22 @@ class ArtifactStore:
     def refresh(self, artifact_id: str) -> bool:
         """Re-read one artifact's files from Storage, replacing its index entry.
 
-        The startup index is built once and never expires, so after another
-        replica writes a new version or rewrites the meta file, this replica's
-        cached entry is stale. ``refresh`` re-runs the artifact's tag search and
-        swaps in a fresh entry (dropping this artifact's in-memory LRU so the
-        next read reloads), letting a caller pick up cross-replica writes on
-        demand. Returns ``True`` when the artifact still exists in Storage.
+        The startup index is built once and never expires, so it can lag
+        behind whatever this process itself most recently wrote through a path
+        that did not update it, or behind a Storage tag rebuild after a
+        degraded-mode startup. ``refresh`` re-runs the artifact's tag search
+        and swaps in a fresh entry (dropping this artifact's in-memory LRU so
+        the next read reloads), letting a caller opt in to Storage's current
+        state on demand. Returns ``True`` when the artifact still exists.
 
-        Residual limitation: this is an explicit, per-artifact catch-up, not
-        continuous cross-replica consistency — full consistency needs shared
-        state (out of scope). Callers opt in via ``fresh=True`` on the readers.
+        Residual limitation: this is an explicit, per-artifact catch-up, not a
+        subscription -- nothing calls it automatically, so a reader that never
+        passes ``fresh=True`` only ever sees what the in-memory index already
+        holds. Under the exactly-one-process invariant (CLAUDE.md, "Exactly
+        one instance, ever") that index is always this process's own most
+        recent write; ``fresh=True`` exists as defence in depth and to bypass
+        the LRU, not to reconcile with a second writer, which this deployment
+        does not allow to exist.
         """
         files = self._backend.search_by_tag(tag_for_id(artifact_id))
         if not files:
@@ -1222,8 +1230,8 @@ class ArtifactStore:
             self._index[artifact_id] = rebuilt
             self._forget_memory_locked(artifact_id)
             self._forget_meta_locked(artifact_id)
-            # The refreshed meta file may carry a share id rotated by another
-            # replica; drop what we knew and re-learn it on the next resolve.
+            # The refreshed meta file may carry a share id rotated since we
+            # last learned it; drop what we knew and re-learn it on resolve.
             self._forget_share_locked(artifact_id)
         return True
 
@@ -1346,9 +1354,9 @@ class ArtifactStore:
         Lookup order, cheapest first: the share cache, then the in-memory index
         (is this an artifact id?), then a scan of indexed artifacts whose share
         id we have not learned yet (their metas are loaded once and cached), and
-        finally a Storage tag search for an artifact this replica has never
-        seen. Every share id learned along the way is cached, so a warm index
-        answers in O(1).
+        finally a Storage tag search for an artifact this process has not
+        indexed yet. Every share id learned along the way is cached, so a warm
+        index answers in O(1).
         """
         wanted = share_or_artifact_id
         if not wanted:
@@ -1367,9 +1375,9 @@ class ArtifactStore:
                     # The mapping still holds, so this is the final answer:
                     # servable, unless the artifact sits in the trash.
                     return None if meta.is_trashed() else cached
-                # Rotated away by another replica. ``wanted`` is revoked for
-                # this artifact; keep looking on the slower paths in case it
-                # now belongs to a different one.
+                # Rotated away since this process last learned it. ``wanted``
+                # is revoked for this artifact; keep looking on the slower
+                # paths in case it now belongs to a different one.
 
         with self._lock:
             known_artifact = wanted in self._index
@@ -1384,8 +1392,8 @@ class ArtifactStore:
         if found is not None:
             return found
 
-        # Never seen by this replica: fall back to a Storage tag search, which
-        # is what every other read path does on an index miss.
+        # Not yet indexed by this process: fall back to a Storage tag search,
+        # which is what every other read path does on an index miss.
         if self._resolve(wanted) is None:
             return None
         return self._share_hit(wanted, wanted)
@@ -1525,9 +1533,12 @@ class ArtifactStore:
         second allocation sees it taken. ``env.version`` is ignored and
         replaced; the assigned number is returned.
 
-        Residual limitation: this coordinates a single process only. Two
-        replicas can still pick the same number (no shared allocator); that
-        needs shared state and is out of scope here.
+        Residual limitation: this coordinates a single process only, which is
+        CLAUDE.md's deployment invariant ("Exactly one instance, ever") --
+        running two of this service at once is not a supported configuration.
+        If that invariant were ever violated, two processes could still pick
+        the same number (no shared allocator); that needs shared state and is
+        out of scope here.
         """
         artifact_id = env.id
         # Loading the meta record seeds the high-water mark into the index, so
@@ -1578,7 +1589,9 @@ class ArtifactStore:
         """One version by number, regardless of its status; None when missing.
 
         ``fresh=True`` re-reads the artifact's Storage tags first (see
-        :meth:`refresh`) so a version another replica added is picked up; the
+        :meth:`refresh`) instead of trusting the in-memory index -- defence in
+        depth under the exactly-one-process rule (CLAUDE.md), not a way to
+        reconcile with a second writer, which this deployment never runs; the
         default stays fast (index only, with the usual miss fallback).
         """
         if fresh:
@@ -1592,8 +1605,10 @@ class ArtifactStore:
         """The version ``/a/{id}`` serves: the pinned one, else the newest live.
 
         ``fresh=True`` re-reads the artifact's Storage tags first (see
-        :meth:`refresh`) so a newer head written by another replica is served;
-        the default stays fast (index only, with the usual miss fallback).
+        :meth:`refresh`) instead of trusting the in-memory index -- defence in
+        depth under the exactly-one-process rule (CLAUDE.md), not a way to
+        reconcile with a second writer, which this deployment never runs; the
+        default stays fast (index only, with the usual miss fallback).
         """
         if fresh:
             self.refresh(artifact_id)
@@ -1661,7 +1676,9 @@ class ArtifactStore:
         """Public metadata of every version (live and proposed), newest first.
 
         ``fresh=True`` re-reads the artifact's Storage tags first (see
-        :meth:`refresh`) so versions added by another replica appear.
+        :meth:`refresh`) instead of trusting the in-memory index -- defence in
+        depth under the exactly-one-process rule (CLAUDE.md), not a way to
+        reconcile with a second writer, which this deployment never runs.
         """
         if fresh:
             self.refresh(artifact_id)
