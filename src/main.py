@@ -522,6 +522,32 @@ def _serialized_per_artifact(route):
             return route(*args, **kwargs)
     return serialized
 
+
+def _serialized_per_comment_target(route):
+    """Like :func:`_serialized_per_artifact`, for routes addressed by share id.
+
+    The comment routes take either half of an artifact's identity pair in
+    their path -- the public share id, or the internal id as an owner
+    fallback (see :func:`_comment_target_of`). Keying the lock on the path
+    parameter would therefore not serialize a comment with the owner routes,
+    which always use the internal id, and a comment could land on a document
+    being finalized in the same instant. The key is resolved first, without
+    authentication: ``resolve_share`` maps a live share id to the internal id
+    and answers None for anything else -- a rotated-away link, or the bare
+    internal id of a rotated artifact -- in which case the path id *is* the
+    internal id if it is anything at all, so it is used as the key as-is. A
+    made-up id locks a key nobody else holds and then 404s inside the route.
+    """
+    @functools.wraps(route)
+    def serialized(*args, **kwargs):
+        request = kwargs["request"]
+        path_id = kwargs["artifact_id"]
+        ensure_hydrated(request.app)
+        internal_id = request.app.state.store.resolve_share(path_id) or path_id
+        with _artifact_lock(internal_id):
+            return route(*args, **kwargs)
+    return serialized
+
 # --------------------------------------------------------------------------
 # Rate-limit counters
 #
@@ -6829,6 +6855,7 @@ def _may_moderate_thread(
         },
     },
 )
+@_serialized_per_comment_target
 def create_comment(
     body: CommentBody,
     request: Request,
@@ -6937,6 +6964,7 @@ def create_comment(
         },
     },
 )
+@_serialized_per_comment_target
 def reply_to_comment(
     body: ReplyBody,
     request: Request,
@@ -7053,6 +7081,7 @@ def reply_to_comment(
         },
     },
 )
+@_serialized_per_comment_target
 def resolve_comment(
     request: Request,
     artifact_id: str = PathParam(..., description=COMMENT_TARGET_ID_DESC),
@@ -7178,6 +7207,7 @@ def resolve_comment(
         },
     },
 )
+@_serialized_per_comment_target
 def delete_comment(
     request: Request,
     artifact_id: str = PathParam(..., description=COMMENT_TARGET_ID_DESC),

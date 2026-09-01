@@ -70,7 +70,9 @@ your side.**
   now waits for the previous one to finish: two promotions of one proposal
   fire once, two deletions cannot remove the last live version between them,
   a document cannot be finalised underneath a submission already in flight,
-  and nothing can land in a document while it is being erased.
+  and nothing can land in a document while it is being erased. Comments are
+  covered too, even though they address the document by its public link
+  rather than its id.
 - A deleted version's number is retired with it. Deleting the newest version
   used to hand its number to whatever was submitted next, so every link,
   comment and comparison that named it silently pointed at different content

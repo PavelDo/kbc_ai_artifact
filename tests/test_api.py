@@ -6372,3 +6372,63 @@ def test_no_documented_curl_example_puts_the_token_in_argv(api: Api) -> None:
         offenders = [l for l in code if re.search(r"""-H\s+["']X-StorageApi-Token""", l)]
         assert offenders == [], (name, offenders)
         assert any(l.startswith("hub()") for l in code), f"{name} does not define hub()"
+
+
+class TestCommentRoutesShareTheArtifactLock:
+    """Comment routes address the document by its *public* share id.
+
+    A lock keyed on that path parameter would not serialize them with the
+    owner routes, which use the internal id -- so a comment could land on a
+    document being finalized, or be resolved on one being trashed. The key
+    has to be the internal id, resolved before the lock is taken. The link is
+    rotated first so the two ids actually differ.
+    """
+
+    @staticmethod
+    def _rotated(api: Api) -> tuple[str, str]:
+        artifact_id = _publish_markdown(api, "# One")
+        assert api.client.post(
+            f"/api/artifacts/{artifact_id}/rotate-link", headers=AUTH_HEADERS
+        ).status_code == 200
+        share_id = main.app.state.store.get_meta(artifact_id).share_id
+        assert share_id != artifact_id
+        return artifact_id, share_id
+
+    def test_finalizing_waits_for_a_comment_written_via_the_share_id(self, api: Api) -> None:
+        artifact_id, share_id = self._rotated(api)
+        entered, release = _pause_inside(main.app.state.comments, "create")
+
+        comment, box_comment = _in_thread(
+            lambda: _comment(api, share_id, exact="One").status_code
+        )
+        assert entered.wait(timeout=5)
+        finalize, box_final = _in_thread(
+            lambda: _policy(api, artifact_id, status="final").status_code
+        )
+        finalize.join(timeout=0.5)
+        assert box_final == [], "the document was finalized under an in-flight comment"
+        release.set()
+        comment.join(timeout=5)
+        finalize.join(timeout=5)
+        assert box_comment == [201] and box_final == [200], (box_comment, box_final)
+
+    def test_trashing_waits_for_a_resolve_written_via_the_share_id(self, api: Api) -> None:
+        artifact_id, share_id = self._rotated(api)
+        thread_id = _comment(api, share_id, exact="One").json()["id"]
+        entered, release = _pause_inside(main.app.state.comments, "update")
+
+        resolve, box_resolve = _in_thread(
+            lambda: api.client.post(
+                f"/api/artifacts/{share_id}/comments/{thread_id}/resolve",
+                json={"resolved": True},
+                headers=AUTH_HEADERS,
+            ).status_code
+        )
+        assert entered.wait(timeout=5)
+        trash, box_trash = _in_thread(lambda: _trash(api, artifact_id).status_code)
+        trash.join(timeout=0.5)
+        assert box_trash == [], "the document was trashed under an in-flight resolve"
+        release.set()
+        resolve.join(timeout=5)
+        trash.join(timeout=5)
+        assert box_resolve == [200] and box_trash == [200], (box_resolve, box_trash)
