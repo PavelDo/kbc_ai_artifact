@@ -15,6 +15,7 @@ import pytest
 
 from src.webhooks import (
     SIGNATURE_HEADER,
+    receiver_signing_key,
     USER_AGENT,
     WebhookDispatcher,
     WebhookEvent,
@@ -102,9 +103,12 @@ class TestDelivery:
         dispatcher.drain()
 
         _, body, headers = recorder.posts[0]
-        expected = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+        # Keyed per receiver, not with the hub-wide webhook key -- see
+        # TestPerReceiverSigningKeys for why.
+        key = receiver_signing_key(SECRET, "abc123", HOOK_URL)
+        expected = hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
         assert headers[SIGNATURE_HEADER] == f"sha256={expected}"
-        assert sign_body(body, SECRET) == headers[SIGNATURE_HEADER]
+        assert sign_body(body, key) == headers[SIGNATURE_HEADER]
 
     def test_a_different_secret_does_not_verify(self) -> None:
         dispatcher, recorder, _ = make_dispatcher([200])
@@ -164,7 +168,9 @@ class TestSlackCompatibility:
         assert "petr" in document["text"]
         assert "https://hub.example.com/a/abc123" in document["text"]
         # Still signed, over the Slack-shaped bytes.
-        assert headers[SIGNATURE_HEADER] == sign_body(body, SECRET)
+        assert headers[SIGNATURE_HEADER] == sign_body(
+            body, receiver_signing_key(SECRET, "abc123", SLACK_URL)
+        )
 
     def test_slack_falls_back_to_the_artifact_id(self) -> None:
         dispatcher, recorder, _ = make_dispatcher([200])
@@ -544,3 +550,87 @@ class TestQueueIsBounded:
         assert dispatcher.drain() == 2
         dispatcher.emit([HOOK_URL], an_event())
         assert dispatcher.pending() == 1
+
+
+class TestPerReceiverSigningKeys:
+    """One shared signing key makes every receiver a forger.
+
+    A receiver necessarily learns the key its deliveries are signed with. If
+    that key is the same for everyone, any receiver can mint a delivery that
+    verifies for any other receiver and any artifact -- so a webhook on one
+    document confers authority over notifications about every document.
+    """
+
+    def test_each_receiver_gets_its_own_key(self) -> None:
+        other = "https://example.com/hooks/second"
+        dispatcher, recorder, _ = make_dispatcher([200, 200])
+        dispatcher.emit([HOOK_URL, other], an_event())
+        dispatcher.drain()
+
+        (_u1, body1, headers1), (_u2, body2, headers2) = recorder.posts
+        # Each verifies under its own key...
+        assert headers1[SIGNATURE_HEADER] == sign_body(
+            body1, receiver_signing_key(SECRET, "abc123", HOOK_URL)
+        )
+        assert headers2[SIGNATURE_HEADER] == sign_body(
+            body2, receiver_signing_key(SECRET, "abc123", other)
+        )
+        # ...and not under the other's.
+        assert headers1[SIGNATURE_HEADER] != sign_body(
+            body1, receiver_signing_key(SECRET, "abc123", other)
+        )
+
+    def test_the_same_receiver_gets_a_different_key_per_artifact(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([200, 200])
+        dispatcher.emit([HOOK_URL], an_event(artifact_id="first"))
+        dispatcher.emit([HOOK_URL], an_event(artifact_id="second"))
+        dispatcher.drain()
+
+        (_u1, body1, headers1), (_u2, body2, headers2) = recorder.posts
+        assert headers1[SIGNATURE_HEADER] == sign_body(
+            body1, receiver_signing_key(SECRET, "first", HOOK_URL)
+        )
+        assert headers2[SIGNATURE_HEADER] != sign_body(
+            body2, receiver_signing_key(SECRET, "first", HOOK_URL)
+        )
+
+    def test_the_shared_key_alone_no_longer_verifies(self) -> None:
+        """The whole point: knowing the hub's webhook key is not enough."""
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher.emit([HOOK_URL], an_event())
+        dispatcher.drain()
+
+        _url, body, headers = recorder.posts[0]
+        assert headers[SIGNATURE_HEADER] != sign_body(body, SECRET)
+
+    def test_a_receiver_key_does_not_reveal_the_shared_key(self) -> None:
+        key = receiver_signing_key(SECRET, "abc123", HOOK_URL)
+        assert SECRET not in key
+        assert key != SECRET
+
+    def test_retries_keep_the_same_key(self) -> None:
+        dispatcher, recorder, _ = make_dispatcher([500, 200])
+        dispatcher.emit([HOOK_URL], an_event())
+        dispatcher.drain()
+
+        assert len(recorder.posts) == 2
+        assert recorder.posts[0][2][SIGNATURE_HEADER] == recorder.posts[1][2][
+            SIGNATURE_HEADER
+        ]
+
+    def test_slack_is_signed_under_its_own_receiver_key(self) -> None:
+        """Slack ignores the header, but the key must still be receiver-bound.
+
+        Otherwise a Slack webhook -- the easiest kind to obtain, since the
+        URL is all there is to it -- would hand its holder the key every
+        other receiver's deliveries are signed with.
+        """
+        dispatcher, recorder, _ = make_dispatcher([200])
+        dispatcher.emit([SLACK_URL], an_event())
+        dispatcher.drain()
+
+        _url, body, headers = recorder.posts[0]
+        assert headers[SIGNATURE_HEADER] == sign_body(
+            body, receiver_signing_key(SECRET, "abc123", SLACK_URL)
+        )
+        assert headers[SIGNATURE_HEADER] != sign_body(body, SECRET)

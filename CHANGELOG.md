@@ -4,8 +4,18 @@ KBC Artifact Hub is one web address where you publish a document and
 collaborate on it with your team, secured by the Keboola account you already
 have.
 
-## 0.8.1 — Small hardening and contract fixes (2026-09-01)
+## 0.9.0 — Security review follow-up (2026-09-01)
 
+**If you run a webhook receiver, read the first item — it needs a change on
+your side.**
+
+- **Each webhook receiver is now signed with its own key.** Previously every
+  receiver verified deliveries with one key shared across the whole service,
+  so anyone running a single webhook could forge a delivery that looked
+  genuine for any other receiver and any document. Keys are now bound to the
+  document and the receiver URL. **Existing receivers will stop verifying:**
+  read your new key from `GET /api/artifacts/{id}/webhooks` (owner only) and
+  configure the receiver with it.
 - Verifying a password now refuses a stored record that asks for an
   implausible amount of work, so a corrupted or tampered record can neither
   tie up the service nor quietly weaken the check.

@@ -50,6 +50,7 @@ from urllib.parse import urlparse
 import httpx
 
 from src.builder import _BLOCKED_HOSTNAMES, _ip_is_blocked, _resolve_host_ips
+from src.security import derive_key
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ __all__ = [
     "DELIVERY_ID_HEADER",
     "EVENT_ID_HEADER",
     "EVENT_KINDS",
+    "receiver_signing_key",
     "SIGNATURE_HEADER",
     "USER_AGENT",
     "WebhookDispatcher",
@@ -246,6 +248,27 @@ def _body_for(url: str, event: WebhookEvent) -> bytes:
     return json.dumps(document, ensure_ascii=False).encode("utf-8")
 
 
+def receiver_signing_key(webhook_key: str, artifact_id: str, url: str) -> str:
+    """The signing key for one receiver of one artifact's events.
+
+    Derived, not stored: the hub can always recompute it, so nothing secret
+    has to be persisted alongside the artifact, and there is no schema to
+    migrate or rebuild from Storage tags.
+
+    A receiver necessarily learns the key its deliveries are signed with. When
+    every receiver shared one key, that knowledge was authority over *all*
+    notifications: any receiver could mint a delivery that verified for any
+    other receiver and any artifact. Binding the key to ``(artifact_id, url)``
+    under the hub's webhook key makes each receiver's knowledge worth exactly
+    its own feed -- the derived keys are independent, and none of them reveals
+    ``webhook_key`` itself.
+
+    The separator keeps the two components unambiguous, so no pair of
+    artifact id and URL can be rearranged into another pair's key.
+    """
+    return derive_key(webhook_key, f"{artifact_id}\x00{url}")
+
+
 def sign_body(body: bytes, secret: str) -> str:
     """Value for :data:`SIGNATURE_HEADER` over ``body``.
 
@@ -314,6 +337,15 @@ class WebhookDispatcher:
         if thread is not None and thread.is_alive():
             self._queue.put(None)
             thread.join(timeout=5)
+
+    def signing_key_for(self, artifact_id: str, url: str) -> str:
+        """The key this receiver's deliveries for this artifact are signed with.
+
+        Exposed so the API layer can report it to the artifact's owner, who
+        is the one who has to configure the receiver with it. See
+        :func:`receiver_signing_key` for why it is per receiver.
+        """
+        return receiver_signing_key(self._secret, artifact_id, url)
 
     # ------------------------------------------------------------------ #
     # producing
@@ -401,7 +433,9 @@ class WebhookDispatcher:
         headers = {
             "Content-Type": "application/json",
             "User-Agent": USER_AGENT,
-            SIGNATURE_HEADER: sign_body(body, self._secret),
+            SIGNATURE_HEADER: sign_body(
+                body, self.signing_key_for(event.artifact_id, url)
+            ),
             EVENT_ID_HEADER: event.event_id,
             DELIVERY_ID_HEADER: event.delivery_id_for(url),
         }

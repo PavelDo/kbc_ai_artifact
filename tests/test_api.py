@@ -54,6 +54,7 @@ from src.security import (
     derive_key,
 )
 from src.statedb import StateDB
+from src.webhooks import receiver_signing_key
 from src.store import ArtifactStore
 
 AUTH_HEADERS = {"X-StorageApi-Token": "good-token", "X-Kbc-Stack": "us"}
@@ -264,6 +265,7 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("DELETE", "/api/artifacts/{id}"),
         ("POST", "/api/artifacts/{id}/restore"),
         ("DELETE", "/api/artifacts/{id}/purge"),
+        ("GET", "/api/artifacts/{id}/webhooks"),
         ("POST", "/api/artifacts/{id}/rotate-link"),
         ("GET", "/api/artifacts/{id}/stats"),
         ("POST", "/api/artifacts/{id}/invitations"),
@@ -3440,6 +3442,68 @@ def test_public_git_url_is_still_reported(api: Api, monkeypatch) -> None:
     assert row["git"]["url"] == "https://github.com/org/public-repo"
 
 
+def test_owner_can_read_each_receivers_signing_key(hooked) -> None:
+    """A receiver has to be configured with its own key, so the owner needs it.
+
+    Delivered on its own endpoint rather than in every artifact response:
+    the key is a credential, and the general owner view is returned on every
+    publish and update, where it would end up in far more logs and
+    transcripts than necessary.
+    """
+    api, posts, dispatcher = hooked
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+    other_hook = "https://hooks.test/second"
+    assert _register_hook(api, artifact_id, [HOOK, other_hook]).status_code == 200
+
+    listed = api.client.get(
+        f"/api/artifacts/{artifact_id}/webhooks", headers=AUTH_HEADERS
+    )
+    assert listed.status_code == 200, listed.text
+    receivers = {row["url"]: row["signing_key"] for row in listed.json()["webhooks"]}
+    assert set(receivers) == {HOOK, other_hook}
+    assert receivers[HOOK] != receivers[other_hook]
+    # The hub-wide webhook key must not be what a receiver is handed.
+    assert derive_key(api.settings.secret_key, KEY_LABEL_WEBHOOK) not in receivers.values()
+
+    # The reported key is the one a delivery actually verifies under.
+    assert (
+        _submit_version(api, artifact_id, "# Two", headers=OTHER_AUTH_HEADERS).status_code
+        == 201
+    )
+    assert dispatcher.drain() == 2
+    for url, body, headers in posts:
+        expected = hmac.new(
+            receivers[url].encode("utf-8"), body, hashlib.sha256
+        ).hexdigest()
+        assert headers["X-Hub-Signature-256"] == f"sha256={expected}", url
+
+
+def test_webhook_signing_keys_are_owner_only(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    assert (
+        api.client.get(
+            f"/api/artifacts/{artifact_id}/webhooks", headers=OTHER_AUTH_HEADERS
+        ).status_code
+        == 403
+    )
+    # No headers at all is a 400 here, not a 401: resolve_stack runs before
+    # the token is verified, the same way it does on every owner-only route.
+    assert api.client.get(f"/api/artifacts/{artifact_id}/webhooks").status_code == 400
+    assert (
+        api.client.get(
+            f"/api/artifacts/{artifact_id}/webhooks",
+            headers={"X-StorageApi-Token": "nope", "X-Kbc-Stack": "us"},
+        ).status_code
+        == 401
+    )
+    assert (
+        api.client.get(
+            "/api/artifacts/does-not-exist/webhooks", headers=AUTH_HEADERS
+        ).status_code
+        == 404
+    )
+
+
 @pytest.mark.parametrize("field", ["git_ref", "git_path"])
 def test_publish_rejects_git_fields_without_a_git_url(api: Api, field: str) -> None:
     resp = api.client.post(
@@ -4343,13 +4407,20 @@ def test_webhook_delivers_a_signed_event_for_a_submitted_version(hooked) -> None
     assert payload["version"] == 2
     assert payload["actor"] == "Other"
     assert payload["url"] == f"https://testserver/a/{artifact_id}"
-    # Signed with the webhook-specific derived key — never the raw master
-    # secret, which also backs the unlock cookies (see security.derive_key).
+    # Signed with a key derived per receiver from the webhook-specific key —
+    # never the raw master secret, which also backs the unlock cookies (see
+    # security.derive_key), and never the hub-wide webhook key either, which
+    # every receiver would then share (see test_owner_can_read_each_receivers
+    # _signing_key).
     webhook_key = derive_key(api.settings.secret_key, KEY_LABEL_WEBHOOK)
+    receiver_key = receiver_signing_key(webhook_key, artifact_id, HOOK)
     expected = hmac.new(
-        webhook_key.encode("utf-8"), body, hashlib.sha256
+        receiver_key.encode("utf-8"), body, hashlib.sha256
     ).hexdigest()
     assert headers["X-Hub-Signature-256"] == f"sha256={expected}"
+    assert headers["X-Hub-Signature-256"] != f"sha256=" + hmac.new(
+        webhook_key.encode("utf-8"), body, hashlib.sha256
+    ).hexdigest()
     # And nothing secret rode along.
     assert "token" not in body.decode("utf-8").lower()
     _assert_no_sensitive_keys(envelope)

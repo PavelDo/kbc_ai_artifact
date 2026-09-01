@@ -2030,7 +2030,9 @@ class UpdateBody(BaseModel):
             "https URLs notified when something happens to this artifact "
             "(version published or proposed, proposal promoted, comment or "
             "reply, finalized, trashed, restored, link rotated). Each delivery "
-            "is a small JSON envelope signed with X-Hub-Signature-256; a "
+            "is a small JSON envelope signed with X-Hub-Signature-256, keyed "
+            "per receiver (read the keys from GET "
+            "/api/artifacts/{id}/webhooks); a "
             "hooks.slack.com URL gets Slack's {\"text\": ...} shape instead. "
             "Replaces the whole list; [] clears it; omit to leave unchanged. "
             "URLs must be https and must not resolve to a private, loopback, "
@@ -2973,6 +2975,15 @@ def context(request: Request) -> dict:
                 ),
             },
             {
+                "method": "GET",
+                "path": "/api/artifacts/{id}/webhooks",
+                "auth": "storage token (owner project)",
+                "purpose": (
+                    "list each registered webhook receiver with the signing "
+                    "key its deliveries use"
+                ),
+            },
+            {
                 "method": "POST",
                 "path": "/api/artifacts/{id}/rotate-link",
                 "auth": "storage token (owner project)",
@@ -3307,12 +3318,24 @@ def context(request: Request) -> dict:
                 "initial publish (v1) emits nothing — the owner just did it."
             ),
             "delivery": (
-                "POST of {'event', 'artifact_id', 'payload', 'created_at'} "
-                "signed with X-Hub-Signature-256: sha256=<hmac>; a "
-                "hooks.slack.com URL gets Slack's {'text': ...} shape "
-                f"instead. Up to {settings.webhook_max_attempts} attempts with "
-                "backoff, best effort: the queue is in memory and a restart "
-                "drops what was pending."
+                "POST of {'event', 'event_id', 'delivery_id', 'artifact_id', "
+                "'payload', 'created_at'} signed with X-Hub-Signature-256: "
+                "sha256=<hmac>; a hooks.slack.com URL gets Slack's "
+                "{'text': ...} shape instead, with the ids in the "
+                "X-Hub-Event-Id and X-Hub-Delivery-Id headers every delivery "
+                f"carries. Up to {settings.webhook_max_attempts} attempts "
+                "with backoff, best effort: the queue is in memory, bounded "
+                f"at {settings.webhook_queue_max}, and a restart drops what "
+                "was pending. The delivery id is stable across retries, so a "
+                "receiver can recognise one instead of acting twice."
+            ),
+            "signing": (
+                "Every receiver has its own signing key, derived from the "
+                "hub's webhook key, the artifact and the receiver URL. GET "
+                "/api/artifacts/{id}/webhooks (owner only) reports each URL "
+                "with its key. A receiver therefore cannot forge a delivery "
+                "for another receiver or another artifact, and its key "
+                "reveals nothing about the hub's own."
             ),
             "secrecy": (
                 "A webhook URL is itself a capability, so it is returned only "
@@ -5509,6 +5532,63 @@ def purge_artifact(
             "purged": True,
             "comment_threads_deleted": threads,
             "note": "canonical copies in the authors' projects were not touched",
+        }
+    )
+
+
+@app.get(
+    "/api/artifacts/{artifact_id}/webhooks",
+    tags=["artifacts"],
+    summary="Read each webhook receiver's signing key",
+    description=(
+        "Owner-only. Lists the artifact's registered webhook URLs together "
+        "with the key each one's deliveries are signed with, so you can "
+        "configure the receiver to verify them.\n\n"
+        "**Every receiver has its own key**, derived from the hub's webhook "
+        "key, the artifact and the receiver URL. A receiver necessarily "
+        "learns the key it verifies with, so a single shared key would let "
+        "any receiver forge a delivery for any other receiver and any "
+        "artifact; a per-receiver key is worth exactly its own feed and "
+        "reveals nothing about the hub's key or another receiver's.\n\n"
+        "The keys are on their own endpoint rather than in the general owner "
+        "view because they are credentials: fetch one when you configure a "
+        "receiver, store it where that receiver keeps its secrets, and do "
+        "not log it. Registering the same URL again yields the same key; "
+        "removing a URL and its receiver ends its use."
+    ),
+    responses={
+        200: {
+            "description": (
+                "The registered receivers, each with its own signing key."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: RESP_OWNER_403,
+        404: RESP_NOT_FOUND,
+    },
+)
+def read_webhook_keys(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Report the per-receiver signing keys to the artifact's owner."""
+    owner, _token = auth
+    ensure_hydrated(request.app)
+    meta = request.app.state.store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    _owner_only(meta, owner)
+
+    dispatcher = request.app.state.webhooks
+    return JSONResponse(
+        {
+            "id": meta.id,
+            "webhooks": [
+                {"url": url, "signing_key": dispatcher.signing_key_for(meta.id, url)}
+                for url in list(meta.webhooks or [])
+            ],
         }
     )
 

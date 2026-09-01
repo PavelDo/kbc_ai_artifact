@@ -210,8 +210,8 @@ Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 
 Every version, comment/reply, finalize, trash/restore and link-rotation event
 also fires any webhooks the artifact has registered (`X-Hub-Signature-256`
-HMAC-signed JSON, or Slack's `{"text": ...}` shape for a `hooks.slack.com`
-URL) — see *Outbound webhooks* above.
+HMAC-signed JSON, keyed per receiver, or Slack's `{"text": ...}` shape for a
+`hooks.slack.com` URL) — see *Outbound webhooks* above.
 
 ## Quick start (curl)
 
@@ -511,8 +511,11 @@ browsers never send to a server, and only ever reaches the API in the
 never a query string, path segment, or cookie. Outbound webhook URLs are
 treated as equally sensitive: they are only ever echoed back in the `PUT`
 response that set them, never in `GET /api/artifacts` (which reports a count
-instead), and every non-Slack delivery is HMAC-signed
-(`X-Hub-Signature-256`) so a receiver can reject a forged POST.
+instead), and every delivery is HMAC-signed (`X-Hub-Signature-256`) so a
+receiver can reject a forged POST. Each receiver is signed with its **own**
+key, bound to the artifact and the receiver URL, so a receiver cannot forge a
+delivery for a different receiver or a different document; owners read those
+keys from `GET /api/artifacts/{id}/webhooks`.
 
 ## Contributing
 

@@ -897,34 +897,39 @@ see the same delivery again.
 
 ### Verify the signature
 
-Every non-Slack delivery carries `X-Hub-Signature-256: sha256=<hex>` — an
-HMAC-SHA256 of the *exact bytes* of the request body, keyed with a webhook
-signing key **derived** from the hub's `HUB_SECRET_KEY` (HMAC-SHA256 of the
-master secret, labeled `"webhook-signature"`), not the master secret itself.
-Recompute it and compare before trusting a delivery (Slack deliveries carry no
-signature — Slack's own webhook format has no header for one, so verify a
-Slack integration by the URL's own secrecy instead):
+Every delivery carries `X-Hub-Signature-256: sha256=<hex>` — an HMAC-SHA256 of
+the *exact bytes* of the request body. Slack ignores the header, so a Slack
+integration is still secured by its URL's own secrecy, but it is signed like
+any other delivery.
+
+**Each receiver is signed with its own key.** Read the keys with the
+owner-only `GET /api/artifacts/{id}/webhooks`, which lists every registered
+URL alongside the `signing_key` its deliveries use, and configure that
+receiver with that value:
+
+```bash
+curl -s "$HUB/api/artifacts/$ID/webhooks" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu"
+```
+
+Recompute and compare before trusting a delivery:
 
 ```python
 import hashlib
 import hmac
 
-def derive_webhook_key(master_secret: str) -> str:
-    # Same derivation the hub uses: HMAC-SHA256(master_secret, label), as hex.
-    return hmac.new(
-        master_secret.encode(), b"webhook-signature", hashlib.sha256
-    ).hexdigest()
-
-def verify(body: bytes, header_value: str, master_secret: str) -> bool:
-    webhook_key = derive_webhook_key(master_secret)
-    expected = "sha256=" + hmac.new(webhook_key.encode(), body, hashlib.sha256).hexdigest()
+def verify(body: bytes, header_value: str, signing_key: str) -> bool:
+    # signing_key is this receiver's value from GET /api/artifacts/{id}/webhooks.
+    expected = "sha256=" + hmac.new(signing_key.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, header_value)
 ```
 
-The derived key is the one an operator actually hands to a webhook receiver,
-so disclosing it (which every receiver necessarily must learn, to verify
-deliveries) no longer exposes the same secret that signs unlock cookies —
-previously a single leaked `HUB_SECRET_KEY` compromised both.
+The key is bound to the artifact and to the receiver URL, so what a receiver
+necessarily learns is worth exactly its own feed: it exposes neither the
+secret that signs unlock cookies nor the key any other receiver verifies
+with. Do not derive a key yourself, and never reuse one receiver's key for
+another.
 
 Compare with `hmac.compare_digest` (or an equivalent constant-time compare in
 your language), never `==` — a naive comparison leaks timing information an

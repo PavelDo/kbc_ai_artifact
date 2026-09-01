@@ -551,34 +551,42 @@ A receiver that acts on a delivery should record the delivery id and ignore a
 repeat, since the hub retries on any non-2xx (including one you answered
 slowly).
 
-**Verifying a delivery's signature** (skip for Slack — it has no signature
-header): every non-Slack POST carries
+**Verifying a delivery's signature.** Every POST carries
 `X-Hub-Signature-256: sha256=<hex>`, an HMAC-SHA256 of the exact request body
-bytes keyed with a webhook signing key **derived** from the hub's
-`HUB_SECRET_KEY` — HMAC-SHA256 of the master secret, labeled
-`"webhook-signature"`, as a hex string — never the master secret itself. If
-you are ever the one implementing or debugging a receiver:
+bytes. Slack ignores the header, so a Slack integration is still secured by
+its URL's own secrecy, but the delivery is signed like any other.
+
+**Each receiver has its own key.** Fetch it with `GET
+/api/artifacts/{id}/webhooks` (owner-only), which lists every registered URL
+with the `signing_key` its deliveries use, and configure the receiver with
+that value:
+
+```bash
+curl -s "$HUB/api/artifacts/$ID/webhooks" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu"
+```
+
+The key is bound to the artifact *and* the receiver URL, so learning one
+tells you nothing about another receiver's key or about the hub's own. Do
+not derive it yourself and do not reuse one receiver's key for another. A
+receiver then verifies:
 
 ```python
 import hashlib, hmac
 
-def derive_webhook_key(master_secret: str) -> str:
-    # Same derivation the hub uses: HMAC-SHA256(master_secret, label), as hex.
-    return hmac.new(
-        master_secret.encode(), b"webhook-signature", hashlib.sha256
-    ).hexdigest()
-
-def verify(body: bytes, header_value: str, master_secret: str) -> bool:
-    webhook_key = derive_webhook_key(master_secret)
-    expected = "sha256=" + hmac.new(webhook_key.encode(), body, hashlib.sha256).hexdigest()
+def verify(body: bytes, header_value: str, signing_key: str) -> bool:
+    # signing_key is this receiver's value from GET /api/artifacts/{id}/webhooks.
+    expected = "sha256=" + hmac.new(signing_key.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, header_value)
 ```
 
 Always compare with a constant-time function (`hmac.compare_digest` or your
 language's equivalent) against the *raw* body bytes, never a re-serialized
-copy of the JSON. This derived key is exactly what an operator hands to a
-webhook receiver, so disclosing it no longer exposes the key that signs
-unlock cookies — previously one leaked secret compromised both. Webhook URLs
+copy of the JSON. A receiver's key is a credential: store it where that
+receiver keeps its secrets and never log it. Disclosing it exposes neither
+the hub's master secret (which signs unlock cookies) nor any other
+receiver's feed. Webhook URLs
 are themselves credentials (a Slack hook's path is its only secret): `GET
 /api/artifacts` reports a `webhooks_count`, never the URLs — only the `PUT`
 response that set them ever echoes them back.
@@ -840,9 +848,12 @@ When you generate the content to publish yourself:
   lost, the fix is revoke-and-reinvite, not trying to recover it.
 - **Verify webhook signatures before trusting a delivery**, if you are ever
   the one consuming them: recompute `X-Hub-Signature-256` over the raw body
-  with the **derived** webhook signing key (HMAC-SHA256 of `HUB_SECRET_KEY`
-  labeled `"webhook-signature"`, as hex — not `HUB_SECRET_KEY` itself) and
-  compare with a constant-time function (see *Webhooks* above). Never treat
+  with **that receiver's own** signing key, read from the owner-only `GET
+  /api/artifacts/{id}/webhooks`, and compare with a constant-time function
+  (see *Webhooks* above). Never reuse another receiver's key, and never try
+  to derive one from `HUB_SECRET_KEY` — a receiver's key is bound to the
+  artifact and the receiver URL precisely so that holding one grants nothing
+  anywhere else. Never treat
   an unsigned or mismatched delivery as genuine, and never treat a webhook as
   the source of truth — it is a nudge to go read `/versions` or `/comments`,
   which are.
