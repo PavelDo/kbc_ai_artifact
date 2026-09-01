@@ -190,6 +190,31 @@ def test_x_real_ip_still_outranks_the_chain(api: Api, monkeypatch) -> None:
     assert main._client_ip(request) == REAL_CLIENT
 
 
+def test_an_x_real_ip_naming_a_trusted_proxy_defers_to_the_chain(
+    api: Api, monkeypatch
+) -> None:
+    """nginx sets X-Real-IP from *its* peer, which in production is the
+    platform proxy, not the browser. A value inside the trusted networks names
+    a hop, so taking it would put every reader in one bucket; the chain still
+    carries the client and wins."""
+    _trusting(api, monkeypatch)
+    request = _request(
+        NGINX_PEER,
+        {"X-Real-IP": PLATFORM_PROXY, **_chain("192.0.2.55", REAL_CLIENT, PLATFORM_PROXY)},
+    )
+
+    assert main._client_ip(request) == REAL_CLIENT
+
+
+def test_an_x_real_ip_naming_a_trusted_proxy_with_no_chain_falls_back_to_the_peer(
+    api: Api, monkeypatch
+) -> None:
+    _trusting(api, monkeypatch)
+    request = _request(NGINX_PEER, {"X-Real-IP": PLATFORM_PROXY})
+
+    assert main._client_ip(request) == NGINX_PEER
+
+
 # --------------------------------------------------------------------------
 # Every candidate has to parse as an address
 # --------------------------------------------------------------------------

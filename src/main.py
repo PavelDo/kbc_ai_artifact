@@ -1112,7 +1112,9 @@ def _client_ip(request: Request) -> str:
 
     Order of preference, once the peer is trusted: ``X-Real-IP`` first,
     because our own nginx sets it from the connection it accepted and it is a
-    single address needing no chain walk; then the rightmost entry of
+    single address needing no chain walk -- unless that address is itself a
+    trusted proxy, in which case it names a hop rather than a client and the
+    chain is consulted instead; then the rightmost entry of
     ``X-Forwarded-For`` that is not itself a trusted proxy (see
     :func:`_forwarded_chain_client` for why the *rightmost*). Either way the
     value has to parse as an IP address, and what is returned is that address
@@ -1128,6 +1130,13 @@ def _client_ip(request: Request) -> str:
     peer = _peer_ip(request)
     if _forwarded_client_trusted(request):
         forwarded = _parse_client_address(request.headers.get("x-real-ip"))
+        # In the real topology our nginx sets X-Real-IP from *its* peer,
+        # which is the platform proxy in front of it, not the browser. A
+        # value that names a trusted proxy therefore identifies a hop, not a
+        # client, and would make every reader share that hop's budget; the
+        # chain still carries the client, so walk it instead.
+        if forwarded is not None and _is_trusted_proxy(forwarded):
+            forwarded = None
         if forwarded is None:
             forwarded = _forwarded_chain_client(
                 request.headers.get("x-forwarded-for")
