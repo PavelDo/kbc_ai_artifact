@@ -42,6 +42,17 @@ consequences baked into `src/main.py`:
    Files in the *host* project; anything written to local disk
    (`HUB_CACHE_DIR`) is an LRU cache only and must be safely rebuildable from
    Storage after a restart with an empty disk.
+5. **Exactly one instance, ever.** One Keboola App is one organisation's hub,
+   and a Data App is one container (single uvicorn process, no `--workers`,
+   auto-suspend and restart — never two at once). This is a *deployment
+   invariant*, not a scaling limit to engineer around: the in-memory artifact
+   index, the per-process locks that serialize check-then-act mutations, the
+   version-number allocator and the StateDB whole-snapshot cycle are all
+   correct **only** under it. Do not add HA, replicas or `--workers`; if that
+   ever changes, the state layer needs shared compare-and-swap, which Storage
+   Files cannot provide (immutable, no create-if-absent) — that is a redesign,
+   not a flag. `StateDB._retire_older_snapshots` detects a second writer and
+   logs an ERROR naming this rule.
 
 ## Storage model
 

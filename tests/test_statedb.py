@@ -381,3 +381,61 @@ class TestLifecycle:
             assert len(_snapshots(backend)) == 1
         finally:
             state.stop()
+
+
+class TestSingleInstanceInvariant:
+    """This deployment is exactly one container, and the sidecar assumes it.
+
+    Every instance snapshots its *whole* local database and retires every
+    other snapshot, so two instances writing at once would each destroy the
+    other's counters in turn. That is not handled -- it is ruled out by the
+    deployment shape (one Keboola App per organisation, one container). What
+    the code can do is notice when the assumption is broken: a snapshot in
+    Storage that is newer than the one this instance last wrote, and is not
+    the one it just uploaded, was written by somebody else.
+    """
+
+    def test_a_foreign_newer_snapshot_is_reported(
+        self, db: StateDB, backend: InMemoryFilesBackend, caplog
+    ) -> None:
+        db.bump("submissions", "abc", "2026-09-01")
+        assert db.snapshot_now() is True
+
+        # Another instance writes state between this instance's snapshots.
+        backend.upload(SNAPSHOT_FILE_NAME, b"SQLite format 3\0foreign", [TAG_STATE])
+
+        db.bump("submissions", "abc", "2026-09-01")
+        with caplog.at_level("ERROR", logger="src.statedb"):
+            assert db.snapshot_now() is True
+
+        messages = [rec.getMessage() for rec in caplog.records if rec.levelname == "ERROR"]
+        assert any("another instance" in msg for msg in messages), messages
+        assert any("one" in msg and "replica" in msg for msg in messages), messages
+
+    def test_an_ordinary_second_snapshot_reports_nothing(
+        self, db: StateDB, backend: InMemoryFilesBackend, caplog
+    ) -> None:
+        db.bump("submissions", "abc", "2026-09-01")
+        assert db.snapshot_now() is True
+        db.bump("submissions", "abc", "2026-09-01")
+        with caplog.at_level("ERROR", logger="src.statedb"):
+            assert db.snapshot_now() is True
+        assert not [rec for rec in caplog.records if rec.levelname == "ERROR"]
+
+    def test_the_snapshot_left_by_a_previous_boot_is_not_foreign(
+        self, backend: InMemoryFilesBackend, tmp_path: Path, caplog
+    ) -> None:
+        """A restart restores the last snapshot and then writes past it -- normal."""
+        first = StateDB(backend, tmp_path / "a" / "s.sqlite3", 0, 10 * 1024 * 1024)
+        first.start()
+        first.bump("submissions", "abc", "2026-09-01")
+        assert first.snapshot_now() is True
+        first.stop()
+
+        second = StateDB(backend, tmp_path / "b" / "s.sqlite3", 0, 10 * 1024 * 1024)
+        second.start()
+        second.bump("submissions", "abc", "2026-09-01")
+        with caplog.at_level("ERROR", logger="src.statedb"):
+            assert second.snapshot_now() is True
+        second.stop()
+        assert not [rec for rec in caplog.records if rec.levelname == "ERROR"]

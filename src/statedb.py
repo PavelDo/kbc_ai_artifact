@@ -13,7 +13,9 @@ the *other* kind of state, the one that class of durability fits badly:
 Both are aggregates rather than documents, so they get a real database. The DB
 lives on the container's ephemeral disk and periodically snapshots itself into
 the *host* project's Storage Files under the :data:`TAG_STATE` tag; on startup
-the newest snapshot is restored. Losing the last few minutes of counters to a
+the newest snapshot is restored. One instance at a time is assumed and
+detected, not coordinated (see ``_retire_older_snapshots``). Losing the last
+few minutes of counters to a
 crash is acceptable for this class of data — losing *all* of it on every restart
 was not.
 
@@ -459,13 +461,42 @@ class StateDB:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _retire_older_snapshots(self, *, keep_id: int, previous_id: int | None) -> None:
-        """Best-effort delete of every snapshot except the one just uploaded."""
+        """Best-effort delete of every snapshot except the one just uploaded.
+
+        Also the single-instance detector, because the listing it needs is
+        already in hand. This sidecar snapshots the *whole* local database and
+        retires everything else, which is only sound when exactly one instance
+        writes -- the deployment invariant (one Keboola App per organisation,
+        one container; see CLAUDE.md). Storage file ids are monotonic, so a
+        snapshot newer than the one this instance last wrote, that is not the
+        one it just uploaded, was written by another instance. That cannot be
+        repaired here -- whichever snapshot wins, the other's counters are
+        gone -- so it is reported as loudly as a log allows and the retirement
+        proceeds unchanged rather than inventing a merge nobody specified.
+        """
         try:
             found = self._backend.search_by_tag(TAG_STATE)
             stale = [info.id for info in found if info.id != keep_id]
         except Exception as exc:  # noqa: BLE001 - retiring is best effort
             logger.warning("Could not list old state snapshots: %s", exc)
             stale = [previous_id] if previous_id is not None else []
+        else:
+            if previous_id is not None:
+                foreign = sorted(
+                    info.id for info in found
+                    if info.id != keep_id and info.id > previous_id
+                )
+                if foreign:
+                    logger.error(
+                        "State snapshot(s) %s were written by another instance "
+                        "since this instance's last snapshot %s. This "
+                        "deployment assumes exactly one replica per hub; with "
+                        "two, each overwrites the other's counters and the "
+                        "artifact index of a warm replica can serve a link "
+                        "that was rotated away elsewhere. Run one container.",
+                        foreign,
+                        previous_id,
+                    )
         for file_id in stale:
             try:
                 self._backend.delete(file_id)

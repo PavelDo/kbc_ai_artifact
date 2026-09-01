@@ -47,6 +47,14 @@ your side.**
   pending notifications without limit; past a configurable ceiling
   (`HUB_WEBHOOK_QUEUE_MAX`) the newest is dropped, and publishing is never held
   up waiting for one.
+- The service now states its deployment shape plainly and watches for it
+  being broken: one hub is one container, serving one organisation. Its index,
+  locks and state snapshots are built for exactly one writer, so if a second
+  instance ever writes state, the log says so in as many words instead of the
+  two instances quietly overwriting each other.
+- Authorization is documented as it was always meant: any token from the
+  owning Keboola project has full owner authority, because the project is the
+  team. The security review had flagged this as a gap; it is the design.
 - Finalising a document now freezes its discussion too. Resolving, reopening
   and withdrawing a comment used to keep working on a document marked final or
   moved to the trash, so a "finished" record kept changing. The owner can still

@@ -184,6 +184,14 @@ Public (no auth):
 | GET | `/changelog` / `/changelog.md` | Rendered changelog (hub's own design) / raw source |
 | GET | `/health` | Liveness check + service version + index stats |
 
+**Authorization is per project, by design.** Ownership is `(stack, project)`:
+any valid Storage token from the owning project carries full owner authority
+— update, trash, restore, purge, rotate-link, promote — regardless of that
+token's own scope. A Keboola project *is* the team, and one hub is one
+organisation, so project membership is the intended boundary; the hub does
+not layer roles of its own on top. Keep destructive tokens as safe as you
+keep the project itself.
+
 Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 
 | Method | Path | Description |
@@ -437,6 +445,15 @@ service's own `git_ref` has. To pin a specific commit, tag it first.
 
 Omitting `--git-branch` (tracking `main`) is fine for a development or
 staging app where following the branch is the point.
+
+**One hub is one container.** A Data App runs as a single container that
+suspends when idle and restarts on demand — never two instances side by
+side — and one hub serves one organisation. The service relies on that: its
+artifact index, its locks and its state snapshots are designed for exactly
+one writer, and Storage Files cannot coordinate two (they are immutable, with
+no create-if-absent). Do not put replicas or extra worker processes in front
+of it; each organisation runs its own app instead. If a second writer ever
+does appear, the state sidecar logs an ERROR saying so.
 
 Secrets are set with `kbagent data-app secrets-set` and never committed to
 the repository:
