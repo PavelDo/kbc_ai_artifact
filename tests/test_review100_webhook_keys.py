@@ -305,7 +305,9 @@ class TestRotateAuthorizationAndErrors:
 
 
 # --------------------------------------------------------------------------
-# Backward compatibility: an old-shape persisted receiver still verifies
+# Backward compatibility: an old-shape persisted receiver still verifies, and
+# the dispatcher's epoch-less key is the never-rotated case (not the
+# fresh-process one -- every emit seeds the dispatcher from the meta record)
 # --------------------------------------------------------------------------
 
 
@@ -354,21 +356,40 @@ class TestOldShapeRecordHydration:
         restored = ArtifactMeta.from_json(meta.to_json())
         assert restored.webhook_key_epochs == {"https://example.com/hook": record}
 
-    def test_dispatcher_signs_an_unrotated_or_old_shape_receiver_with_the_legacy_key(
+    def test_dispatcher_falls_back_to_the_legacy_key_only_for_never_rotated_receivers(
         self,
     ) -> None:
-        """A receiver whose meta record predates rotation (no epoch on file, or
-        never rotated) must sign exactly the way it always did -- the original
-        two-argument derivation -- with no code path treating "no epoch" as
-        an error or a different key.
+        """The dispatcher's epoch-less fallback is the *never rotated* case.
+
+        Two states reach the same key here, and it is worth being precise
+        about which one this pins, because an earlier version of this test
+        read as though a fresh process signed with the legacy key for every
+        receiver -- it does not, and has not since ``_emit_webhook`` began
+        seeding the dispatcher.
+
+        * **Seeded with no record** (``seed_epoch(..., None)``): the receiver
+          was never rotated, so there is no epoch on file and the original
+          two-argument derivation is the correct, current key.
+        * **Never seeded at all**: the bare dispatcher unit, constructed here
+          and asked before anything has told it anything.
+
+        The second state is *not* what a restarted service does. Since
+        ``_emit_webhook`` reseeds every registered receiver from the durable
+        ``ArtifactMeta.webhook_key_epochs`` on every emit, a delivery in a
+        fresh process is always preceded by a seed, so a rotated receiver
+        signs with its rotated key even on the first emit after a restart --
+        that is what
+        ``tests/test_review100_followups.py::
+        test_delivery_after_restart_signs_with_the_rotated_key`` proves, with
+        ``test_delivery_after_restart_for_an_unrotated_receiver_is_unaffected``
+        covering the unrotated half end to end. What this test pins is
+        narrower and still worth pinning: no code path in the dispatcher
+        treats "no epoch" as an error or as a *different* key.
         """
         dispatcher = WebhookDispatcher(timeout_s=5, max_attempts=1, sign_secret=SECRET)
         url = "https://example.com/hook"
         legacy = receiver_signing_key(SECRET, "abc123", url)
 
-        # Never seeded at all (a fresh process, receiver untouched since
-        # restart) and explicitly seeded with an empty/old-shape record both
-        # produce the same, original key.
         assert dispatcher.signing_key_for("abc123", url) == legacy
         dispatcher.seed_epoch("abc123", url, None)
         assert dispatcher.signing_key_for("abc123", url) == legacy
