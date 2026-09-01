@@ -1932,3 +1932,34 @@ class TestMetaInvitations:
             "salt": "aa",
             "hash": "bb",
         }
+
+
+class TestInvitationRevokedIsStrictlyBoolean:
+    """``revoked`` is a revocation flag, so an unreadable value must fail closed.
+
+    The entry comes from a persisted meta record. Truthiness coercion makes
+    the value's *type* decide the outcome: ``"false"`` revokes, ``0`` and
+    ``[]`` do not. A flag whose meaning cannot be established must not keep
+    granting a guest a voice.
+    """
+
+    def test_a_non_boolean_value_is_treated_as_revoked(self):
+        for value in ("false", "no", 0, [], {}, "active"):
+            entry = _invitation()
+            entry["revoked"] = value
+            meta = _make_meta(invitations=[entry])
+            restored = ArtifactMeta.from_json(meta.to_json())
+            assert restored.invitations[0]["revoked"] is True, value
+
+    def test_real_booleans_are_still_honoured(self):
+        for value in (True, False):
+            entry = _invitation()
+            entry["revoked"] = value
+            restored = ArtifactMeta.from_json(_make_meta(invitations=[entry]).to_json())
+            assert restored.invitations[0]["revoked"] is value
+
+    def test_a_missing_flag_stays_an_active_invitation(self):
+        entry = _invitation()
+        del entry["revoked"]
+        restored = ArtifactMeta.from_json(_make_meta(invitations=[entry]).to_json())
+        assert restored.invitations[0]["revoked"] is False

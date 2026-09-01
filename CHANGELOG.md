@@ -4,6 +4,78 @@ KBC Artifact Hub is one web address where you publish a document and
 collaborate on it with your team, secured by the Keboola account you already
 have.
 
+## 0.8.1 — Small hardening and contract fixes (2026-09-01)
+
+- Verifying a password now refuses a stored record that asks for an
+  implausible amount of work, so a corrupted or tampered record can neither
+  tie up the service nor quietly weaken the check.
+- A comment thread's "resolved" mark and a guest invitation's "revoked" mark
+  are now read strictly. A malformed record can no longer close a thread that
+  is open, and an invitation whose revocation cannot be read is treated as
+  revoked rather than still valid.
+- Comparing two versions now requires the older one first. Asking for 5..3
+  used to answer with additions and removals swapped under labels claiming
+  the opposite; it is a clear error now.
+- Pages no longer pass their address on to anywhere they link or load from,
+  so a document's link cannot leak through a font request or an outbound
+  click.
+- The API reference now describes what the review page really does for a
+  password-protected document — it serves the page and asks for the password
+  in place, rather than the redirect it used to promise.
+- Documentation now says plainly that pending proposals are subject to their
+  own retention cap, instead of claiming they are kept forever.
+
+## 0.8.0 — Documents that update themselves (2026-09-01)
+
+- **A document open in your browser now updates itself when a new version
+  lands.** No more reloading to find out whether something changed — the
+  document page, the review page and the admin studio all notice on their
+  own, within about ten seconds.
+- Nothing is ever pulled out from under you. The page swaps in a new version
+  only when you are still at the top and have nothing typed; otherwise it
+  offers you a banner and lets you decide. A specific version you opened on
+  purpose never changes under you, and a half-written comment is never lost.
+- Watching pauses while the tab is in the background, and stops entirely when
+  a link has been rotated away.
+
+## 0.7.5 — The review page opens for a locked document (2026-09-01)
+
+- A password-protected document sent to the review page now actually opens
+  it, showing its own unlock panel. Previously the review page redirected to
+  the standalone password form, which navigated away — and for an invited
+  guest that dropped the invitation out of the address bar, leaving them with
+  no way back in.
+- The page served while locked carries no document content and no credential;
+  everything it shows is still fetched through the gated endpoints.
+
+## 0.7.4 — Unlock a protected document from the review page (2026-09-01)
+
+- An invited guest reaching a password-protected document can now supply the
+  password on the review page itself. Before this, the document would not
+  load and a typed comment failed at submit with a bare "password required".
+- A comment refused because of the password is replayed after unlocking, so
+  what you typed is not lost. A wrong password and a rate-limited attempt
+  each get their own message.
+- The password is held in the tab only and sent on writes; it never goes into
+  a URL, browser storage or a log.
+
+## 0.7.3 — A live demo, and a clear signal when a document is frozen (2026-09-01)
+
+- Public responses now say whether the *document* is accepting new versions,
+  not just what state a given version is in. A machine consumer could
+  previously not tell that a document had been marked final.
+- The landing page links a published showcase document when one is
+  configured.
+
+## 0.7.2 — Comment anchoring and guest credit (2026-09-01)
+
+- An inline comment whose quote spans a line break now anchors correctly.
+  Quotes sent through the API — the route an AI assistant takes — used to
+  have to reproduce the source's own newlines and indentation exactly, and
+  otherwise rendered as "quote not found on this version".
+- The Obsidian vault export now credits a guest commenter as "Name (guest)"
+  instead of "unknown project".
+
 ## 0.7.1 — Security follow-up (2026-09-01)
 
 - Documents opened through the machine-readable link now render inside the

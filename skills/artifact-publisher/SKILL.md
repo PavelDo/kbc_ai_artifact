@@ -609,7 +609,10 @@ is protected from retention pruning. The response reports
 
 - **Retention** — at most `HUB_MAX_VERSIONS` (default 50) live versions per
   artifact. The oldest live versions that are neither the head nor pinned are
-  pruned. Proposals are never pruned.
+  pruned; this rule never counts or removes a proposal.
+- **Proposal retention** — proposals have their own cap:
+  `HUB_MAX_PROPOSED_VERSIONS` (default 50) retained per artifact, oldest
+  pruned above that. A pending proposal does not wait forever.
 - **Rate limit** — `HUB_MAX_VERSIONS_PER_DAY` (default 20) submitted versions
   per contributing project, per artifact, per UTC day. Past that, 429.
 

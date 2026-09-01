@@ -32,6 +32,7 @@ import html
 import io
 import json
 import logging
+import pathlib
 import re
 import zipfile
 from typing import Any, NamedTuple
@@ -1612,6 +1613,113 @@ def test_diff_malformed_spec_is_400_and_missing_version_is_404(api: Api) -> None
     artifact_id = _publish_and_update(api)
     assert api.client.get(f"/a/{artifact_id}/diff/1-2").status_code == 400
     assert api.client.get(f"/a/{artifact_id}/diff/1..9").status_code == 404
+
+
+def test_changelog_documents_every_released_version(api: Api) -> None:
+    """The changelog is how a reader learns what changed, security included.
+
+    A gap in it is invisible: nothing else in the service reports that a
+    release happened. Requiring the newest section to name the running
+    version turns "we forgot to write the entry" into a failing test rather
+    than a silent omission.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    documented = re.findall(r"^## (\d+\.\d+\.\d+)", text, flags=re.MULTILINE)
+
+    assert documented, "the changelog has no version sections at all"
+    assert documented[0] == main.SERVICE_VERSION, (
+        f"newest changelog section is {documented[0]}, "
+        f"but this build reports {main.SERVICE_VERSION}"
+    )
+    for released in ("0.7.2", "0.7.3", "0.7.4", "0.7.5"):
+        assert released in documented, released
+
+
+def test_served_docs_do_not_claim_proposals_are_never_pruned(api: Api) -> None:
+    """Retention text has to match ArtifactStore._prune_proposals.
+
+    "Proposals are never pruned" was true while HUB_MAX_VERSIONS was the only
+    retention rule. HUB_MAX_PROPOSED_VERSIONS added a second one, and an agent
+    that believes the old sentence will assume a pending proposal waits
+    forever.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    served = {
+        "/agent": api.client.get("/agent").text,
+        "/skill": api.client.get("/skill").text,
+        "README.md": (root / "README.md").read_text(encoding="utf-8"),
+    }
+    for name, text in served.items():
+        assert "roposals are never pruned" not in text, name
+        assert "HUB_MAX_PROPOSED_VERSIONS" in text, name
+
+
+def test_openapi_documents_the_locked_review_shell_as_200(api: Api) -> None:
+    """The review route deliberately serves a credential-free shell while locked.
+
+    Declaring a 401 unlock form there makes generated clients and operators
+    expect a status and a flow the route never produces.
+    """
+    schema = api.client.get("/openapi.json").json()
+    review = schema["paths"]["/a/{artifact_id}/review"]["get"]
+    assert "401" not in review["responses"]
+    description = review["description"]
+    # It must say what the route does -- answer 200 while locked -- rather
+    # than inherit the shared note that promises a redirect to the standalone
+    # unlock form.
+    assert "still answers 200" in description
+    assert "browsers use the unlock form at POST" not in description
+    assert "shell" in review["responses"]["200"]["description"].lower()
+
+
+def test_locked_review_really_answers_200(api: Api) -> None:
+    """The behaviour the OpenAPI above is describing."""
+    artifact_id = _publish_markdown(api, "# Report\n")
+    resp = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"password": "hunter2"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert api.client.get(f"/a/{artifact_id}/review").status_code == 200
+    assert api.client.get(f"/a/{artifact_id}").status_code == 401
+
+
+def test_every_response_carries_a_no_referrer_policy(api: Api) -> None:
+    """Hub pages load Google Fonts, so the URL must not travel with the request.
+
+    A capability URL *is* the credential. Under a browser's default policy a
+    cross-origin stylesheet request carries the referring page's origin, and
+    a same-origin navigation carries the full URL -- neither of which a
+    third party or a linked-to site is entitled to learn.
+    """
+    artifact_id = _publish_markdown(api, "# Report\n")
+    for path in ("/", "/admin", f"/a/{artifact_id}", f"/a/{artifact_id}/review"):
+        resp = api.client.get(path)
+        assert resp.status_code == 200, path
+        assert resp.headers.get("referrer-policy") == "no-referrer", path
+
+
+def test_diff_spec_must_name_an_older_and_a_newer_version(api: Api) -> None:
+    """The operands are named older..newer, so the route has to enforce it.
+
+    2..1 would otherwise render additions as removals under labels claiming
+    the opposite, and a review reading those stats draws the reverse
+    conclusion about what changed.
+    """
+    artifact_id = _publish_and_update(api)
+
+    reversed_spec = api.client.get(f"/a/{artifact_id}/diff/2..1")
+    assert reversed_spec.status_code == 400
+    assert "older" in reversed_spec.json()["detail"].lower()
+
+    same = api.client.get(f"/a/{artifact_id}/diff/2..2")
+    assert same.status_code == 400
+
+    # The check must not depend on the versions existing: ordering is a
+    # property of the spec itself, so it is answered before any lookup.
+    assert api.client.get(f"/a/{artifact_id}/diff/9..8").status_code == 400
 
 
 # --------------------------------------------------------------------------

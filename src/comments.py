@@ -366,7 +366,12 @@ class CommentThread:
             body=str(data.get("body") or ""),
             author=author if isinstance(author, dict) else {},
             created_at=str(data.get("created_at") or ""),
-            resolved=bool(data.get("resolved")),
+            # Strictly bool, never truthiness: this value arrives from a
+            # persisted envelope, and bool("false") is True -- a malformed
+            # record would otherwise close a thread it says is open. Anything
+            # that is not a real bool leaves the thread open, the state that
+            # keeps the discussion visible.
+            resolved=data.get("resolved") is True,
             resolved_by=resolved_by if isinstance(resolved_by, dict) else None,
             replies=(
                 [Reply.from_dict(item) for item in raw_replies]

@@ -226,8 +226,9 @@ INVITATION_ID_DESC = (
 
 #: Description of the ``spec`` path parameter of the diff endpoint.
 SPEC_DESC = (
-    "Two version numbers in the form OLD..NEW, for example 1..2. Anything "
-    "else is a 400."
+    "Two version numbers in the form OLD..NEW, for example 1..2. OLD must be "
+    "strictly smaller than NEW -- every rendering labels the two sides that "
+    "way, so a reversed or repeated spec is a 400, as is anything else."
 )
 
 #: Sentence appended to the description of reads that honour the password gate.
@@ -238,6 +239,26 @@ PASSWORD_GATE_NOTE = (
     "which sets a signed cookie scoped to the artifact path and to the "
     "current password. Failed attempts are rate-limited per artifact and "
     "client address, so a wrong password may answer 429 instead of 401."
+)
+
+#: Password paragraph for GET /a/{id}/review only.
+#:
+#: The shared PASSWORD_GATE_NOTE promises browsers the standalone unlock form.
+#: The review route deliberately does the opposite (see read_review): it serves
+#: its credential-free shell with 200 and lets the page ask for the password in
+#: place, so that navigating away cannot drop the URL fragment carrying an
+#: invited guest's credential.
+REVIEW_PASSWORD_NOTE = (
+    "When the artifact is password-protected this route still answers 200. "
+    "The shell it returns carries no artifact content and no credential of "
+    "its own -- everything it displays comes from /raw, /versions and "
+    "/comments, which stay gated -- so the page renders locked and asks for "
+    "the password in its own panel rather than navigating to the standalone "
+    "unlock form, which would drop the '#invite=...' fragment an invited "
+    "guest arrives with. Machine clients send the password in the "
+    "X-Artifact-Password header on the gated endpoints. Failed attempts are "
+    "rate-limited per artifact and client address, so a wrong password may "
+    "answer 429."
 )
 
 #: Paragraph appended to every public route that describes an artifact.
@@ -1084,8 +1105,16 @@ async def public_origin(request: Request, call_next):
 
 @app.middleware("http")
 async def artifact_headers(request: Request, call_next):
-    """Keep artifact responses out of search indexes and shared caches."""
+    """Keep artifact responses out of search indexes, shared caches and referrers."""
     response = await call_next(request)
+    # Every response, not just /a/: a capability URL *is* the credential, and
+    # the hub's pages pull their fonts from a third-party origin. Under a
+    # browser's default policy that stylesheet request carries the referring
+    # page's origin, and a link a reader follows out of a document carries the
+    # full URL -- share id included. "no-referrer" is affordable here because
+    # nothing this service does needs a Referer: its own fetches are
+    # same-origin and authenticate with headers, not with where they came from.
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
     if request.url.path.startswith("/a/"):
         response.headers["X-Robots-Tag"] = "noindex, nofollow"
         # setdefault, not assignment: a handler that has already asked for
@@ -4270,7 +4299,8 @@ def read_versions(
     summary="Diff two versions",
     description=(
         "Compares two versions of one artifact, given in the path as "
-        "'{older}..{newer}' (for example 3..5). Markdown is compared when "
+        "'{older}..{newer}' (for example 3..5); the older number must come "
+        "first. Markdown is compared when "
         "both versions carry Markdown source, otherwise the built HTML is.\n\n"
         "The 'format' query parameter selects the rendering: 'html' (the "
         "default) is a side-by-side page for humans, 'unified' is a "
@@ -4298,7 +4328,8 @@ def read_versions(
         },
         400: {
             "description": (
-                "Malformed diff spec (not OLD..NEW) or an unknown 'format'."
+                "Malformed diff spec (not OLD..NEW, or OLD not strictly "
+                "smaller than NEW) or an unknown 'format'."
             )
         },
         401: {
@@ -4352,6 +4383,25 @@ def read_diff(
             },
         )
     older, newer = int(match.group(1)), int(match.group(2))
+    if older >= newer:
+        # The operands are *named* older and newer, and every rendering
+        # labels them that way: the side-by-side page, the unified diff's
+        # -/+ signs and the JSON "added"/"removed" counts. Accepting 2..1
+        # would answer with additions labelled as removals, so a reader --
+        # or an agent summarising the stats -- concludes the reverse of what
+        # happened. Answered before any lookup, since ordering is a property
+        # of the spec, not of the artifact.
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "malformed diff spec",
+                "detail": (
+                    "The older version must come first and the two must "
+                    "differ. Use {older}..{newer}, for example 3..5"
+                ),
+                "spec": spec,
+            },
+        )
 
     public_id = artifact_id
     meta = _public_meta_of(request, public_id)
@@ -4721,13 +4771,14 @@ def guest_identity(
         "with no Keboola account at all, sending the credential in the "
         "X-Artifact-Guest header. Browsers never send a fragment to a server, "
         "and the page never puts it in a URL, so the secret stays out of the "
-        "hub's logs.\n\n" + PASSWORD_GATE_NOTE
+        "hub's logs.\n\n" + REVIEW_PASSWORD_NOTE
     ),
     responses={
-        200: {"description": "The review page.", "content": CONTENT_HTML},
-        401: {
+        200: {
             "description": (
-                "Password-protected artifact; the HTML unlock form is returned."
+                "The review page. For a password-protected artifact this is "
+                "the same credential-free shell, which renders locked and "
+                "asks for the password in place -- this route has no 401."
             ),
             "content": CONTENT_HTML,
         },

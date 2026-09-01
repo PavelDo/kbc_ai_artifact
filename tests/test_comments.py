@@ -724,3 +724,41 @@ class TestBackendErrors:
 
         loaded = cmt_store.get(ARTIFACT, "t1")
         assert loaded is not None and loaded.resolved is True
+
+
+class TestResolvedIsStrictlyBoolean:
+    """``resolved`` decides whether a thread reads as closed moderation state.
+
+    It arrives from a persisted JSON envelope, so it is untrusted input.
+    Coercing it by truthiness makes the string ``"false"`` close a thread,
+    which is the opposite of what the record says.
+    """
+
+    @staticmethod
+    def _thread_json(resolved: object) -> bytes:
+        return json.dumps(
+            {
+                "id": "t1",
+                "artifact_id": ARTIFACT,
+                "version": 1,
+                "selector": {"exact": "quote"},
+                "body": "a comment",
+                "author": {"key": AUTHOR_A},
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "resolved": resolved,
+                "replies": [],
+            }
+        ).encode("utf-8")
+
+    def test_the_string_false_does_not_resolve_a_thread(self):
+        thread = CommentThread.from_json(self._thread_json("false"))
+        assert thread.resolved is False
+
+    def test_a_non_boolean_value_leaves_the_thread_open(self):
+        for value in ("yes", 1, [], {}, "resolved"):
+            thread = CommentThread.from_json(self._thread_json(value))
+            assert thread.resolved is False, value
+
+    def test_real_booleans_are_still_honoured(self):
+        assert CommentThread.from_json(self._thread_json(True)).resolved is True
+        assert CommentThread.from_json(self._thread_json(False)).resolved is False

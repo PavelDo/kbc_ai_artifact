@@ -756,7 +756,10 @@ rather than retrying blindly — retrying will not fix a 401/403/422.
 
 - Built HTML must stay under **15 MB**.
 - At most **50 live versions** are retained per artifact; oldest non-head,
-  non-pinned versions are pruned automatically. Proposals are never pruned.
+  non-pinned versions are pruned automatically. Live retention never touches a
+  proposal, but proposals have a cap of their own: at most **50** are retained
+  per artifact (`HUB_MAX_PROPOSED_VERSIONS`), and the oldest above that are
+  pruned. Do not assume a pending proposal waits forever -- get it reviewed.
 - At most **20 versions per contributing project per artifact per UTC day**
   (429 past that).
 - At most **5 webhooks** and **20 live guest invitations** per artifact

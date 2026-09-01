@@ -210,15 +210,33 @@ def _stack_host(stack_url: str) -> str:
     return urlsplit(stack_url).hostname or ""
 
 
+def _clean_revoked(entry: dict) -> bool:
+    """Read one invitation's ``revoked`` flag, failing closed on anything odd.
+
+    ``True``/``False`` are honoured, an absent key means "not revoked", and
+    every other value -- a string, a number, a container -- is treated as
+    revoked, because a revocation flag we cannot read must not keep granting
+    access.
+    """
+    if "revoked" not in entry:
+        return False
+    return entry["revoked"] is not False
+
+
 def _clean_invitations(raw: object) -> list[dict]:
     """Normalize a guest-invitation list read from an untrusted meta record.
 
     An entry survives only when it carries a non-empty string ``id`` and a
     ``secret`` that is at least shaped like a hash record (a dict) — anything
     else could never authenticate a guest, so keeping it would only grow the
-    meta file. The remaining fields are coerced rather than dropped, so a
-    half-written entry degrades to an unnamed, non-revoked invitation instead
-    of taking the whole artifact down.
+    meta file. The remaining descriptive fields are coerced rather than
+    dropped, so a half-written entry degrades to an unnamed invitation
+    instead of taking the whole artifact down. ``revoked`` is the exception:
+    it is a security decision, so it is read strictly and fails closed (see
+    :func:`_clean_revoked`).
+
+    This is the single place invitation records are normalized -- every
+    reader downstream may therefore assume ``revoked`` is a real bool.
     """
     if not isinstance(raw, list):
         return []
@@ -242,7 +260,13 @@ def _clean_invitations(raw: object) -> list[dict]:
                 "name": str(entry.get("name") or ""),
                 "secret": secret,
                 "created_at": str(entry.get("created_at") or ""),
-                "revoked": bool(entry.get("revoked")),
+                # A revocation flag fails closed. Strict identity, not
+                # truthiness: bool("false") is True while bool(0) is False,
+                # so coercion lets the value's *type* decide whether a guest
+                # still has a voice. A missing key is the one benign case --
+                # that is simply an invitation written before this field --
+                # so it keeps meaning "not revoked".
+                "revoked": _clean_revoked(entry),
             }
         )
     return cleaned

@@ -19,6 +19,15 @@ from itsdangerous import TimestampSigner
 
 PBKDF2_ITERATIONS = 200_000
 
+#: Bounds on the iteration count a *persisted* record may ask :func:`check_password`
+#: to run. The stored count is honoured so hashes written under an older cost keep
+#: verifying, but that trust has to be bounded in both directions: a corrupted or
+#: hostile record could otherwise turn one unlock attempt into minutes of CPU, or
+#: silently downgrade the KDF. Every record this project has ever written uses
+#: PBKDF2_ITERATIONS, so the range is wide enough to admit all real data.
+MIN_PBKDF2_ITERATIONS = 50_000
+MAX_PBKDF2_ITERATIONS = 4_000_000
+
 _COOKIE_SALT = "artifact-unlock"
 _SALT_BYTES = 16
 
@@ -85,7 +94,15 @@ def check_password(password: str, record: dict) -> bool:
     Tolerates malformed records (missing/invalid fields) by returning
     False rather than raising. Honors ``record["iterations"]`` when
     present so hashes created under an older iteration count still
-    verify correctly.
+    verify correctly -- but only inside
+    ``MIN_PBKDF2_ITERATIONS..MAX_PBKDF2_ITERATIONS``.
+
+    The bound is checked *before* the KDF runs, which is the whole point: a
+    record is persisted data, and persisted data must not be able to choose
+    how much CPU one unlock attempt costs. Out of range the record is treated
+    as unusable (False) rather than clamped, because clamping would verify a
+    password against a cost nobody ever hashed it at and quietly answer True
+    for a downgraded record.
     """
     try:
         salt_hex = record["salt"]
@@ -94,6 +111,9 @@ def check_password(password: str, record: dict) -> bool:
         salt = bytes.fromhex(salt_hex)
         expected = bytes.fromhex(expected_hex)
     except (KeyError, TypeError, ValueError):
+        return False
+
+    if not MIN_PBKDF2_ITERATIONS <= iterations <= MAX_PBKDF2_ITERATIONS:
         return False
 
     try:
