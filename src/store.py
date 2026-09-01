@@ -1027,6 +1027,7 @@ class ArtifactStore:
         max_envelope_bytes: int = 20 * 1024 * 1024,
         max_proposed_versions: int = 50,
         reap_aborted_after_s: int = 0,
+        negative_lookup_cache_entries: int = 4096,
     ) -> None:
         self._backend = backend
         self._cache_dir = Path(cache_dir)
@@ -1048,6 +1049,22 @@ class ArtifactStore:
         # re-checked against the meta record before it is trusted.
         self._share_index: dict[str, str] = {}
         self._share_of: dict[str, str] = {}
+        # SEC-100-002: ids a Storage tag search has confirmed do not exist,
+        # newest last so the bound evicts least-recently-used. Since target
+        # resolution now runs *before* authentication (see
+        # ``_serialized_per_comment_target`` in src/main.py), an anonymous
+        # caller can otherwise turn a stream of well-formed made-up ids into
+        # one Storage round trip each; remembering the miss makes a repeat
+        # free. Membership is only ever a shortcut to "not found", so a stale
+        # entry could only ever hide an artifact that appeared behind our
+        # back -- which the single-writer invariant (CLAUDE.md, "Exactly one
+        # instance, ever") does not allow: this process is the only writer, it
+        # writes through this store, and every path that can make an id
+        # resolvable drops the entry. A read racing a create in *this* process
+        # is not a concern either, since the create's invalidation lands under
+        # the same lock before the new artifact is reachable at all.
+        self._negative_max_entries = max(0, int(negative_lookup_cache_entries))
+        self._absent: OrderedDict[str, None] = OrderedDict()
         self._memory: OrderedDict[tuple[str, int], Envelope] = OrderedDict()
         self._meta_memory: OrderedDict[tuple[str, int], ArtifactMeta] = OrderedDict()
         self._lock = threading.Lock()
@@ -1090,6 +1107,11 @@ class ArtifactStore:
             # from an empty share cache and re-learns lazily (resolve_share).
             self._share_index = {}
             self._share_of = {}
+            # A rebuild is the moment Storage's own state becomes
+            # authoritative again, so every remembered absence is discarded
+            # rather than reconciled: some of them may be in the index we just
+            # built (SEC-100-002).
+            self._absent.clear()
         logger.info("Hydrated index with %d artifact(s)", len(index))
         return len(index)
 
@@ -1175,25 +1197,69 @@ class ArtifactStore:
         hydration) serves with an empty index and discovers artifacts lazily --
         so an index miss is re-checked against Storage before we answer "not
         found", rather than trusting a startup snapshot that may not have run.
+
+        SEC-100-002: that re-check used to run on *every* miss, including the
+        made-up ids an unauthenticated caller supplies by the thousand, so a
+        confirmed absence is now remembered in a bounded LRU and answered from
+        memory. Nothing but a write of this process's own can make an absent
+        id appear (single writer, CLAUDE.md), and every such write invalidates
+        the entry, so a read that legitimately races a just-created artifact
+        cannot be served a stale "missing".
         """
         with self._lock:
             entry = self._index.get(artifact_id)
+            if entry is None and artifact_id in self._absent:
+                self._absent.move_to_end(artifact_id)
+                return None
         if entry is not None:
             return entry
 
         files = self._backend.search_by_tag(tag_for_id(artifact_id))
         if not files:
+            with self._lock:
+                self._remember_absent_locked(artifact_id)
             return None
         fresh = _ArtEntry()
         for info in files:
             _absorb_file(fresh, info)
 
         with self._lock:
+            self._forget_absent_locked(artifact_id)
             current = self._index.get(artifact_id)
             if current is None:
                 self._index[artifact_id] = fresh
                 return fresh
             return current
+
+    def negative_cache_size(self) -> int:
+        """How many confirmed-absent ids are remembered right now.
+
+        Exposed so the bound can be asserted on without reaching into the
+        store's internals; nothing in the service reads it.
+        """
+        with self._lock:
+            return len(self._absent)
+
+    def _remember_absent_locked(self, artifact_id: str) -> None:
+        """Record that Storage has no file for ``artifact_id``. Holds the lock."""
+        if self._negative_max_entries <= 0:
+            return
+        self._absent[artifact_id] = None
+        self._absent.move_to_end(artifact_id)
+        while len(self._absent) > self._negative_max_entries:
+            self._absent.popitem(last=False)
+
+    def _forget_absent_locked(self, artifact_id: str) -> None:
+        """Drop a remembered absence. Caller holds the lock.
+
+        Called from every path that can make an id resolvable, which is what
+        keeps the cache from ever answering "missing" about something that
+        exists: creation and version writes (``save_meta``, ``add_version``,
+        ``add_version_next``), a share id being learned or rotated
+        (``_learn_share_locked``), a full rebuild (``hydrate``) and an
+        explicit per-artifact re-read (``refresh``).
+        """
+        self._absent.pop(artifact_id, None)
 
     def refresh(self, artifact_id: str) -> bool:
         """Re-read one artifact's files from Storage, replacing its index entry.
@@ -1222,12 +1288,16 @@ class ArtifactStore:
                 self._forget_memory_locked(artifact_id)
                 self._forget_meta_locked(artifact_id)
                 self._forget_share_locked(artifact_id)
+                # Storage has just confirmed the absence, so record it the
+                # same way a plain lookup miss would (SEC-100-002).
+                self._remember_absent_locked(artifact_id)
             return False
         rebuilt = _ArtEntry()
         for info in files:
             _absorb_file(rebuilt, info)
         with self._lock:
             self._index[artifact_id] = rebuilt
+            self._forget_absent_locked(artifact_id)
             self._forget_memory_locked(artifact_id)
             self._forget_meta_locked(artifact_id)
             # The refreshed meta file may carry a share id rotated since we
@@ -1273,6 +1343,7 @@ class ArtifactStore:
 
         with self._lock:
             entry = self._index.setdefault(artifact_id, _ArtEntry())
+            self._forget_absent_locked(artifact_id)
             previous = entry.meta_file_id
             entry.meta_file_id = file_id
             self._forget_meta_locked(artifact_id)
@@ -1308,6 +1379,11 @@ class ArtifactStore:
                 self._share_index.pop(previous, None)
         self._share_of[artifact_id] = share_id
         self._share_index[share_id] = artifact_id
+        # A rotation mints an id an anonymous caller may already have probed
+        # and had recorded as absent; both halves of the identity pair are
+        # live from here on (SEC-100-002).
+        self._forget_absent_locked(artifact_id)
+        self._forget_absent_locked(share_id)
 
     def _forget_share_locked(self, artifact_id: str) -> None:
         """Drop everything we know about an artifact's share id. Holds lock."""
@@ -1397,6 +1473,35 @@ class ArtifactStore:
         if self._resolve(wanted) is None:
             return None
         return self._share_hit(wanted, wanted)
+
+    def resolve_lock_target(self, path_id: str) -> str | None:
+        """Map either half of an artifact's identity pair to its internal id.
+
+        What the comment routes need in order to take the right lock: a live
+        share id resolves to the artifact behind it, and so does the bare
+        internal id of an artifact whose public link has been rotated away or
+        which sits in the trash -- both are still real artifacts whose
+        mutations have to serialize against their owner's routes, even though
+        neither is publicly servable. Anything naming no artifact at all
+        answers ``None``.
+
+        SEC-100-002: the caller used to get this by asking twice
+        (``resolve_share`` and then ``get_meta``), which cost an unauthenticated
+        caller two Storage tag searches per made-up id. Resolving both halves in
+        one pass costs one -- and, for a repeat of the same id, none, since the
+        confirmed absence is remembered (see :meth:`_resolve`).
+        """
+        if not path_id:
+            return None
+        internal_id = self.resolve_share(path_id)
+        if internal_id is not None:
+            return internal_id
+        # ``resolve_share`` has already re-checked Storage for an id this
+        # process has not indexed, so this second half reads the index (or the
+        # negative cache) and never repeats the tag search.
+        if self._resolve(path_id) is None:
+            return None
+        return path_id if self.get_meta(path_id) is not None else None
 
     def _scan_for_share(self, wanted: str) -> str | None:
         """Load the metas whose share id we do not know yet, looking for one.
@@ -1507,6 +1612,7 @@ class ArtifactStore:
 
         with self._lock:
             entry = self._index.setdefault(artifact_id, _ArtEntry())
+            self._forget_absent_locked(artifact_id)
             previous = entry.versions.get(version)
             entry.versions[version] = _VerEntry(
                 file_id=file_id, status=env.status, size_bytes=len(raw)
@@ -1547,6 +1653,7 @@ class ArtifactStore:
         self.get_meta(artifact_id)
         with self._lock:
             entry = self._index.setdefault(artifact_id, _ArtEntry())
+            self._forget_absent_locked(artifact_id)
             version = entry.next_free_number()
             entry.reserving.add(version)
 
@@ -1566,6 +1673,7 @@ class ArtifactStore:
 
         with self._lock:
             entry = self._index.setdefault(artifact_id, _ArtEntry())
+            self._forget_absent_locked(artifact_id)
             entry.reserving.discard(version)
             entry.high_water = max(entry.high_water, version)
             previous = entry.versions.get(version)
@@ -1973,6 +2081,11 @@ class ArtifactStore:
             self._forget_memory_locked(artifact_id)
             self._forget_meta_locked(artifact_id)
             self._forget_share_locked(artifact_id)
+            # Every file of this artifact is gone from Storage, so the id is
+            # absent in exactly the sense the negative cache records; saying
+            # so here spares the next probe of a purged id a tag search
+            # (SEC-100-002).
+            self._remember_absent_locked(artifact_id)
         self._purge_disk_cache(artifact_id)
         # The artifact is gone, so its revision has nothing left to describe;
         # dropping it keeps a create/purge loop from growing the ledger.
