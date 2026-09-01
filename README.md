@@ -221,7 +221,7 @@ Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 | DELETE | `/api/artifacts/{id}/invitations/{iid}` | Revoke one invitation; everyone else's keeps working (owner project only) |
 | POST | `/api/artifacts/{id}/versions` | Submit a version `{html[, markdown_source] \| markdown \| git_url, title?, note?, base_version?}` — live for the owner, proposed for any other project (409 when `status` is `final` or trashed) |
 | POST | `/api/artifacts/{id}/versions/{n}/promote` | Promote a proposal to live (owner project only) |
-| DELETE | `/api/artifacts/{id}/versions/{n}` | Delete a version (owner), or withdraw your own proposal (contributor) |
+| DELETE | `/api/artifacts/{id}/versions/{n}` | Delete a version (owner), or withdraw your own proposal (contributor). 409 for the last live version, and for the version the head is pinned to — re-pin or switch the head to `latest` first |
 | PUT | `/api/artifacts/{id}/head` | `{"mode": "latest"}` or `{"mode": "pinned", "version": n}` (owner project only) |
 | POST | `/api/artifacts/{id}/comments` | Open a comment thread `{version, exact, prefix, suffix, body}` (403 if closed/allowlisted, 409 if frozen, 429 past the daily cap); also accepts an `X-Artifact-Guest` credential in place of a Storage token |
 | POST | `/api/artifacts/{id}/comments/{tid}/replies` | Reply to a thread `{body}` (guest credential accepted here too) |
@@ -314,6 +314,9 @@ hub -X POST "$HUB/api/artifacts/<id>/versions/2/promote"
 hub -X PUT "$HUB/api/artifacts/<id>/head" \
   -H "Content-Type: application/json" \
   -d '{"mode": "pinned", "version": 1}'
+
+# A pinned version cannot be deleted (409) — the head would be left naming a
+# version that no longer exists. Re-pin, or go back to "latest", then delete.
 
 # Withdraw your own proposal (contributor project)
 KBC_TOKEN="$CONTRIBUTOR_TOKEN" hub -X DELETE "$HUB/api/artifacts/<id>/versions/2"

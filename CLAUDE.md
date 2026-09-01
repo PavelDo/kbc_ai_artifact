@@ -74,6 +74,39 @@ no other source of truth. **If you add a field or a relationship the index
 needs, it must be reconstructible from these tags/file contents alone; if it
 isn't, that's a bug**, not a case to special-case around with local state.
 
+**Deleting an artifact deletes children first, the meta file strictly last**
+(`ArtifactStore.delete`). The meta file is what authorizes the purge, so
+removing it while any version/legacy file survives makes the leftover
+unreachable *and* undeletable — the retry can no longer prove ownership. If
+you add a new kind of per-artifact file, classify it as a child in
+`ArtifactStore._classify_for_delete`. The other side of that ordering is that
+a crash in the final gap leaves a meta record with no versions: that is a
+legitimate, temporary state (inert publicly, still purgeable by the owner) and
+`ArtifactStore._reap_aborted_publishes` clears it once it is too old to be an
+operation still in flight.
+
+## Known residual risks
+
+Accepted, understood and deliberately not fixed. Add to this list rather than
+rediscovering an item as a bug; each entry says why the fix is worse than the
+risk and what an operator can do about it.
+
+- **`REL-075-009` — a process death can orphan a canonical copy in the
+  author's project.** Publishing writes a canonical HTML copy into the
+  *caller's* own Keboola project (`_store_canonical` in `src/main.py`) before
+  the hub's version file exists. Every caught failure afterwards deletes that
+  copy while the caller's token is still in hand (`_discard_canonical`); the
+  container *dying* in between cannot, because client tokens are request-scope
+  only and the hub keeps no handle to another project's Storage. The window is
+  process death alone — not anything an API caller can trigger. Reordering so
+  the external copy is written last would close it, but `canonical_file_id`
+  lives in the version envelope and version files are immutable (above), so
+  that would mean rewriting a version file — a worse trade than the orphan,
+  which is informational only: the id is echoed in the publish response and
+  never resolved back to a file. **Operator remedy:** in the *author's* own
+  project, list Storage files tagged `kbc-artifact` plus `artifact-id-{id}`
+  and delete any whose artifact the hub does not serve.
+
 ## Secrets discipline
 
 - Client Storage tokens and `git_token` are **transient, request-scope only**.

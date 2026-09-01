@@ -2619,7 +2619,37 @@ def _build(
 
 
 def _store_canonical(owner: Owner, token: str, artifact_id: str, html: str) -> int:
-    """Upload the canonical copy of the built HTML into the author's project."""
+    """Upload the canonical copy of the built HTML into the author's project.
+
+    **REL-075-009 — accepted residual: a process death here orphans this file.**
+
+    The copy lands in the *caller's* project, reachable only with the caller's
+    token, which is request-scope and never persisted (see CLAUDE.md, "Secrets
+    discipline"). Every *caught* failure downstream cleans it up while the
+    token is still in hand (:func:`_discard_canonical`). What cannot be cleaned
+    up is the container dying between this upload and the hub-side version
+    write: the token is gone, the hub has no record naming the file, and no
+    reconciler can search another project's Storage. The window is process
+    death only — a matter of milliseconds, and not something an API caller can
+    trigger.
+
+    Writing the external copy *last*, after the hub version file exists, would
+    close the window. It is not available: ``canonical_file_id`` lives inside
+    the version envelope, and version files are immutable by design (CLAUDE.md,
+    "Storage model" — one file per submitted version, never overwritten), so
+    the id cannot be filled in afterwards. Rewriting a version file to add it,
+    or writing the version with ``canonical_file_id=None`` and following up,
+    would trade a rare orphan in someone else's project for a hole in the
+    immutability the whole version/diff/anchor model rests on. The id is purely
+    informational anyway: it is echoed back once in the publish response and
+    never resolved back to a file, so the orphan costs storage and tidiness,
+    not correctness or confidentiality.
+
+    An operator reaping one by hand searches the *author's own* project for
+    Storage files tagged ``kbc-artifact`` (:data:`CANONICAL_TAG`) plus
+    ``artifact-id-{id}``, and deletes any whose artifact the hub does not
+    serve.
+    """
     backend = KbcFilesBackend(owner.stack_url, token)
     try:
         return backend.upload(
@@ -5744,9 +5774,11 @@ def restore_artifact(
         "artifact's view statistics and rate-limit counters. All of its URLs "
         "stop resolving for good.\n\n"
         "The call is idempotent and resumable: each step is safe to repeat, "
-        "and the record that authorizes the operation is erased last, so a "
-        "call that fails partway can simply be retried with the same "
-        "credentials.\n\n"
+        "and the meta record that authorizes the operation is erased strictly "
+        "last — after the comment threads and after every version file — so a "
+        "call that fails partway leaves the artifact still owned by you and "
+        "can simply be retried with the same credentials, including after a "
+        "restart.\n\n"
         "An artifact does not have to be in the trash first, but the gentler "
         "path is DELETE /api/artifacts/{id} (soft, reversible) followed by "
         "this once you are sure. The canonical copies in the authors' own "
@@ -5768,13 +5800,14 @@ def restore_artifact(
                 "The caller's Keboola stack could not be reached to verify "
                 "the token, the hub's own Storage is unavailable, or the "
                 "erasure only partially succeeded — some stored files could "
-                "not be removed, so the artifact is still readable and the "
-                "call must be retried. Comment threads are erased before the "
-                "artifact itself, so a partial comment erasure "
-                "('comment_threads_failed' says how many threads still have "
-                "files in Storage) leaves the artifact deliberately in place: "
-                "retrying the purge with the same credentials resumes it and "
-                "finishes the job."
+                "not be removed, so content may still be readable and the "
+                "call must be retried. Comment threads are erased first, then "
+                "the version files, then the meta record, so a partial "
+                "erasure at any point ('comment_threads_failed' says how many "
+                "threads still have files in Storage) leaves the artifact and "
+                "its ownership record deliberately in place: retrying the "
+                "purge with the same credentials resumes it and finishes the "
+                "job."
             )
         },
     },
@@ -5841,6 +5874,11 @@ def purge_artifact(
         # confirmed gone; on a partial failure it keeps the index so the
         # artifact stays readable. Reporting "deleted": true here would tell an
         # owner their content is unreachable while it is still being served.
+        #
+        # REL-100-001: whatever survived, the artifact's meta record survived
+        # with it (store.delete deletes it strictly last), so this retry can
+        # authenticate and finish -- including after a restart, since the meta
+        # is what hydrate rebuilds the artifact from.
         logger.error(
             "Partial purge of artifact %s: some Storage files remain",
             artifact_id,
@@ -5850,8 +5888,10 @@ def purge_artifact(
             content={
                 "error": "artifact not fully deleted",
                 "detail": (
-                    "Some stored files could not be removed; the artifact is "
-                    "still readable. Retry the delete."
+                    "Some stored files could not be removed, so the erasure "
+                    "did not fully happen and content may still be readable. "
+                    "The artifact's ownership record was deliberately kept so "
+                    "this call can be retried; retry the purge to finish it."
                 ),
                 "id": artifact_id,
                 "comment_threads_deleted": threads,
@@ -6664,7 +6704,7 @@ def promote_version(
     "/api/artifacts/{artifact_id}/versions/{version}",
     tags=["versions"],
     summary="Delete a version or withdraw a proposal",
-    description="The owning project may delete any version except the last live one. A contributor may delete only their own proposal — withdrawing a submission they no longer stand behind.",
+    description="The owning project may delete any version except the last live one and the version the head is currently pinned to. A contributor may delete only their own proposal — withdrawing a submission they no longer stand behind. Deleting the pinned version is refused with 409: pin the head to another live version, or switch it back to 'latest', and then delete.",
     responses={
         200: {
             "description": (
@@ -6679,7 +6719,9 @@ def promote_version(
         404: {"description": "No artifact, or no such version."},
         409: {
             "description": (
-                "This is the only live version; an artifact must keep one."
+                "This is the only live version and an artifact must keep one, "
+                "or this is the version the head is pinned to — re-pin the "
+                "head or switch it to 'latest' first."
             )
         },
         422: {"description": "'version' is not an integer."},
@@ -6744,6 +6786,49 @@ def delete_version(
                 ),
                 "id": artifact_id,
                 "version": version,
+            },
+        )
+
+    # COR-075-006: refuse to delete the version the head is pinned to.
+    #
+    # The delete used to succeed and leave the meta record naming a version
+    # that no longer existed. Nothing was corrupted in a way a reader would
+    # notice -- get_head logs the dangling pin and falls back to the newest
+    # live version -- and that silence was the problem: the owner had asked
+    # for one specific version to be served, the stored answer to "what does
+    # /a/{id} serve" still said that version, and what was actually served was
+    # something else. A pin is an explicit editorial decision, so resolving it
+    # by guessing is worse than refusing.
+    #
+    # Of the two options in the review roadmap -- refuse, or silently rewrite
+    # the head to "latest" in the same operation -- this is the refusal. It
+    # keeps the head pointer something only the owner ever moves, and it costs
+    # them one extra call that says out loud what the alternative would have
+    # done behind their back. The invariant it establishes: after any
+    # successful version delete, a stored "pinned" head still names a live
+    # version.
+    #
+    # The check reads the meta record loaded above rather than the head
+    # envelope, because a stale pin is exactly the state being guarded and
+    # get_head would have already resolved it away. Both this route and
+    # PUT /head are @_serialized_per_artifact, so the pin cannot move between
+    # this check and the delete below.
+    if meta.head_mode == HEAD_PINNED and meta.head_version == version:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "cannot delete the pinned head version",
+                "detail": (
+                    f"The head is pinned to version {version}, so deleting it "
+                    "would leave the artifact pointing at a version that no "
+                    "longer exists. Pin the head to another live version, or "
+                    "switch it back to 'latest' "
+                    f"(PUT /api/artifacts/{artifact_id}/head), then delete."
+                ),
+                "id": artifact_id,
+                "version": version,
+                "head_mode": meta.head_mode,
+                "head_version": meta.head_version,
             },
         )
 
