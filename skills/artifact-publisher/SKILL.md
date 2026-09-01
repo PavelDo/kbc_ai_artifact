@@ -1105,7 +1105,17 @@ mind:
 | 413 | Built HTML over the size limit, a diff side over `HUB_DIFF_MAX_BYTES` (for `format=visual`, the rendered HTML of the larger side) |
 | 422 | Build failure — bad git repo, no entry file found, markdown render error, `git_token`/`git_username` sent without `git_url`, `markdown_source` sent without `html`, a `title` sent without content, pinning the head to a version that does not exist or is not live, a `base_version` naming a version that does not exist, an invalid/blocked webhook URL or too many of them, or an empty/over-long/over-quota invitation name |
 | 429 | Your project reached the daily version-submission cap for this artifact, the daily `HUB_MAX_COMMENTS_PER_DAY` comment/reply cap (per project or per guest invitation), or too many wrong unlock-password attempts from your address this hour |
-| 502 | The Keboola stack itself could not be reached to verify the token, or the hub's own Storage backend is unavailable |
+| 502 | The Keboola stack itself could not be reached to verify the token, or the hub's own Storage backend is unavailable. On `PUT /api/artifacts/{id}` the `detail` also states what is in force — see below |
+
+A `PUT` that mixes new content with new settings is never left in a state
+looser than it started in: the settings that **narrow** access (`password`,
+closing `accept_versions_mode`/`comments_mode`, `"status": "final"`) are
+committed before the new version, and the ones that **widen** it
+(`clear_password`, reopening a mode, `"status": "draft"`) after it. A 502 from
+that call therefore reports one of three outcomes in its `detail` — nothing
+applied, the narrowing settings applied without the version, or the version
+live under the previous narrower settings — and what to resend. Read it rather
+than assuming the request changed nothing.
 
 ## Safety notes
 

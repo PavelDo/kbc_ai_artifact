@@ -99,12 +99,18 @@ from src.security import (
 )
 from src.statedb import StateDB
 from src.store import (
+    ACCEPT_ALLOWLIST,
+    ACCEPT_ANYONE,
     ACCEPT_MODES,
+    ACCEPT_OFF,
     ARTIFACT_DRAFT,
     ARTIFACT_FINAL,
     ARTIFACT_SETTABLE_STATUSES,
     ARTIFACT_TRASHED,
+    COMMENTS_ALLOWLIST,
+    COMMENTS_ANYONE,
     COMMENTS_MODES,
+    COMMENTS_OFF,
     HEAD_LATEST,
     HEAD_PINNED,
     STATUS_LIVE,
@@ -2525,6 +2531,134 @@ def _apply_policy(meta: ArtifactMeta, body: UpdateBody) -> None:
                 ),
             )
         meta.status = body.status
+
+
+# --------------------------------------------------------------------------
+# Settings direction: tightening vs loosening (SEC-100-001 / REL-075-004)
+# --------------------------------------------------------------------------
+
+#: Every field on :class:`~src.store.ArtifactMeta` that ``PUT /api/artifacts/
+#: {id}`` can change and that decides *who may read or write* the artifact.
+#: Deliberately explicit rather than derived: a new access-relevant setting has
+#: to be classified here on purpose, and the test suite pins the list, so
+#: forgetting one is a failing test rather than a silent fail-open.
+#:
+#: ``updated_at`` is intentionally absent — it changes on every update and
+#: grants nobody anything, so counting it would make every request look like a
+#: settings change and force a redundant Storage write.
+_ACCESS_SETTINGS: tuple[str, ...] = (
+    "password",
+    "accept_versions_mode",
+    "contributors",
+    "comments_mode",
+    "status",
+    "webhooks",
+)
+
+#: How *wide* each mode is: a higher number lets more people in. Used only to
+#: compare an old value with a new one, never persisted.
+_ACCEPT_WIDTH = {ACCEPT_OFF: 0, ACCEPT_ALLOWLIST: 1, ACCEPT_ANYONE: 2}
+_COMMENTS_WIDTH = {COMMENTS_OFF: 0, COMMENTS_ALLOWLIST: 1, COMMENTS_ANYONE: 2}
+#: "final" freezes versions and comments, "trashed" kills the public link.
+#: ``_apply_policy`` refuses to set "trashed" here, but ranking it keeps the
+#: comparison total for a meta record that is already in the trash.
+_STATUS_WIDTH = {ARTIFACT_TRASHED: 0, ARTIFACT_FINAL: 1, ARTIFACT_DRAFT: 2}
+
+
+def _is_tightening(field_name: str, before: Any, after: Any) -> bool:
+    """Does changing ``field_name`` from ``before`` to ``after`` reduce access?
+
+    "Tightening" means the new value lets *no more* people read or contribute
+    than the old one did. The rules, one per access-relevant setting:
+
+    * ``password`` — setting one where there was none puts a gate up; replacing
+      an existing one revokes the credential its old holders have. Neither
+      widens anything, so both are tightening. Only clearing it is loosening.
+    * ``accept_versions_mode`` / ``comments_mode`` — ranked by how many people
+      the mode admits (``off`` < ``allowlist`` < ``anyone``); moving to an
+      equal-or-narrower rank is tightening.
+    * ``contributors`` — the allowlist itself. A new list that is a subset of
+      the old one can only remove people; anything that introduces a key that
+      was not there before is loosening.
+    * ``status`` — ``draft`` is open, ``final`` freezes contributions,
+      ``trashed`` additionally kills the public link. Freezing is tightening;
+      reopening is loosening.
+    * ``webhooks`` — an outbound copy of what happens to the artifact, so a URL
+      that was not registered before is a new recipient, i.e. loosening.
+      Removing one is tightening.
+
+    Anything not enumerated above is treated as tightening, which is the
+    fail-closed answer: an unclassified setting is then committed *before* the
+    content, where the worst case is a change that survives a failed request
+    while being no wider than what the owner asked for.
+    """
+    if before == after:
+        return True
+    if field_name == "password":
+        return after is not None
+    if field_name == "accept_versions_mode":
+        return _ACCEPT_WIDTH.get(after, 0) <= _ACCEPT_WIDTH.get(before, 0)
+    if field_name == "comments_mode":
+        return _COMMENTS_WIDTH.get(after, 0) <= _COMMENTS_WIDTH.get(before, 0)
+    if field_name == "status":
+        return _STATUS_WIDTH.get(after, 0) <= _STATUS_WIDTH.get(before, 0)
+    if field_name in ("contributors", "webhooks"):
+        return set(after or ()) <= set(before or ())
+    return True
+
+
+def _tightening_half(previous: ArtifactMeta, candidate: ArtifactMeta) -> ArtifactMeta:
+    """A copy of ``previous`` carrying only ``candidate``'s tightening changes.
+
+    The result is by construction no less restrictive than either input, which
+    is exactly what makes it safe to commit before the new content exists.
+    """
+    tightened = dataclasses.replace(previous)
+    for field_name in _ACCESS_SETTINGS:
+        before = getattr(previous, field_name)
+        after = getattr(candidate, field_name)
+        if _is_tightening(field_name, before, after):
+            setattr(tightened, field_name, after)
+    return tightened
+
+
+def _access_differs(before: ArtifactMeta, after: ArtifactMeta) -> bool:
+    """True when the two metas disagree about who may read or write."""
+    return any(
+        getattr(before, name) != getattr(after, name) for name in _ACCESS_SETTINGS
+    )
+
+
+#: 502 details for a partly-applied update. Each one names the state that is
+#: actually in force, because the owner's next move depends on it: a rolled-back
+#: update is retried whole, a stuck tightening needs the settings checked, and a
+#: published-but-not-loosened artifact needs only the settings resent.
+_UPDATE_ROLLED_BACK = (
+    "No new version was published and the settings this request would have "
+    "tightened were rolled back: the artifact's previous content and settings "
+    "are what is in force. Retry the whole update."
+)
+_UPDATE_TIGHTENING_STUCK = (
+    "No new version was published, and the settings this request tightened "
+    "could not be rolled back: they are still in force over the previous "
+    "content, which is more restrictive than before but not what you asked "
+    "for. Check the artifact's settings before retrying."
+)
+_UPDATE_LOOSENING_PENDING = (
+    "The new version was published and is live, but under the previous, more "
+    "restrictive settings: the requested changes that widen access were not "
+    "applied. Resend them."
+)
+_UPDATE_TIMESTAMP_PENDING = (
+    "The new version was published and is live; only the artifact's "
+    "updated-at timestamp could not be recorded, so access is unchanged."
+)
+
+
+def _partial_update_502(cause: Exception, statement: str) -> HTTPException:
+    """A 502 that keeps the underlying cause *and* states what is in force."""
+    reason = str(getattr(cause, "detail", None) or cause) or "storage was unavailable"
+    return HTTPException(status_code=502, detail=f"{reason}. {statement}")
 
 
 def _require_exactly_one_content(body: PublishBody | VersionBody) -> None:
@@ -5372,7 +5506,15 @@ def publish_artifact(
             "description": (
                 "The caller's Keboola stack could not be reached to verify "
                 "the token, the canonical upload failed, or the hub's own "
-                "Storage is unavailable."
+                "Storage is unavailable.\n\n"
+                "When a request carried both content and settings, the "
+                "'detail' names exactly what is in force, because a partly "
+                "applied update is never left less restrictive than it was: "
+                "either nothing was applied, or the settings that *narrow* "
+                "access were applied without the new version (and could not "
+                "be rolled back), or the new version is live under the "
+                "previous, narrower settings and the changes that *widen* "
+                "access must be resent. Read the detail before retrying."
             )
         },
     },
@@ -5384,7 +5526,16 @@ def update_artifact(
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
     auth: tuple[Owner, str] = Depends(require_owner),
 ) -> Response:
-    """Add a live version and/or change the artifact-level settings."""
+    """Add a live version and/or change the artifact-level settings.
+
+    **Persistence contract (SEC-100-001).** When one request does both, the
+    settings are split by direction and committed around the content:
+    tightening first, then the version, then loosening. Whatever fails, the
+    publicly reachable state is never less restrictive than the last durable
+    commit, and the 502 says which state that is. See the long comment on the
+    ordering below for the reasoning and :func:`_is_tightening` for how each
+    individual setting is classified.
+    """
     owner, token = auth
     ensure_hydrated(request.app)
     store = request.app.state.store
@@ -5441,12 +5592,42 @@ def update_artifact(
     if present:
         built, source = _build(body)
 
-    # Content first, settings last. The settings used to be saved before the
-    # content, so a failed canonical upload or version write answered 502
-    # with a new password, policy or status already in force -- the caller
-    # was told nothing happened while the security-relevant half had. Now
-    # the version lands (or fails, with nothing changed) before any setting
-    # is written. The settings are applied to a *copy*: store.get_meta
+    # Fail-closed write ordering (SEC-100-001, the regressed REL-075-004).
+    #
+    # A single PUT can carry both new content and new settings, and the two
+    # naive orderings each fail open in one direction:
+    #
+    #   settings first (v0.7.5)  a failed content write left the new password,
+    #                            policy or status in force although the caller
+    #                            was told the update failed;
+    #   content first (v0.10.0)  a failed settings write left the new -- often
+    #                            confidential -- version as the *public head*
+    #                            under the old, looser policy. Strictly worse:
+    #                            less restrictive than the previous state and
+    #                            than the requested one.
+    #
+    # Neither is safe on its own, because one request can both narrow access (a
+    # password, submissions closed, the document finalized) and widen it
+    # (clear_password, submissions reopened, un-finalized). So the settings are
+    # split by direction -- see :func:`_is_tightening` for the per-setting
+    # rules -- and committed around the content:
+    #
+    #   (a) tightening settings, (b) the new version, (c) loosening settings.
+    #
+    # The contract this is here to keep, and which the tests in
+    # tests/test_review100_atomic_update.py pin at every step:
+    #
+    #   **after any partial failure the publicly reachable state is never less
+    #   restrictive than the last durable commit.**
+    #
+    # Concretely: if (a) fails, nothing changed. If (b) fails, (a) is rolled
+    # back best-effort and the 502 names whichever of the two states survived
+    # -- retained tightening is acceptable and is stated plainly, retained
+    # loosening never happens because loosening has not been written yet. If
+    # (c) fails, the new content is live under the tightened/previous settings
+    # and the 502 says the widening half must be resent.
+    #
+    # Everything is applied to *copies* (dataclasses.replace): store.get_meta
     # answers from cache, so mutating ``meta`` in place would let a failed
     # save_meta leave every later read on this process showing settings
     # Storage never received.
@@ -5458,48 +5639,127 @@ def update_artifact(
     _apply_policy(candidate, body)
     candidate.updated_at = now
 
-    if built is not None:
-        canonical_file_id = _store_canonical(owner, token, artifact_id, built.html)
-        envelope = Envelope(
-            id=artifact_id,
-            # Replaced by add_version_next, which allocates atomically.
-            version=0,
-            title=built.title,
-            html=built.html,
-            source_type=built.source_type,
-            source=source or {},
-            author=_identity(owner),
-            status=STATUS_LIVE,
-            canonical_file_id=canonical_file_id,
-            created_at=now,
-        )
+    finalized_emitted = False
+    if built is None:
+        # No content means nothing to order the settings around, so this stays
+        # the single save it has always been.
+        envelope = store.get_head(artifact_id)
+        if envelope is None:
+            return _not_found(artifact_id)
+        store.save_meta(candidate)
+        meta = candidate
+    else:
+        previous = meta
+        tightened = _tightening_half(previous, candidate)
+        tightened.updated_at = now
+        has_tightening = _access_differs(previous, tightened)
+        has_loosening = _access_differs(tightened, candidate)
+
+        # (a) Narrow access first, so a failure anywhere later can only leave
+        # the artifact more locked down than it was, never less.
+        if has_tightening:
+            store.save_meta(tightened)
+        committed = tightened if has_tightening else previous
+
+        # (b) The content. Both halves of it -- the canonical copy in the
+        # caller's project and the version envelope on the hub -- are undone on
+        # failure, and so is (a).
         try:
-            envelope.version = store.add_version_next(envelope)
-        except Exception:
-            # The copy in the caller's project has no version pointing at it
-            # and no other way to ever be found; discard it now, while the
-            # caller's token still works. The failure itself still propagates.
-            _discard_canonical(owner, token, artifact_id, canonical_file_id)
-            raise
-        # v1 is the publish itself, which the owner just did by hand and does
-        # not need a notification about; every later live version is news.
+            canonical_file_id = _store_canonical(owner, token, artifact_id, built.html)
+            envelope = Envelope(
+                id=artifact_id,
+                # Replaced by add_version_next, which allocates atomically.
+                version=0,
+                title=built.title,
+                html=built.html,
+                source_type=built.source_type,
+                source=source or {},
+                author=_identity(owner),
+                status=STATUS_LIVE,
+                canonical_file_id=canonical_file_id,
+                created_at=now,
+            )
+            try:
+                envelope.version = store.add_version_next(envelope)
+            except Exception:
+                # The copy in the caller's project has no version pointing at
+                # it and no other way to ever be found; discard it now, while
+                # the caller's token still works. The failure still propagates.
+                _discard_canonical(owner, token, artifact_id, canonical_file_id)
+                raise
+        except Exception as exc:
+            if not has_tightening:
+                # Nothing was committed at all, so the pre-existing behaviour
+                # -- the raw failure, as a 502 -- is already accurate.
+                raise
+            rolled_back = False
+            try:
+                store.save_meta(dataclasses.replace(previous))
+                rolled_back = True
+            except Exception:  # noqa: BLE001 - the original failure must win
+                logger.error(
+                    "Artifact %s: the new version failed *and* the tightened "
+                    "settings from the same request could not be rolled back; "
+                    "they remain in force over the previous content and need "
+                    "checking by hand",
+                    artifact_id,
+                )
+            raise _partial_update_502(
+                exc,
+                _UPDATE_ROLLED_BACK if rolled_back else _UPDATE_TIGHTENING_STUCK,
+            ) from exc
+
+        # Durable now, so the notification is truthful. v1 is the publish
+        # itself, which the owner just did by hand and does not need a
+        # notification about; every later live version is news. The receivers
+        # are the ones ``committed`` holds -- a request that removed a webhook
+        # tightened it away in (a), and it must not be notified.
         if envelope.version > 1:
             _emit_webhook(
                 request,
-                meta,
+                committed,
                 "version.published",
                 {"title": envelope.title, "version": envelope.version},
                 actor=owner,
             )
-    else:
-        envelope = store.get_head(artifact_id)
-        if envelope is None:
-            return _not_found(artifact_id)
+        # Finalizing is a tightening, so it became durable in (a). Emitting it
+        # here rather than at the end of the handler means a failing (c) does
+        # not swallow an event describing a freeze that really did take.
+        if committed.status == ARTIFACT_FINAL and not was_final:
+            _emit_webhook(
+                request,
+                committed,
+                "artifact.finalized",
+                {"title": envelope.title, "version": envelope.version},
+                actor=owner,
+            )
+            finalized_emitted = True
 
-    store.save_meta(candidate)
-    meta = candidate
+        # (c) Widen access last, once the content it applies to exists. Also
+        # the place a content-only update records its updated_at, which is why
+        # this runs when there is no settings change at all.
+        if has_loosening or not has_tightening:
+            try:
+                store.save_meta(candidate)
+            except Exception as exc:
+                logger.error(
+                    "Artifact %s: version %d is published and live, but the "
+                    "settings that widen access could not be saved; the "
+                    "previous, more restrictive settings stay in force",
+                    artifact_id,
+                    envelope.version,
+                )
+                raise _partial_update_502(
+                    exc,
+                    _UPDATE_LOOSENING_PENDING
+                    if has_loosening
+                    else _UPDATE_TIMESTAMP_PENDING,
+                ) from exc
+            meta = candidate
+        else:
+            meta = tightened
 
-    if meta.status == ARTIFACT_FINAL and not was_final:
+    if meta.status == ARTIFACT_FINAL and not was_final and not finalized_emitted:
         _emit_webhook(
             request,
             meta,
