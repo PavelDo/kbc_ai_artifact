@@ -5973,25 +5973,46 @@ def export_vault(
     # Only the owner or a proposal's author (authenticated via the standard
     # token headers) gets them included in their download.
     caller = optional_caller(request)
+    limit = settings.export_max_bytes
+
+    # Refuse an oversized artifact *before* rendering, and before the load
+    # itself finishes: the running total is checked after every envelope and
+    # every thread as it comes in from Storage, not once at the end. Summing
+    # a fully materialized (envelopes, threads) list first and estimating
+    # afterwards would let the very allocation this budget exists to bound --
+    # up to HUB_MAX_VERSIONS x HUB_MAX_ENVELOPE_BYTES of parsed envelopes --
+    # happen before the budget is ever consulted (REL-100-002). The moment
+    # the running total crosses the limit, loading stops: later versions are
+    # never fetched, comments are never even listed, and whatever was
+    # accumulated so far is discarded along with the request.
     envelopes: list[Envelope] = []
+    running_total = 0
     for row in store.list_versions(meta.id):
         envelope = store.get_version(meta.id, row["version"])
-        if envelope is not None and may_see(meta, envelope, caller):
-            envelopes.append(envelope)
-    threads = request.app.state.comments.list_for(meta.id)
+        if envelope is None or not may_see(meta, envelope, caller):
+            continue
+        envelopes.append(envelope)
+        running_total += export.envelope_source_chars(envelope)
+        if 0 < limit < running_total:
+            logger.info(
+                "Refusing a vault export of artifact %s: about %d characters "
+                "of source in the versions alone, over the %d limit",
+                meta.id, running_total, limit,
+            )
+            return _export_too_large(running_total, limit)
 
-    # Refuse an oversized artifact *before* rendering: the estimate is a cheap
-    # sum over material already in hand, while the build that follows diffs
-    # and converts all of it (REL-100-002).
-    limit = settings.export_max_bytes
-    estimate = export.vault_source_chars(envelopes, threads)
-    if 0 < limit < estimate:
-        logger.info(
-            "Refusing a vault export of artifact %s: about %d characters "
-            "of source, over the %d limit",
-            meta.id, estimate, limit,
-        )
-        return _export_too_large(estimate, limit)
+    threads = request.app.state.comments.list_for(meta.id)
+    for thread in threads:
+        running_total += export.thread_source_chars(thread)
+        if 0 < limit < running_total:
+            logger.info(
+                "Refusing a vault export of artifact %s: about %d characters "
+                "of source, over the %d limit",
+                meta.id, running_total, limit,
+            )
+            return _export_too_large(running_total, limit)
+
+    estimate = running_total
 
     # Streamed into an owner-only scratch file rather than a BytesIO: the peak
     # memory of an anonymous request must not be the caller's to choose.

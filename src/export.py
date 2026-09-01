@@ -14,9 +14,16 @@ Three renderings live here, all **pure functions of their inputs**:
   owner-only temporary file instead of being held whole in memory. This is
   what ``GET /a/{id}/export/vault`` uses (REL-100-002); both spellings write
   through the same :func:`_write_vault`, so their bytes are identical.
-- :func:`vault_source_chars` — the pre-build size estimate the route budgets
-  against, so an oversized artifact is refused before any of the rendering
-  work happens.
+- :func:`envelope_source_chars` / :func:`thread_source_chars` — the
+  per-envelope and per-thread halves of that estimate, so the route can add
+  them up incrementally *while it loads* each record from Storage and stop
+  reading the moment the running total crosses the budget (REL-100-002) —
+  rather than paying to load and parse the whole visible history first and
+  only then discovering it should have been refused.
+- :func:`vault_source_chars` — the same estimate over a fully materialized
+  ``(envelopes, threads)`` pair, built from the two functions above. Kept for
+  callers (tests, anything computing the estimate post hoc) that already have
+  everything in hand; the export route itself no longer calls it.
 
 Design constraints, in order of importance:
 
@@ -65,6 +72,8 @@ __all__ = [
     "markdown_of_html",
     "build_vault",
     "build_vault_file",
+    "envelope_source_chars",
+    "thread_source_chars",
     "vault_source_chars",
     "ExportTooLarge",
     "SOURCE_ORIGINAL",
@@ -912,14 +921,49 @@ def _add(archive: zipfile.ZipFile, path: str, text: str) -> None:
     archive.writestr(info, text.encode("utf-8"))
 
 
+def envelope_source_chars(env: Envelope) -> int:
+    """How much source material one version envelope contributes to the budget.
+
+    This is the per-record unit :func:`vault_source_chars` used to sum over a
+    whole ``envelopes`` list; split out so the export route can add it to a
+    running total *as each envelope is loaded* from Storage (REL-100-002),
+    rather than loading everything first and estimating afterwards -- which
+    would let the very allocation the budget exists to bound happen before
+    the budget is ever consulted.
+
+    The unit is **characters, not bytes**, deliberately -- see
+    :func:`vault_source_chars` for why.
+    """
+    total = len(env.html or "") + len(env.title or "") + len(env.note or "")
+    source = env.source if isinstance(env.source, dict) else {}
+    markdown = source.get("markdown")
+    if isinstance(markdown, str):
+        total += len(markdown)
+    return total
+
+
+def thread_source_chars(thread: "CommentThread") -> int:
+    """How much source material one comment thread contributes to the budget.
+
+    The comment-side counterpart to :func:`envelope_source_chars`, for the
+    same incremental-loading reason (REL-100-002).
+    """
+    total = len(getattr(thread, "body", "") or "")
+    selector = getattr(thread, "selector", None)
+    total += len(getattr(selector, "exact", "") or "")
+    for reply in list(getattr(thread, "replies", None) or []):
+        total += len(getattr(reply, "body", "") or "")
+    return total
+
+
 def vault_source_chars(
     envelopes: list[Envelope], threads: list["CommentThread"]
 ) -> int:
     """How much source material a vault of these inputs would chew through.
 
     Counted *before* anything is rendered, so the caller can refuse an
-    oversized export without paying for it (REL-100-002): a vault runs a
-    ``difflib`` comparison per version and an HTML-to-Markdown conversion per
+    oversized export without paying for it: a vault runs a ``difflib``
+    comparison per version and an HTML-to-Markdown conversion per
     HTML-authored one, and every one of those is superlinear in nothing but
     this number.
 
@@ -928,20 +972,17 @@ def vault_source_chars(
     own -- encoding tens of megabytes of HTML purely to measure it would cost
     as much as the work being guarded against. One character is at least one
     UTF-8 byte, so a byte budget compared against this is never over-strict.
+
+    This is a convenience wrapper over :func:`envelope_source_chars` and
+    :func:`thread_source_chars` for callers that already hold the full lists
+    in memory (tests, mainly). The export route does **not** call this: it
+    needs the estimate *while* loading each record, one at a time, so it can
+    stop reading Storage the instant the running total crosses the limit
+    (REL-100-002) -- summing this function requires everything to already be
+    loaded, which is exactly the allocation the budget is meant to prevent.
     """
-    total = 0
-    for env in envelopes or []:
-        total += len(env.html or "") + len(env.title or "") + len(env.note or "")
-        source = env.source if isinstance(env.source, dict) else {}
-        markdown = source.get("markdown")
-        if isinstance(markdown, str):
-            total += len(markdown)
-    for thread in threads or []:
-        total += len(getattr(thread, "body", "") or "")
-        selector = getattr(thread, "selector", None)
-        total += len(getattr(selector, "exact", "") or "")
-        for reply in list(getattr(thread, "replies", None) or []):
-            total += len(getattr(reply, "body", "") or "")
+    total = sum(envelope_source_chars(env) for env in envelopes or [])
+    total += sum(thread_source_chars(thread) for thread in threads or [])
     return total
 
 

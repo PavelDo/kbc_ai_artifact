@@ -33,7 +33,7 @@ import pytest
 
 import src.main as main
 from src.comments import CommentStore
-from src.export import ExportTooLarge, build_vault, build_vault_file
+from src.export import ExportTooLarge, build_vault, build_vault_file, envelope_source_chars
 from src.store import ArtifactStore
 from tests.test_api import (
     AUTH_HEADERS,
@@ -191,6 +191,113 @@ def test_export_is_documented_in_openapi(api: Api) -> None:
         assert response["description"].strip()
     assert "HUB_EXPORT_MAX_BYTES" in operation["description"]
     assert "HUB_MAX_EXPORTS_PER_HOUR" in operation["description"]
+
+
+def test_export_budget_stops_loading_versions_once_it_is_exceeded(
+    api: Api, monkeypatch
+) -> None:
+    """The budget is checked incrementally while loading, not after the fact.
+
+    Regression for a wrong fix of REL-100-002: computing the size estimate
+    only after every visible version has already been downloaded and parsed
+    lets the allocation the budget exists to bound (up to
+    ``HUB_MAX_VERSIONS x HUB_MAX_ENVELOPE_BYTES``) happen before the budget is
+    ever consulted. Instead, ``get_version`` must be called one version at a
+    time, with the running total checked after each call, so that once the
+    first two versions alone already exceed the budget, the third, fourth and
+    fifth are never fetched from Storage at all.
+    """
+    artifact_id = _publish_markdown(
+        api, "# Big\n\nfirst\n", title="Big", accept_versions=True
+    )
+    for i in range(4):
+        assert (
+            _submit_version(api, artifact_id, f"# Big\n\nversion {i}\n").status_code
+            == 201
+        )
+    store = main.app.state.store
+    rows = store.list_versions(artifact_id)
+    assert len(rows) == 5
+
+    # Work out, from the real envelopes, a budget the first two versions
+    # already cross but the first alone does not -- so the incremental check
+    # must load exactly two versions before refusing, not zero and not five.
+    running = 0
+    running_after: list[int] = []
+    for row in rows:
+        env = store.get_version(artifact_id, row["version"])
+        running += envelope_source_chars(env)
+        running_after.append(running)
+    limit = running_after[0]
+    assert running_after[1] > limit, "second version must push the total over the limit"
+    _retune(api, monkeypatch, export_max_bytes=limit)
+
+    calls: list[int] = []
+    original_get_version = store.get_version
+
+    def counting_get_version(artifact_id_, version, fresh=False):
+        calls.append(version)
+        return original_get_version(artifact_id_, version, fresh=fresh)
+
+    monkeypatch.setattr(store, "get_version", counting_get_version)
+
+    thread_calls: list[str] = []
+    original_list_for = main.app.state.comments.list_for
+
+    def counting_list_for(artifact_id_):
+        thread_calls.append(artifact_id_)
+        return original_list_for(artifact_id_)
+
+    monkeypatch.setattr(main.app.state.comments, "list_for", counting_list_for)
+
+    resp = api.client.get(f"/a/{artifact_id}/export/vault")
+    assert resp.status_code == 413, resp.text
+
+    # Only two of the five versions should ever have been fetched.
+    assert len(calls) == 2, f"loaded {len(calls)} versions, expected exactly 2"
+    # And comments should never have been listed at all: the versions alone
+    # already tripped the budget.
+    assert thread_calls == []
+
+
+def test_export_within_budget_loads_every_version_and_matches_bytes(
+    api: Api, monkeypatch
+) -> None:
+    """The happy path is unaffected: everything is loaded, ZIP is unchanged.
+
+    Companion to the "stop early" regression above -- the incremental budget
+    check must not skip anything when the artifact is within budget.
+    """
+    artifact_id = _seed_artifact(api)
+    store = main.app.state.store
+    expected_versions = {row["version"] for row in store.list_versions(artifact_id)}
+
+    calls: list[int] = []
+    original_get_version = store.get_version
+
+    def counting_get_version(artifact_id_, version, fresh=False):
+        calls.append(version)
+        return original_get_version(artifact_id_, version, fresh=fresh)
+
+    monkeypatch.setattr(store, "get_version", counting_get_version)
+
+    resp = api.client.get(f"/a/{artifact_id}/export/vault")
+    assert resp.status_code == 200, resp.text
+    assert set(calls) == expected_versions
+
+    meta = store.get_meta(artifact_id)
+    envelopes = [
+        env
+        for env in (
+            store.get_version(artifact_id, row["version"])
+            for row in store.list_versions(artifact_id)
+        )
+        if env is not None and main.may_see(meta, env, None)
+    ]
+    threads = main.app.state.comments.list_for(artifact_id)
+    name, expected = build_vault(meta, envelopes, threads)
+    assert resp.headers["content-disposition"] == f'attachment; filename="{name}"'
+    assert resp.content == expected
 
 
 # --------------------------------------------------------------------------
