@@ -27,15 +27,18 @@ version (ninth item).**
   come from somewhere else.** The hourly budget on failed password and
   invitation attempts was counted per client address, and the address was
   taken from a header the caller writes, so changing one line of the request
-  bought a fresh budget. That header now counts only when the connection came
-  from a proxy network you named (`HUB_TRUSTED_PROXY_CIDRS`); otherwise the
-  real connection address is used, which nobody can choose. A second budget
-  per document across all addresses (`HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR`)
-  backs it up. **If you run behind the Keboola proxy, set
-  `HUB_TRUSTED_PROXY_CIDRS` to the proxy's network.** Without it every reader
-  shares one budget per document, which is safe but means one person
-  guessing can push other readers into "too many attempts" for the rest of
-  the hour.
+  bought a fresh budget. Forwarded addresses now count only when the
+  connection came from a proxy network you named (`HUB_TRUSTED_PROXY_CIDRS`),
+  the `X-Forwarded-For` chain is read from the right, skipping every trusted
+  hop, every value has to parse as an IP address and is stored in canonical
+  form, and at most `HUB_MAX_FORWARDED_CHAIN_ENTRIES` (16) entries are
+  examined. Otherwise the real connection address is used, which nobody can
+  choose. A second budget per document across all addresses
+  (`HUB_MAX_UNLOCK_ATTEMPTS_PER_ARTIFACT_PER_HOUR`) backs it up. **If you run
+  behind the Keboola proxy, set `HUB_TRUSTED_PROXY_CIDRS` to the network of
+  every proxy hop in front of the hub.** Without it every reader shares one
+  budget per document, which is safe but means one person guessing can push
+  other readers into "too many attempts" for the rest of the hour.
 - **An oversized request is now refused before it is read.** A large body
   sent to a comment, invitation or unlock endpoint used to be received and
   parsed in full before anyone checked whether the document even existed.
