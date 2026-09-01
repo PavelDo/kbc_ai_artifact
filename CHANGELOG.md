@@ -4,7 +4,45 @@ KBC Artifact Hub is one web address where you publish a document and
 collaborate on it with your team, secured by the Keboola account you already
 have.
 
-## 0.5.0 — Changelog and clearer guidance (2026-09-01, this release)
+## 0.7.0 — Control, guests, and push notifications (2026-09-01)
+
+- **Revoke a shared link in one click.** Mint a new link for a document and
+  the old one stops working immediately, for everyone — the way to take back
+  access after a link went somewhere it shouldn't have.
+- **Deleted documents go to a recycle bin first.** Deleting a document no
+  longer erases it on the spot: it moves to the trash, where it stays fully
+  recoverable — bring it back, exactly as it was, on the same link, whenever
+  you like. A separate, clearly-labeled "erase forever" action is there for
+  when you really do mean permanent.
+- **Get a Slack message the moment a colleague proposes a change or
+  comments.** Connect a document to a Slack channel (or your own system) and
+  stop refreshing the page to see what happened — a notification arrives the
+  instant a version is proposed or promoted, a comment or reply lands, or the
+  document is finalized, trashed, restored, or its link is rotated.
+- **Invite reviewers by name — no Keboola account needed.** Send a private
+  link to a colleague, client, or outside reviewer and they can comment right
+  away, without signing up for anything. Revoke any one person's access at
+  any time without touching anybody else's.
+- **See whether your document is actually being read.** Every document now
+  reports how many times it's been opened, broken down by day and by how
+  people viewed it — the rendered page, the raw file, or a specific version.
+- **Compare two versions the way a reader actually sees them.** A new
+  side-by-side view renders both versions as real pages, scrolling in sync —
+  ideal for reports and dashboards where the visual result matters as much as
+  the text.
+- **A proposed change now tells you when it's out of date.** If a colleague
+  suggests a change and somebody else's edit lands first, the suggestion is
+  now flagged so you know to take a fresh look before approving it.
+
+## 0.6.0 — Security hardening
+
+- An independent security review examined every part of the service; all
+  forty findings it raised have been fixed.
+- Documents now render inside an isolated sandbox, so a shared document can
+  never reach the part of the page that holds your Keboola sign-in — even a
+  document designed to try.
+
+## 0.5.0 — Changelog and clearer guidance (2026-09-01)
 
 - This page. A plain-English summary of what changed, so you don't have to
   read engineering release notes to know what's new.

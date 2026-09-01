@@ -135,6 +135,31 @@ this section is the sequence, not the reference.
    between two runs — the fastest way for an agent to summarize what a given
    run changed.
 
+### 4. Notify a Slack channel on every proposal (project brain, continued)
+
+1. After step 1 of the project-brain walkthrough above, register a webhook so
+   the owner does not have to keep polling `/a/{id}/versions` and
+   `/a/{id}/comments`: `PUT /api/artifacts/{id}` with
+   `{"webhooks": ["https://hooks.slack.com/services/…"]}` (see *Webhooks*
+   below). From then on, every proposal, promotion, comment, reply,
+   finalization, trash/restore and link rotation posts a one-line Slack
+   message with the artifact's title, the acting project, and its URL.
+2. **Always send `base_version`** on every `POST /api/artifacts/{id}/versions`
+   call — the version number you built your change against (from the
+   `head_version` you last read via `GET /a/{id}/meta` or `/versions`). This
+   is what lets `GET /a/{id}/versions` flag your proposal `"outdated": true`
+   if somebody else's change landed first, so the owner does not review a
+   proposal that silently conflicts with something newer. Omitting it is
+   valid but throws away this safety net — do it only when you truly did not
+   start from a specific version.
+3. To bring in a reviewer who has no Keboola account at all — a client
+   stakeholder, an external auditor — invite them by name instead of asking
+   them to get a Storage token: `POST /api/artifacts/{id}/invitations` with
+   `{"name": "Jana (legal)"}` returns a one-time `review_url`. Hand that link
+   directly to the person it names (chat, email); opening it lets them
+   comment on `/a/{id}/review` with no sign-in step. See *Guest invitations*
+   below for what they can and cannot do, and how to revoke access later.
+
 ## Publishing
 
 Use `$HUB` for the base URL and `$KBC_TOKEN` for your Storage token in the
@@ -252,7 +277,7 @@ Keboola projects submit versions of your artifact. Their submissions always
 land as moderated proposals that only you can promote — see *Versioning*
 below. The default is `false`: only the owning project may add versions.
 
-### Update and delete
+### Update, trash, restore, and permanently erase
 
 ```bash
 # Update (must use a token from the owning project)
@@ -262,21 +287,48 @@ curl -s -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx" \
   -H "Content-Type: application/json" \
   -d '{"markdown": "# Updated title\n\nNew content."}'
 
-# Delete
+# Move to the trash — soft delete, reversible
 curl -s -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx" \
   -H "X-StorageApi-Token: $KBC_TOKEN" \
   -H "X-Storage-Stack: eu"
 
-# List your own project's artifacts
+# Bring it back, on the same share id
+curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/restore" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu"
+
+# Erase it for good — no undo
+curl -s -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/purge" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu"
+
+# List your own project's artifacts (trashed ones included, status "trashed")
 curl -s "$HUB/api/artifacts" \
   -H "X-StorageApi-Token: $KBC_TOKEN" \
   -H "X-Storage-Stack: eu"
 ```
 
-`PUT` and `DELETE` both require a token from the project that originally
-published the artifact. A `PUT` that carries content adds a **new version**;
-nothing is ever overwritten. A `title` lives on a version, so it can only be
-changed together with new content (422 otherwise).
+`PUT` and both `DELETE` routes require a token from the project that
+originally published the artifact. A `PUT` that carries content adds a **new
+version**; nothing is ever overwritten. A `title` lives on a version, so it
+can only be changed together with new content (422 otherwise).
+
+**`DELETE /api/artifacts/{id}` is a *soft* delete.** Nothing is removed from
+Storage: the artifact's `status` becomes `"trashed"`, its public link stops
+resolving (every `/a/{id}` route answers 404, exactly as if it never existed),
+and it is frozen — new versions and comments answer 409. It keeps appearing in
+`GET /api/artifacts` with `status: "trashed"` and a `trashed_at` timestamp, so
+its owner still sees it there. `POST /api/artifacts/{id}/restore` undoes it:
+the artifact returns to the status it was trashed from (`draft` or `final`),
+on the *same* share id, and unfreezes. Restoring something that is not in the
+trash is a 409 — there is nothing to undo.
+
+**`DELETE /api/artifacts/{id}/purge` is permanent.** It erases every version,
+every comment thread, the meta record, and the artifact's view statistics and
+rate-limit counters — no undo, and no trash to fall back on. An artifact does
+not have to be trashed first, but the gentler two-step path (trash, confirm,
+then purge) is the one to default to. Either route leaves the canonical copies
+in the authors' own Keboola projects untouched.
 
 ### Project-brain settings (`PUT /api/artifacts/{id}`)
 
@@ -308,6 +360,49 @@ comments — there is no separate list per capability. Setting `status` to
 `"final"` is the signal an agent should treat as "stop proposing changes, the
 document is settled" — see *Collaborative review workflow* in the
 `artifact-hub` agent for the full loop.
+
+### Rotate the public link (revoke a shared URL)
+
+```bash
+curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/rotate-link" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu"
+```
+
+Owner-only. Mints a fresh share id and returns every public URL rebuilt from
+it. **The old link stops working immediately** — anyone still holding
+`/a/{old_share_id}` (or the bare internal artifact id, which only ever
+resolved publicly while it equaled the share id) gets a 404 from the next
+request on. This is the whole point: a capability URL sent to the wrong
+person, or leaked into a channel that should not have had it, can be taken
+back. There is no grace period and no way to un-rotate, so reshare the new
+`url` with everyone who should still have access before rotating, not after.
+Unlock cookies handed out under the old link go with it, so readers of a
+password-protected artifact unlock once more. The internal artifact id,
+content, version history and comment threads are unchanged — this rotates the
+address, not the artifact.
+
+The response's `share_id` (not the internal `id`) is what every `/a/{...}`
+URL in every response is built from, from the very first publish onward — so
+code that stores "the artifact's URL" should always re-derive it from the
+latest response rather than hand-assembling `/a/{id}`.
+
+### View statistics (owner only)
+
+```bash
+curl -s "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/stats" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu"
+```
+
+Reports how often the artifact was read: `total` across all recorded history,
+`by_kind` (`page` for the rendered wrapper, `raw`, `source`, `version`), and
+`by_day` for the most recent 30 UTC days, oldest first so it charts as-is. An
+artifact nobody has read yet reports zeros, not a 404. These are traffic
+figures, not an audit log — no reader identity, address or referrer is ever
+recorded. Counts come from an in-process sidecar that snapshots into Storage
+periodically: a crash can lose the last few minutes, and `.../purge` forgets
+an artifact's numbers entirely.
 
 ## Versioning
 
@@ -342,23 +437,36 @@ curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/versions" \
   -H "Content-Type: application/json" \
   -d '{
     "markdown": "# Q3 review\n\nCorrected the revenue table.",
-    "note": "fix Q3 totals"
+    "note": "fix Q3 totals",
+    "base_version": 3
   }'
 ```
 
 The body takes the same content fields as publishing (exactly one of `html`,
-`markdown`, `git_url`, plus the `git_*` extras), an optional `title`, and an
-optional `note` describing what changed (max 500 characters). The response is:
+`markdown`, `git_url`, plus the `git_*` extras), an optional `title`, an
+optional `note` describing what changed (max 500 characters), and
+**`base_version`**. The response is:
 
 ```json
 {
   "id": "aBcD3fGhIjKlMnOpQrStUvWx",
-  "version": 2,
+  "version": 4,
   "status": "proposed",
   "note": "fix Q3 totals",
-  "url": "https://<hub-host>/a/aBcD3fGhIjKlMnOpQrStUvWx/v/2"
+  "base_version": 3,
+  "url": "https://<hub-host>/a/aBcD3fGhIjKlMnOpQrStUvWx/v/4"
 }
 ```
+
+**Always send `base_version`: the version number you built your change
+against.** Fetch it from `head_version` in `GET /a/{id}/meta` or
+`/a/{id}/versions` right before you write your change, then send that same
+number back here. It must name a version that exists (422 otherwise). This is
+what lets the owner see, in the version history, whether a proposal was
+written against a document that has since moved on — see *List versions*
+below. Skipping it is accepted, but it throws away that safety check for no
+benefit; only omit it when you genuinely did not start from a specific
+version (e.g. a from-scratch rewrite).
 
 ### List versions
 
@@ -368,9 +476,17 @@ curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/versions"
 
 Returns `{"id", "head_version", "accept_versions", "protected", "versions": [...]}`
 newest first; each entry carries `version`, `title`, `status`, `note`,
-`created_at`, `is_head`, `size_bytes`, `source_type`, the author's project, and
-a `url`. Add `?format=html` for a human-readable picker page with links to each
-version and to the diff of every adjacent pair.
+`base_version`, `created_at`, `is_head`, `size_bytes`, `source_type`, the
+author's project, and a `url`. Add `?format=html` for a human-readable picker
+page with links to each version and to the diff of every adjacent pair.
+
+**`outdated`.** Every *proposed* row also carries `"outdated": true` when its
+`base_version` is no longer the head — i.e. the proposal was written without
+seeing the versions published after it. Live rows carry no `outdated` key at
+all. Check this before promoting a proposal: an outdated one may conflict with
+what shipped in the meantime, so re-diff it against the current head before
+acting on it rather than trusting the proposal's own diff against its stale
+base.
 
 ### Read one version
 
@@ -394,11 +510,23 @@ curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2?format=unified"
 
 # JSON: the unified diff plus added/removed line counts
 curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2?format=json"
+
+# Visual: the two rendered documents side by side, scrolling in step
+curl -s "$HUB/a/aBcD3fGhIjKlMnOpQrStUvWx/diff/1..2?format=visual"
 ```
 
 The spec is always `{older}..{newer}`. Markdown is compared when both versions
-carry it, otherwise the built HTML. Formats other than `html`, `unified` and
-`json` are a 400; a side larger than the configured diff limit is a 413.
+carry it, otherwise the built HTML. Formats other than `html`, `unified`,
+`json` and `visual` are a 400; a side larger than the configured diff limit is
+a 413.
+
+**`?format=visual`** renders the two versions themselves side by side — each
+in its own iframe sandboxed without `allow-same-origin` — with the panes'
+scrolling synchronized, for comparing what a reader actually *sees* rather
+than the source that produced it. Useful when a change is mostly visual
+(layout, styling, a chart) and a text diff would not show what changed. The
+size guard applies to each side's rendered HTML for this format, since that is
+what the page has to carry, rather than to the source.
 
 ### Promote a proposal (owner only)
 
@@ -583,6 +711,176 @@ outside the individual API calls it makes on the reviewer's behalf. Point a
 human reviewer at this page instead of asking them to run the comment curl
 commands above by hand.
 
+## Guest invitations
+
+An invitation lets **one named human with no Keboola account at all** comment
+on one artifact — for the reviewer who has no Storage token and never will
+(a client stakeholder, an external auditor, someone outside the org).
+
+### Invite a guest (owner only)
+
+```bash
+curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/invitations" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Jana (legal)"}'
+```
+
+Response:
+
+```json
+{
+  "invitation_id": "…",
+  "name": "Jana (legal)",
+  "review_url": "https://<hub-host>/a/aBcD3fGhIjKlMnOpQrStUvWx/review#invite=<invitation_id>.<secret>",
+  "warning": "This link is shown once and cannot be recovered — the secret is stored hashed. Send it to the person it names; anyone holding it can comment as them until you revoke it."
+}
+```
+
+**The secret is shown exactly once and travels in the URL fragment** (after
+the `#`), which browsers never send to a server — it only ever reaches this
+API in the `X-Artifact-Guest` header. If the link is lost, there is no way to
+recover it: revoke the invitation and mint a new one. Hand `review_url` to the
+named person directly (chat, email); opening it in a browser is all they need
+to do — the review page reads the fragment itself, clears it from the address
+bar, and starts commenting as them, no sign-in step.
+
+### What a guest can and cannot do
+
+A guest may open a comment thread, reply, and resolve or delete threads they
+themselves opened — nothing else. It never grants a version submission, never
+any other `/api/*` management call, and never access to another artifact.
+`comments_mode` does not gate a guest (the invitation *is* the grant, issued
+by the owner that setting belongs to), but a `final` or trashed artifact
+freezes them exactly like everybody else, and they draw on the same daily
+comment budget as any project, counted per invitation rather than per
+Keboola project. Their comments are published as `{"kind": "guest", "name":
+...}` — the invitation id never appears in a public response.
+
+### Comment as a guest (what the review page does under the hood)
+
+```bash
+curl -s -X POST "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/comments" \
+  -H "X-Artifact-Guest: <invitation_id>.<secret>" \
+  -H "Content-Type: application/json" \
+  -d '{"version": 4, "exact": "the Q3 revenue total", "prefix": "...as shown in ", "suffix": " on the summary page...", "body": "This looks off vs. the source table."}'
+```
+
+Every comment-write route (`POST .../comments`, `.../replies`,
+`.../resolve`, `DELETE .../comments/{tid}`) accepts `X-Artifact-Guest` as an
+alternative to the two Storage headers. `GET /a/{id}/guest` resolves a
+credential to a display name (`{"id", "invitation_id", "name"}`) without
+writing anything — use it as a cheap "is this link still good?" probe before
+showing a composer.
+
+### List and revoke (owner only)
+
+```bash
+# List invitations — no secrets, they cannot be recovered
+curl -s "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/invitations" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu"
+
+# Revoke one person's access — everyone else's link keeps working
+curl -s -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/invitations/<invitation_id>" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu"
+```
+
+Revoking is per person and idempotent; comments the guest already wrote stay
+— revoking withdraws the capability, not the contribution. `HUB_MAX_INVITATIONS_PER_ARTIFACT`
+(default 20) live invitations may exist on one artifact at a time (422 past
+that); revoked ones are reclaimed automatically to make room for a new invite.
+
+## Webhooks (push notifications)
+
+Register up to `HUB_MAX_WEBHOOKS_PER_ARTIFACT` (default 5) https URLs on an
+artifact so you learn about activity the moment it happens, instead of
+polling `/versions` and `/comments`.
+
+### Register webhooks
+
+```bash
+curl -s -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" \
+  -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{"webhooks": ["https://hooks.slack.com/services/T000/B000/XXXX", "https://example.com/hooks/artifact-hub"]}'
+```
+
+`webhooks` replaces the whole list; send `[]` to clear it, omit the field to
+leave it unchanged. URLs must be `https` and must not resolve to a private,
+loopback, link-local, reserved or cloud-metadata address (the same SSRF guard
+`git_url` clones get) — a violation is a 422 explaining why. Webhook URLs are
+themselves capabilities (a Slack hook's path is its only credential), so they
+are echoed back **only in this PUT's own response** — `GET /api/artifacts`
+reports a `webhooks_count` instead, never the URLs.
+
+### What gets delivered, and when
+
+| Event | Fires when |
+|---|---|
+| `version.published` | The owner adds a live version (not the initial publish) |
+| `version.proposed` | Another project submits a proposal |
+| `version.promoted` | The owner promotes a proposal to live |
+| `comment.created` | A new thread is opened (by a project or a guest) |
+| `comment.replied` | A reply is posted to an existing thread |
+| `artifact.finalized` | `status` is set to `final` |
+| `artifact.trashed` | `DELETE /api/artifacts/{id}` (soft delete) |
+| `artifact.restored` | `POST /api/artifacts/{id}/restore` |
+| `link.rotated` | `POST /api/artifacts/{id}/rotate-link` |
+
+A `hooks.slack.com` URL receives Slack's `{"text": "..."}` shape, formatted as
+a one-line human summary; every other URL receives the generic envelope:
+
+```json
+{
+  "event": "version.proposed",
+  "artifact_id": "aBcD3fGhIjKlMnOpQrStUvWx",
+  "payload": {"title": "Q3 review", "version": 4, "note": "fix Q3 totals",
+              "base_version": 3, "actor": "Analytics Team",
+              "url": "https://<hub-host>/a/<share_id>"},
+  "created_at": "2026-09-01T09:30:00+00:00"
+}
+```
+
+The payload is deliberately narrow: the internal artifact id, the acting
+project's **name** (or a guest's display name plus " (guest)"), and the
+public `url` built from the current share id — never a token, an owner key, or
+a password record.
+
+### Verify the signature
+
+Every non-Slack delivery carries `X-Hub-Signature-256: sha256=<hex>` — an
+HMAC-SHA256 of the *exact bytes* of the request body, keyed with the hub's own
+`HUB_SECRET_KEY`. Recompute it and compare before trusting a delivery (Slack
+deliveries carry no signature — Slack's own webhook format has no header for
+one, so verify a Slack integration by the URL's own secrecy instead):
+
+```python
+import hashlib
+import hmac
+
+def verify(body: bytes, header_value: str, secret: str) -> bool:
+    expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, header_value)
+```
+
+Compare with `hmac.compare_digest` (or an equivalent constant-time compare in
+your language), never `==` — a naive comparison leaks timing information an
+attacker can use to forge a valid signature byte by byte. Use the *raw request
+body bytes*, not a re-serialized JSON object: any change in key order or
+whitespace changes the HMAC.
+
+### Delivery is best-effort
+
+The delivery queue is in-memory: a hub restart drops whatever was pending. The
+Storage Files record of what happened is the durable part; a webhook is a
+convenience notification on top of it, retried up to `HUB_WEBHOOK_MAX_ATTEMPTS`
+times (default 3) with capped exponential backoff, never blocking the API
+call that triggered it. Do not build a workflow that only learns about a
+change through its webhook — always treat `/versions` and `/comments` as the
+source of truth and the webhook as the "check now" nudge.
+
 ## Export
 
 Two read-only export endpoints turn an artifact's full history into files a
@@ -630,17 +928,30 @@ it.
 |---|---|
 | `GET /a/{id}` | Head version as a human-readable page (or the password unlock form) |
 | `GET /a/{id}/v/{n}` | One specific version (owner/author only when proposed) |
-| `GET /a/{id}/versions` | Version history JSON, or `?format=html` for a picker page |
-| `GET /a/{id}/diff/{a}..{b}` | Diff of two versions (`?format=html\|unified\|json`) |
+| `GET /a/{id}/versions` | Version history JSON (each proposed row flagged `outdated` when applicable), or `?format=html` for a picker page |
+| `GET /a/{id}/diff/{a}..{b}` | Diff of two versions (`?format=html\|unified\|json\|visual`) |
 | `GET /a/{id}/raw` | Exact HTML that will be rendered — no chrome around it |
 | `GET /a/{id}/source` | Original source you submitted (markdown or html) |
 | `GET /a/{id}/meta` | JSON metadata (title, timestamps, head version, version counts, content type, `accept_versions_mode`, `contributors`, `comments_mode`, `status` — no owner details) |
 | `GET /a/{id}/comments` | Every inline comment thread (open and resolved), as JSON |
-| `GET /a/{id}/review` | Browser review UI: select text to comment, sidebar of threads, sandboxed artifact iframe |
+| `GET /a/{id}/guest` | Resolve an `X-Artifact-Guest` credential to its display name, without writing anything |
+| `GET /a/{id}/review` | Browser review UI: select text to comment, sidebar of threads, sandboxed artifact iframe; also the guest entry point via a `#invite=` link |
 | `GET /a/{id}/export/markdown` | Head version's Markdown source (or HTML when there is no Markdown) |
 | `GET /a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault (versions, comments, and a chronological reasoning trail) |
+| `GET /changelog` | Rendered changelog, in the hub's own visual design |
 | `GET /admin` | Browser moderation studio for the artifact owner (token pasted client-side, never stored server-side) |
 | `GET /agent` | This hub's SKILL.md distilled into a ready-to-install Claude Code subagent |
+
+`GET /api/artifacts/{id}/stats` (view counts) and the invitation management
+routes are owner-only and authenticated, not part of this public table — see
+*View statistics* and *Guest invitations* above.
+
+**Note on rendering.** `/a/{id}` and `/a/{id}/v/{n}` serve the artifact inside
+a sandboxed `srcdoc` iframe (opaque origin, no `allow-same-origin`) rather than
+the hub's own origin, so a published document's scripts can never reach the
+Storage token a visitor may have signed into `/admin` or `/review` with.
+Machine clients that want the exact bytes — no wrapper, nothing to unwrap —
+should always use `/a/{id}/raw`.
 
 If the artifact is password-protected, machine clients pass
 `X-Artifact-Password: <password>` on these requests; browsers get an HTML
@@ -676,14 +987,14 @@ mind:
 | Status | Meaning |
 |---|---|
 | 400 | Unknown or disallowed `X-Storage-Stack` value, a malformed diff spec (use `{older}..{newer}`), or an unknown diff `format` |
-| 401 | Storage token rejected by the stack, or wrong artifact password |
-| 403 | Token is valid but not from the owning project (update, delete, promote, head); the artifact does not accept versions from other projects; you asked for a proposal you did not author; or comments are closed (`comments_mode: "off"`) or you are not on the `contributors` allowlist |
-| 404 | Unknown artifact id (identical response whether it never existed or was deleted), or no such version or comment thread |
-| 409 | Promoting a version that is already live; deleting the only live version of an artifact; submitting a version or a comment on an artifact whose `status` is `"final"`; or resolving/reopening a thread already in that state |
-| 413 | Built HTML over the size limit, or a diff side over `HUB_DIFF_MAX_BYTES` |
-| 422 | Build failure — bad git repo, no entry file found, markdown render error, `git_token`/`git_username` sent without `git_url`, a `title` sent without content, or pinning the head to a version that does not exist or is not live |
-| 429 | Your project reached the daily version-submission cap for this artifact, or the daily `HUB_MAX_COMMENTS_PER_DAY` comment cap |
-| 502 | The Keboola stack itself could not be reached to verify the token |
+| 401 | Storage token rejected by the stack, wrong artifact password, or an unknown/revoked/malformed `X-Artifact-Guest` credential (the three guest cases are deliberately indistinguishable) |
+| 403 | Token is valid but not from the owning project (update, trash, restore, purge, rotate-link, stats, invitations, promote, head); the artifact does not accept versions from other projects; you asked for a proposal you did not author; or comments are closed (`comments_mode: "off"`) or you are not on the `contributors` allowlist |
+| 404 | Unknown artifact id (identical response whether it never existed, was purged, or its share id was rotated away), or no such version, comment thread, or invitation |
+| 409 | Promoting a version that is already live; deleting the only live version of an artifact; submitting a version, a comment, or a new invitation on an artifact whose `status` is `"final"` or that is trashed (the detail names which, and the way out — reopen vs. restore); resolving/reopening a thread already in that state; or restoring an artifact that is not in the trash |
+| 413 | Built HTML over the size limit, a diff side over `HUB_DIFF_MAX_BYTES` (for `format=visual`, the rendered HTML of the larger side) |
+| 422 | Build failure — bad git repo, no entry file found, markdown render error, `git_token`/`git_username` sent without `git_url`, a `title` sent without content, pinning the head to a version that does not exist or is not live, a `base_version` naming a version that does not exist, an invalid/blocked webhook URL or too many of them, or an empty/over-long/over-quota invitation name |
+| 429 | Your project reached the daily version-submission cap for this artifact, the daily `HUB_MAX_COMMENTS_PER_DAY` comment/reply cap (per project or per guest invitation), or too many wrong unlock-password attempts from your address this hour |
+| 502 | The Keboola stack itself could not be reached to verify the token, or the hub's own Storage backend is unavailable |
 
 ## Safety notes
 
@@ -703,3 +1014,13 @@ mind:
 - Publishing from a private repository publishes its content to a **public**
   URL. The `git_token` protects the clone, not the artifact; add a `password`
   if the result should not be readable by everyone holding the link.
+- `POST /api/artifacts/{id}/rotate-link` is the way to revoke a leaked or
+  over-shared URL, but it is immediate and permanent: the old link dies for
+  *everyone*, including people who should keep access. Reshare the new URL
+  with them right after rotating.
+- `DELETE /api/artifacts/{id}/purge` has no undo. Prefer the plain `DELETE`
+  (trash) first — it is instantly reversible with `.../restore` — and only
+  purge once you are certain nothing should ever come back.
+- A guest invitation's secret is shown exactly once, in the `review_url`. It
+  cannot be recovered from the hub afterward; losing it means revoking and
+  re-inviting.

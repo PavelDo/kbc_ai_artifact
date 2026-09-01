@@ -12,6 +12,9 @@ from src.store import (
     ACCEPT_OFF,
     ARTIFACT_DRAFT,
     ARTIFACT_FINAL,
+    ARTIFACT_SETTABLE_STATUSES,
+    ARTIFACT_STATUSES,
+    ARTIFACT_TRASHED,
     COMMENTS_ALLOWLIST,
     COMMENTS_ANYONE,
     COMMENTS_OFF,
@@ -733,6 +736,7 @@ class TestListOwner:
         assert [row["id"] for row in rows] == ["a2", "a1"]
         assert rows[0] == {
             "id": "a2",
+            "share_id": "a2",
             "title": "second",
             "created_at": "2026-01-01T00:00:00+00:00",
             "updated_at": "2026-01-03T00:00:00+00:00",
@@ -740,6 +744,7 @@ class TestListOwner:
             "accept_versions_mode": ACCEPT_ANYONE,
             "comments_mode": COMMENTS_ANYONE,
             "status": ARTIFACT_DRAFT,
+            "trashed_at": "",
             "protected": True,
             "head_version": 1,
             "versions_count": 2,
@@ -1302,3 +1307,609 @@ class TestProposalCap:
             store.add_version(_make_envelope(version=n, status=STATUS_PROPOSED))
         rows = {row["version"]: row["status"] for row in store.list_versions("abc123")}
         assert 2 in rows  # the pinned proposal was spared
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — link rotation (share ids)
+# --------------------------------------------------------------------------
+
+
+class _CountingBackend(InMemoryFilesBackend):
+    """Counts the backend round trips a lookup actually costs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.searches = 0
+        self.downloads = 0
+
+    def search_by_tag(self, tag: str):
+        self.searches += 1
+        return super().search_by_tag(tag)
+
+    def download(self, file_id: int):
+        self.downloads += 1
+        return super().download(file_id)
+
+
+class TestShareIdSerialization:
+    def test_share_id_defaults_to_the_artifact_id(self):
+        assert _make_meta().share_id == "abc123"
+        assert ArtifactMeta(id="x").share_id == "x"
+
+    def test_an_explicitly_empty_share_id_is_normalized(self):
+        assert _make_meta(share_id="").share_id == "abc123"
+
+    def test_from_json_fills_a_missing_share_id_with_the_id(self):
+        # Every meta file written before 0.7.0 looks like this; its public URL
+        # was the artifact id, so that is the share id it must keep.
+        raw = json.dumps({"id": "old1", "owner": _identity()}).encode("utf-8")
+        assert ArtifactMeta.from_json(raw).share_id == "old1"
+
+    def test_from_json_fills_an_empty_or_bogus_share_id_with_the_id(self):
+        for value in ("", None, 7, []):
+            raw = json.dumps({"id": "old1", "share_id": value}).encode("utf-8")
+            assert ArtifactMeta.from_json(raw).share_id == "old1"
+
+    def test_from_json_keeps_a_rotated_share_id(self):
+        raw = json.dumps({"id": "old1", "share_id": "rotated"}).encode("utf-8")
+        assert ArtifactMeta.from_json(raw).share_id == "rotated"
+
+    def test_to_json_always_writes_the_share_id(self):
+        assert json.loads(_make_meta().to_json())["share_id"] == "abc123"
+        payload = json.loads(_make_meta(share_id="rotated").to_json())
+        assert payload["share_id"] == "rotated"
+
+    def test_round_trip_with_a_rotated_share_id(self):
+        meta = _make_meta(share_id="rotated")
+        assert ArtifactMeta.from_json(meta.to_json()) == meta
+
+
+class TestResolveShare:
+    def test_a_fresh_artifact_resolves_by_its_own_id(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope())
+        assert tmp_store.resolve_share("abc123") == "abc123"
+
+    def test_unknown_identifiers_never_resolve(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope())
+        assert tmp_store.resolve_share("nope") is None
+        assert tmp_store.resolve_share("") is None
+
+    def test_rotation_revokes_the_old_link_and_the_bare_artifact_id(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope())
+        assert tmp_store.resolve_share("abc123") == "abc123"
+
+        new_share = tmp_store.rotate_share("abc123", generate=lambda: "SHARE2")
+        assert new_share == "SHARE2"
+        assert tmp_store.resolve_share("SHARE2") == "abc123"
+        # The whole point of rotating: the link handed out before is dead, and
+        # so is the internal id as a *public* handle.
+        assert tmp_store.resolve_share("abc123") is None
+
+    def test_the_internal_id_still_addresses_the_artifact_for_owner_reads(
+        self, tmp_store
+    ):
+        tmp_store.create(_make_meta(), _make_envelope())
+        tmp_store.rotate_share("abc123", generate=lambda: "SHARE2")
+        # /api/* keeps resolving by artifact id — only the public path changes.
+        assert tmp_store.get_head("abc123") is not None
+        assert tmp_store.get_meta("abc123").share_id == "SHARE2"
+        assert tmp_store.owner_key_of("abc123") == OWNER_A
+
+    def test_double_rotation_leaves_only_the_newest_link_alive(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope())
+        tmp_store.rotate_share("abc123", generate=lambda: "SHARE2")
+        tmp_store.rotate_share("abc123", generate=lambda: "SHARE3")
+
+        assert tmp_store.resolve_share("SHARE3") == "abc123"
+        assert tmp_store.resolve_share("SHARE2") is None
+        assert tmp_store.resolve_share("abc123") is None
+
+    def test_rotation_survives_a_cold_hydrate(self, backend, tmp_path):
+        writer = _store_with_limit(backend, tmp_path / "w", 50)
+        writer.create(_make_meta(), _make_envelope())
+        writer.create(_make_meta(artifact_id="other"), _make_envelope("other"))
+        writer.rotate_share("abc123", generate=lambda: "SHARE2")
+
+        # A different replica with an empty share cache: hydrate indexes the
+        # meta files by tag only, so the share id must be found by loading them.
+        reader = _store_with_limit(backend, tmp_path / "r", 50)
+        assert reader.hydrate() == 2
+        assert reader.resolve_share("SHARE2") == "abc123"
+        assert reader.resolve_share("abc123") is None
+        assert reader.resolve_share("other") == "other"
+
+    def test_cold_store_resolves_the_bare_id_first_without_a_scan(
+        self, backend, tmp_path
+    ):
+        # Same as above but asking for the revoked artifact id *before* anything
+        # taught the store the new share id.
+        writer = _store_with_limit(backend, tmp_path / "w", 50)
+        writer.create(_make_meta(), _make_envelope())
+        writer.rotate_share("abc123", generate=lambda: "SHARE2")
+
+        reader = _store_with_limit(backend, tmp_path / "r", 50)
+        reader.hydrate()
+        assert reader.resolve_share("abc123") is None
+        assert reader.resolve_share("SHARE2") == "abc123"
+
+    def test_a_never_seen_artifact_resolves_through_storage(self, backend, tmp_path):
+        writer = _store_with_limit(backend, tmp_path / "w", 50)
+        writer.create(_make_meta(), _make_envelope())
+        # No hydrate(): the index miss must fall back to a tag search.
+        reader = _store_with_limit(backend, tmp_path / "r", 50)
+        assert reader.resolve_share("abc123") == "abc123"
+
+    def test_a_legacy_schema1_artifact_keeps_its_link(self, backend, tmp_path):
+        _seed_legacy(backend)
+        store = _store_with_limit(backend, tmp_path, 50)
+        store.hydrate()
+        # Its synthesized meta has no share_id of its own, so the artifact id
+        # stays the public identifier.
+        assert store.resolve_share("legacy1") == "legacy1"
+
+    def test_a_trashed_link_answers_from_the_share_cache(self, tmp_path):
+        backend = _CountingBackend()
+        store = _store_with_limit(backend, tmp_path, 50)
+        store.create(_make_meta(), _make_envelope())
+        store.rotate_share("abc123", generate=lambda: "SHARE2")
+        store.trash("abc123", "2026-02-02T00:00:00+00:00")
+        assert store.resolve_share("SHARE2") is None
+
+        before = (backend.searches, backend.downloads)
+        for _ in range(5):
+            assert store.resolve_share("SHARE2") is None
+        # A dead link must not cost a Storage round trip on every hit.
+        assert (backend.searches, backend.downloads) == before
+
+    def test_learned_share_ids_are_cached(self, tmp_path):
+        backend = _CountingBackend()
+        store = _store_with_limit(backend, tmp_path, 50)
+        store.create(_make_meta(), _make_envelope())
+        store.rotate_share("abc123", generate=lambda: "SHARE2")
+        assert store.resolve_share("SHARE2") == "abc123"
+
+        before = (backend.searches, backend.downloads)
+        for _ in range(5):
+            assert store.resolve_share("SHARE2") == "abc123"
+        # A warm share index answers from memory: no Storage round trips.
+        assert (backend.searches, backend.downloads) == before
+
+    def test_refresh_picks_up_a_rotation_from_another_replica(self, backend, tmp_path):
+        writer = _store_with_limit(backend, tmp_path / "w", 50)
+        reader = _store_with_limit(backend, tmp_path / "r", 50)
+        writer.create(_make_meta(), _make_envelope())
+        reader.hydrate()
+        assert reader.resolve_share("abc123") == "abc123"
+
+        writer.rotate_share("abc123", generate=lambda: "SHARE2")
+        assert reader.refresh("abc123") is True
+        assert reader.resolve_share("abc123") is None
+        assert reader.resolve_share("SHARE2") == "abc123"
+
+    def test_delete_stops_the_share_id_from_resolving(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope())
+        tmp_store.rotate_share("abc123", generate=lambda: "SHARE2")
+        assert tmp_store.delete("abc123") is True
+        assert tmp_store.resolve_share("SHARE2") is None
+        assert tmp_store.resolve_share("abc123") is None
+
+
+class TestRotateShare:
+    def test_unknown_artifact_returns_none(self, tmp_store):
+        assert tmp_store.rotate_share("nope") is None
+
+    def test_default_generator_mints_an_unguessable_id(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope())
+        new_share = tmp_store.rotate_share("abc123")
+        assert isinstance(new_share, str) and len(new_share) >= 20
+        assert new_share != "abc123"
+        assert tmp_store.resolve_share(new_share) == "abc123"
+
+    def test_the_new_share_id_is_persisted(self, backend, tmp_path):
+        store = _store_with_limit(backend, tmp_path, 50)
+        store.create(_make_meta(), _make_envelope())
+        store.rotate_share("abc123", generate=lambda: "SHARE2")
+
+        metas = [
+            raw
+            for info, raw in backend.files.values()
+            if TAG_META in info.tags and tag_for_id("abc123") in info.tags
+        ]
+        assert len(metas) == 1
+        assert json.loads(metas[0])["share_id"] == "SHARE2"
+
+    def test_rotation_can_stamp_updated_at(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope())
+        tmp_store.rotate_share(
+            "abc123", generate=lambda: "SHARE2", when_iso="2026-05-05T00:00:00+00:00"
+        )
+        assert tmp_store.get_meta("abc123").updated_at == "2026-05-05T00:00:00+00:00"
+
+    def test_rotation_keeps_content_and_policy_untouched(self, tmp_store):
+        tmp_store.create(
+            _make_meta(accept_versions_mode=ACCEPT_ALLOWLIST, contributors=[OWNER_B]),
+            _make_envelope(),
+        )
+        tmp_store.add_version(_make_envelope(version=2, title="second"))
+        tmp_store.rotate_share("abc123", generate=lambda: "SHARE2")
+
+        meta = tmp_store.get_meta("abc123")
+        assert meta.accept_versions_mode == ACCEPT_ALLOWLIST
+        assert meta.contributors == [OWNER_B]
+        head = tmp_store.get_head("abc123")
+        assert head is not None and head.version == 2 and head.title == "second"
+
+    def test_an_empty_generated_id_is_refused(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope())
+        with pytest.raises(ValueError):
+            tmp_store.rotate_share("abc123", generate=lambda: "")
+        # The old link is untouched by the failed rotation.
+        assert tmp_store.resolve_share("abc123") == "abc123"
+
+    def test_the_owner_listing_reports_the_share_id(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope())
+        tmp_store.rotate_share("abc123", generate=lambda: "SHARE2")
+        row = tmp_store.list_owner(OWNER_A)[0]
+        assert row["id"] == "abc123"
+        assert row["share_id"] == "SHARE2"
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — trash (soft delete)
+# --------------------------------------------------------------------------
+
+
+class TestTrashMeta:
+    def test_trashed_is_a_known_but_unsettable_status(self):
+        assert ARTIFACT_TRASHED in ARTIFACT_STATUSES
+        assert ARTIFACT_TRASHED not in ARTIFACT_SETTABLE_STATUSES
+        assert ARTIFACT_SETTABLE_STATUSES == (ARTIFACT_DRAFT, ARTIFACT_FINAL)
+
+    def test_is_trashed(self):
+        assert _make_meta(status=ARTIFACT_TRASHED).is_trashed() is True
+        assert _make_meta().is_trashed() is False
+        assert _make_meta(status=ARTIFACT_FINAL).is_trashed() is False
+        # "trashed" is its own state, not a flavour of "final".
+        assert _make_meta(status=ARTIFACT_TRASHED).is_final() is False
+
+    def test_trashed_freezes_versions_and_comments_for_everyone(self):
+        meta = _make_meta(
+            status=ARTIFACT_TRASHED,
+            accept_versions_mode=ACCEPT_ANYONE,
+            comments_mode=COMMENTS_ANYONE,
+            contributors=[OWNER_B],
+        )
+        for key in (OWNER_A, OWNER_B, "", "9@connection.keboola.com"):
+            assert meta.allows_versions_from(key) is False
+            assert meta.allows_comments_from(key) is False
+
+    def test_trash_fields_round_trip(self):
+        meta = _make_meta(
+            status=ARTIFACT_TRASHED,
+            trashed_at="2026-02-02T00:00:00+00:00",
+            restore_status=ARTIFACT_FINAL,
+        )
+        restored = ArtifactMeta.from_json(meta.to_json())
+        assert restored == meta
+        assert restored.trashed_at == "2026-02-02T00:00:00+00:00"
+        assert restored.restore_status == ARTIFACT_FINAL
+
+    def test_defaults_for_a_pre_070_meta_file(self):
+        raw = json.dumps({"id": "x", "status": ARTIFACT_FINAL}).encode("utf-8")
+        meta = ArtifactMeta.from_json(raw)
+        assert meta.is_trashed() is False
+        assert meta.trashed_at == ""
+        assert meta.restore_status == ARTIFACT_DRAFT
+
+    def test_restore_status_can_never_be_trashed(self):
+        raw = json.dumps(
+            {"id": "x", "restore_status": ARTIFACT_TRASHED}
+        ).encode("utf-8")
+        assert ArtifactMeta.from_json(raw).restore_status == ARTIFACT_DRAFT
+        assert _make_meta(restore_status="sideways").restore_status == ARTIFACT_DRAFT
+
+    def test_trashed_at_is_cleared_for_a_non_trashed_status(self):
+        meta = _make_meta(status=ARTIFACT_DRAFT, trashed_at="2026-02-02T00:00:00+00:00")
+        assert meta.trashed_at == ""
+
+
+class TestTrashStore:
+    def test_trash_kills_the_public_link_but_keeps_the_files(self, tmp_store, backend):
+        tmp_store.create(_make_meta(), _make_envelope())
+        assert tmp_store.resolve_share("abc123") == "abc123"
+
+        assert tmp_store.trash("abc123", "2026-02-02T00:00:00+00:00") is True
+        assert tmp_store.resolve_share("abc123") is None
+        # Soft delete: nothing left Storage, and the owner can still read it.
+        assert tmp_store.get_head("abc123") is not None
+        assert [
+            info for info, _ in backend.files.values() if tag_for_id("abc123") in info.tags
+        ]
+
+    def test_trash_records_when_and_what_to_come_back_to(self, tmp_store):
+        tmp_store.create(_make_meta(status=ARTIFACT_FINAL), _make_envelope())
+        assert tmp_store.trash("abc123", "2026-02-02T00:00:00+00:00") is True
+
+        meta = tmp_store.get_meta("abc123")
+        assert meta.status == ARTIFACT_TRASHED
+        assert meta.trashed_at == "2026-02-02T00:00:00+00:00"
+        assert meta.restore_status == ARTIFACT_FINAL
+        assert meta.updated_at == "2026-02-02T00:00:00+00:00"
+
+    def test_restore_brings_back_the_previous_status_and_the_link(self, tmp_store):
+        tmp_store.create(_make_meta(status=ARTIFACT_FINAL), _make_envelope())
+        tmp_store.trash("abc123", "2026-02-02T00:00:00+00:00")
+
+        assert tmp_store.restore("abc123") is True
+        meta = tmp_store.get_meta("abc123")
+        assert meta.status == ARTIFACT_FINAL
+        assert meta.trashed_at == ""
+        assert tmp_store.resolve_share("abc123") == "abc123"
+
+    def test_restore_of_a_draft_stays_a_draft(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope())
+        tmp_store.trash("abc123", "2026-02-02T00:00:00+00:00")
+        assert tmp_store.restore("abc123", when_iso="2026-02-03T00:00:00+00:00") is True
+        meta = tmp_store.get_meta("abc123")
+        assert meta.status == ARTIFACT_DRAFT
+        assert meta.updated_at == "2026-02-03T00:00:00+00:00"
+
+    def test_trashing_twice_does_not_lose_the_restore_status(self, tmp_store):
+        tmp_store.create(_make_meta(status=ARTIFACT_FINAL), _make_envelope())
+        assert tmp_store.trash("abc123", "2026-02-02T00:00:00+00:00") is True
+        assert tmp_store.trash("abc123", "2026-02-04T00:00:00+00:00") is True
+        meta = tmp_store.get_meta("abc123")
+        assert meta.restore_status == ARTIFACT_FINAL
+        assert meta.trashed_at == "2026-02-02T00:00:00+00:00"
+
+    def test_trash_and_restore_of_unknown_artifacts(self, tmp_store):
+        assert tmp_store.trash("nope", "2026-02-02T00:00:00+00:00") is False
+        assert tmp_store.restore("nope") is False
+
+    def test_restore_of_a_live_artifact_is_a_no_op_false(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope())
+        assert tmp_store.restore("abc123") is False
+        assert tmp_store.get_meta("abc123").status == ARTIFACT_DRAFT
+
+    def test_a_trashed_artifact_stops_resolving_by_its_rotated_share_id_too(
+        self, tmp_store
+    ):
+        tmp_store.create(_make_meta(), _make_envelope())
+        tmp_store.rotate_share("abc123", generate=lambda: "SHARE2")
+        tmp_store.trash("abc123", "2026-02-02T00:00:00+00:00")
+        assert tmp_store.resolve_share("SHARE2") is None
+        assert tmp_store.restore("abc123") is True
+        assert tmp_store.resolve_share("SHARE2") == "abc123"
+
+    def test_a_cold_replica_refuses_a_trashed_artifacts_link(self, backend, tmp_path):
+        writer = _store_with_limit(backend, tmp_path / "w", 50)
+        writer.create(_make_meta(), _make_envelope())
+        writer.rotate_share("abc123", generate=lambda: "SHARE2")
+        writer.trash("abc123", "2026-02-02T00:00:00+00:00")
+
+        reader = _store_with_limit(backend, tmp_path / "r", 50)
+        reader.hydrate()
+        assert reader.resolve_share("SHARE2") is None
+        assert reader.resolve_share("abc123") is None
+
+    def test_store_level_reads_still_work_while_trashed(self, tmp_store):
+        # Visibility of a trashed artifact is the API layer's call; the store
+        # keeps serving its content to whoever asks by artifact id.
+        tmp_store.create(_make_meta(), _make_envelope())
+        tmp_store.add_version(_make_envelope(version=2))
+        tmp_store.trash("abc123", "2026-02-02T00:00:00+00:00")
+
+        assert tmp_store.get_head("abc123").version == 2
+        assert tmp_store.get_version("abc123", 1) is not None
+        assert [row["version"] for row in tmp_store.list_versions("abc123")] == [2, 1]
+
+    def test_owner_listing_shows_trashed_rows(self, tmp_store):
+        tmp_store.create(_make_meta(artifact_id="a1"), _make_envelope("a1"))
+        tmp_store.create(_make_meta(artifact_id="a2"), _make_envelope("a2"))
+        tmp_store.trash("a2", "2026-02-02T00:00:00+00:00")
+
+        rows = {row["id"]: row for row in tmp_store.list_owner(OWNER_A)}
+        assert rows["a2"]["status"] == ARTIFACT_TRASHED
+        assert rows["a2"]["trashed_at"] == "2026-02-02T00:00:00+00:00"
+        assert rows["a1"]["status"] == ARTIFACT_DRAFT
+        assert rows["a1"]["trashed_at"] == ""
+
+    def test_purge_after_trash(self, tmp_store, backend):
+        tmp_store.create(_make_meta(), _make_envelope())
+        tmp_store.trash("abc123", "2026-02-02T00:00:00+00:00")
+        assert tmp_store.delete("abc123") is True
+        assert tmp_store.get_meta("abc123") is None
+        assert tmp_store.get_head("abc123") is None
+        assert tmp_store.resolve_share("abc123") is None
+        assert not [
+            info for info, _ in backend.files.values() if tag_for_id("abc123") in info.tags
+        ]
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — base_version on submissions
+# --------------------------------------------------------------------------
+
+
+class TestBaseVersion:
+    def test_defaults_to_none(self):
+        assert _make_envelope().base_version is None
+
+    def test_round_trip(self):
+        env = _make_envelope(version=3, base_version=2)
+        restored = Envelope.from_json(env.to_json())
+        assert restored == env
+        assert restored.base_version == 2
+
+    def test_serialized_key_is_always_present(self):
+        assert json.loads(_make_envelope().to_json())["base_version"] is None
+        assert json.loads(_make_envelope(base_version=4).to_json())["base_version"] == 4
+
+    def test_missing_key_parses_as_none(self):
+        raw = json.dumps({"id": "x"}).encode("utf-8")
+        assert Envelope.from_json(raw).base_version is None
+
+    def test_bogus_values_parse_as_none(self):
+        for value in ("2", True, 0, -1, 1.5, [], None):
+            raw = json.dumps({"id": "x", "base_version": value}).encode("utf-8")
+            assert Envelope.from_json(raw).base_version is None
+
+    def test_public_meta_exposes_it(self):
+        assert _make_envelope(base_version=2).public_meta()["base_version"] == 2
+        assert _make_envelope().public_meta()["base_version"] is None
+
+    def test_survives_a_storage_round_trip(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope(version=1))
+        tmp_store.add_version(
+            _make_envelope(version=2, status=STATUS_PROPOSED, base_version=1)
+        )
+        env = tmp_store.get_version("abc123", 2)
+        assert env is not None and env.base_version == 1
+        rows = {row["version"]: row for row in tmp_store.list_versions("abc123")}
+        assert rows[2]["base_version"] == 1
+        assert rows[1]["base_version"] is None
+
+    def test_add_version_next_keeps_the_base_version(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope(version=1))
+        assigned = tmp_store.add_version_next(_make_envelope(base_version=1))
+        env = tmp_store.get_version("abc123", assigned)
+        assert env is not None and env.base_version == 1
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — registered webhook URLs on the meta record
+# --------------------------------------------------------------------------
+
+
+class TestMetaWebhooks:
+    def test_defaults_to_an_empty_list(self):
+        assert _make_meta().webhooks == []
+
+    def test_round_trip(self):
+        urls = ["https://example.com/hook", "https://hooks.slack.com/services/a/b/c"]
+        meta = _make_meta(webhooks=list(urls))
+        restored = ArtifactMeta.from_json(meta.to_json())
+        assert restored == meta
+        assert restored.webhooks == urls
+
+    def test_serialized_key_is_always_present(self):
+        assert json.loads(_make_meta().to_json())["webhooks"] == []
+        payload = json.loads(_make_meta(webhooks=["https://example.com/h"]).to_json())
+        assert payload["webhooks"] == ["https://example.com/h"]
+
+    def test_missing_key_parses_as_an_empty_list(self):
+        # Every meta file written before 0.7.0 looks like this.
+        raw = json.dumps({"id": "old1", "owner": _identity()}).encode("utf-8")
+        assert ArtifactMeta.from_json(raw).webhooks == []
+
+    def test_non_list_values_parse_as_an_empty_list(self):
+        for value in ("https://example.com/h", 7, {"a": 1}, None):
+            raw = json.dumps({"id": "old1", "webhooks": value}).encode("utf-8")
+            assert ArtifactMeta.from_json(raw).webhooks == []
+
+    def test_non_string_entries_are_dropped(self):
+        raw = json.dumps(
+            {"id": "old1", "webhooks": ["https://example.com/h", 3, "", None, []]}
+        ).encode("utf-8")
+        assert ArtifactMeta.from_json(raw).webhooks == ["https://example.com/h"]
+
+    def test_survives_a_storage_round_trip(self, tmp_store):
+        tmp_store.create(
+            _make_meta(webhooks=["https://example.com/hook"]), _make_envelope()
+        )
+        meta = tmp_store.get_meta("abc123")
+        assert meta is not None and meta.webhooks == ["https://example.com/hook"]
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — guest invitations on the meta record
+# --------------------------------------------------------------------------
+
+
+def _invitation(
+    invitation_id: str = "inv1", name: str = "Jana", revoked: bool = False
+) -> dict:
+    """One invitation entry, shaped exactly as the API layer writes it."""
+    return {
+        "id": invitation_id,
+        "name": name,
+        # A real record comes from security.hash_password(); the store only
+        # cares that it is a dict, so this stands in for one.
+        "secret": {"algo": "pbkdf2-sha256", "salt": "aa", "hash": "bb"},
+        "created_at": "2026-02-01T00:00:00+00:00",
+        "revoked": revoked,
+    }
+
+
+class TestMetaInvitations:
+    def test_defaults_to_an_empty_list(self):
+        assert _make_meta().invitations == []
+
+    def test_round_trip(self):
+        invitations = [_invitation(), _invitation("inv2", "Petr", revoked=True)]
+        meta = _make_meta(invitations=[dict(inv) for inv in invitations])
+        restored = ArtifactMeta.from_json(meta.to_json())
+        assert restored == meta
+        assert restored.invitations == invitations
+
+    def test_serialized_key_is_always_present(self):
+        assert json.loads(_make_meta().to_json())["invitations"] == []
+        payload = json.loads(_make_meta(invitations=[_invitation()]).to_json())
+        assert payload["invitations"][0]["id"] == "inv1"
+        assert payload["invitations"][0]["name"] == "Jana"
+
+    def test_missing_key_parses_as_an_empty_list(self):
+        # Every meta file written before guest invitations looks like this.
+        raw = json.dumps({"id": "old1", "owner": _identity()}).encode("utf-8")
+        assert ArtifactMeta.from_json(raw).invitations == []
+
+    def test_non_list_values_parse_as_an_empty_list(self):
+        for value in ("inv1", 7, {"a": 1}, None):
+            raw = json.dumps({"id": "old1", "invitations": value}).encode("utf-8")
+            assert ArtifactMeta.from_json(raw).invitations == []
+
+    def test_unusable_entries_are_dropped(self):
+        """An entry that could never authenticate anybody is not worth keeping."""
+        raw = json.dumps(
+            {
+                "id": "old1",
+                "invitations": [
+                    _invitation(),
+                    "not a dict",
+                    {"name": "no id", "secret": {"hash": "x"}},
+                    {"id": "no secret", "name": "x"},
+                    {"id": "bad secret", "secret": "a string"},
+                    # A duplicate id would make revocation ambiguous.
+                    _invitation(name="Jana again"),
+                ],
+            }
+        ).encode("utf-8")
+        kept = ArtifactMeta.from_json(raw).invitations
+        assert [inv["id"] for inv in kept] == ["inv1"]
+        assert kept[0]["name"] == "Jana"
+
+    def test_partial_entries_are_coerced_not_dropped(self):
+        raw = json.dumps(
+            {"id": "old1", "invitations": [{"id": "inv9", "secret": {"hash": "x"}}]}
+        ).encode("utf-8")
+        kept = ArtifactMeta.from_json(raw).invitations
+        assert kept == [
+            {
+                "id": "inv9",
+                "name": "",
+                "secret": {"hash": "x"},
+                "created_at": "",
+                "revoked": False,
+            }
+        ]
+
+    def test_survives_a_storage_round_trip(self, tmp_store):
+        tmp_store.create(_make_meta(invitations=[_invitation()]), _make_envelope())
+        meta = tmp_store.get_meta("abc123")
+        assert meta is not None
+        assert [inv["id"] for inv in meta.invitations] == ["inv1"]
+        assert meta.invitations[0]["secret"] == {
+            "algo": "pbkdf2-sha256",
+            "salt": "aa",
+            "hash": "bb",
+        }

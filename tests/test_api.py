@@ -26,6 +26,8 @@ log.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import hmac
 import html
 import io
 import json
@@ -43,6 +45,7 @@ from src.builder import BuiltArtifact
 from src.comments import CommentStore
 from src.config import load_settings
 from src.kbc import BackendError, InMemoryFilesBackend
+from src.statedb import StateDB
 from src.store import ArtifactStore
 
 AUTH_HEADERS = {"X-StorageApi-Token": "good-token", "X-Kbc-Stack": "us"}
@@ -65,7 +68,14 @@ class Api(NamedTuple):
 @pytest.fixture
 def api(tmp_path, settings, monkeypatch):
     """A TestClient over ``src.main.app`` wired to fakes, per the module docstring."""
-    test_settings = dataclasses.replace(settings, cache_dir=tmp_path / "cache")
+    test_settings = dataclasses.replace(
+        settings,
+        cache_dir=tmp_path / "cache",
+        # The state sidecar is built by the lifespan just like in production;
+        # 0 means "no background snapshot thread", so the tests drive it (and
+        # its Storage writes) entirely themselves.
+        state_snapshot_interval_s=0,
+    )
     monkeypatch.setattr(main, "settings", test_settings)
 
     backend = InMemoryFilesBackend()
@@ -114,11 +124,12 @@ def api(tmp_path, settings, monkeypatch):
 
     monkeypatch.setattr(main, "KbcFilesBackend", fake_kbc_files_backend)
     monkeypatch.setattr(main, "verify_token", fake_verify_token)
-    # The per-contributor counters are module-level state; a test must never
-    # inherit another test's tally.
-    main._submission_counts.clear()
-    main._comment_counts.clear()
-    main._unlock_failures.clear()
+    # Rate-limit counters live in the state sidecar, which the lifespan builds
+    # fresh per test over this test's own in-memory backend and tmp cache dir —
+    # so no tally leaks between tests. The module-level fallback dict is only
+    # reached when no sidecar is attached; clear it anyway, since a test that
+    # detaches the sidecar would otherwise inherit another test's tally.
+    main._fallback_counts.clear()
 
     with TestClient(main.app, base_url="https://testserver") as client:
         yield Api(
@@ -234,6 +245,7 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("GET", "/a/{id}/versions"),
         ("GET", "/a/{id}/diff/{a}..{b}"),
         ("GET", "/a/{id}/comments"),
+        ("GET", "/a/{id}/guest"),
         ("GET", "/a/{id}/review"),
         ("GET", "/a/{id}/export/markdown"),
         ("GET", "/a/{id}/export/vault"),
@@ -241,6 +253,13 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("PUT", "/api/artifacts/{id}"),
         ("GET", "/api/artifacts"),
         ("DELETE", "/api/artifacts/{id}"),
+        ("POST", "/api/artifacts/{id}/restore"),
+        ("DELETE", "/api/artifacts/{id}/purge"),
+        ("POST", "/api/artifacts/{id}/rotate-link"),
+        ("GET", "/api/artifacts/{id}/stats"),
+        ("POST", "/api/artifacts/{id}/invitations"),
+        ("GET", "/api/artifacts/{id}/invitations"),
+        ("DELETE", "/api/artifacts/{id}/invitations/{iid}"),
         ("POST", "/api/artifacts/{id}/versions"),
         ("POST", "/api/artifacts/{id}/versions/{n}/promote"),
         ("DELETE", "/api/artifacts/{id}/versions/{n}"),
@@ -449,7 +468,7 @@ def test_openapi_documents_the_diff_format_query_parameter(api: Api) -> None:
     parameter = _parameter(schema, "/a/{artifact_id}/diff/{spec}", "get", "format")
     assert parameter["in"] == "query"
     assert parameter["schema"]["default"] == "html"
-    assert parameter["schema"]["enum"] == ["html", "unified", "json"]
+    assert parameter["schema"]["enum"] == ["html", "unified", "json", "visual"]
     assert "unified" in parameter["description"]
 
 
@@ -1118,7 +1137,7 @@ def test_list_artifacts_only_own_project_with_urls_merged(api: Api) -> None:
 
 
 # --------------------------------------------------------------------------
-# Delete
+# Delete (soft) and purge (permanent)
 # --------------------------------------------------------------------------
 
 
@@ -1133,14 +1152,48 @@ def test_delete_foreign_is_403(api: Api) -> None:
     assert resp.status_code == 403
 
 
-def test_delete_own_removes_serving_copy(api: Api) -> None:
+def test_delete_own_takes_the_public_link_down(api: Api) -> None:
+    """DELETE is now a soft delete: the link dies, the content does not."""
     artifact_id = _publish_markdown(api, "# Mine")
     resp = api.client.delete(f"/api/artifacts/{artifact_id}", headers=AUTH_HEADERS)
     assert resp.status_code == 200
-    assert resp.json()["deleted"] is True
+    body = resp.json()
+    assert body["trashed"] is True
+    assert body["id"] == artifact_id
+    assert "restore" in body["restore_hint"]
 
-    resp2 = api.client.get(f"/a/{artifact_id}")
-    assert resp2.status_code == 404
+    assert api.client.get(f"/a/{artifact_id}").status_code == 404
+    # The Storage files are all still there — that is what makes it reversible.
+    assert main.app.state.store.get_meta(artifact_id) is not None
+
+
+def test_purge_own_removes_serving_copy(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Mine")
+    resp = api.client.delete(
+        f"/api/artifacts/{artifact_id}/purge", headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] is True
+    assert resp.json()["purged"] is True
+
+    assert api.client.get(f"/a/{artifact_id}").status_code == 404
+    assert main.app.state.store.get_meta(artifact_id) is None
+
+
+def test_purge_unknown_is_404_and_foreign_is_403(api: Api) -> None:
+    assert (
+        api.client.delete(
+            "/api/artifacts/does-not-exist/purge", headers=AUTH_HEADERS
+        ).status_code
+        == 404
+    )
+    artifact_id = _publish_markdown(api, "# Mine")
+    assert (
+        api.client.delete(
+            f"/api/artifacts/{artifact_id}/purge", headers=OTHER_AUTH_HEADERS
+        ).status_code
+        == 403
+    )
 
 
 # --------------------------------------------------------------------------
@@ -2002,18 +2055,45 @@ def test_delete_unknown_thread_is_404(api: Api) -> None:
     assert resp.status_code == 404
 
 
-def test_deleting_an_artifact_removes_its_comment_threads(api: Api) -> None:
+def test_purging_an_artifact_removes_its_comment_threads(api: Api) -> None:
     artifact_id = _publish_markdown(api, "# One")
     _comment(api, artifact_id, exact="One")
     _comment(api, artifact_id, exact="One")
 
-    deleted = api.client.delete(f"/api/artifacts/{artifact_id}", headers=AUTH_HEADERS)
+    deleted = api.client.delete(
+        f"/api/artifacts/{artifact_id}/purge", headers=AUTH_HEADERS
+    )
     assert deleted.status_code == 200
     assert deleted.json()["comment_threads_deleted"] == 2
 
     assert api.client.get(f"/a/{artifact_id}/comments").status_code == 404
     # Nothing is left behind in Storage either.
     assert main.app.state.comments.list_for(artifact_id) == []
+
+
+def test_trashing_an_artifact_keeps_its_comment_threads(api: Api) -> None:
+    """A soft delete must not destroy the discussion it can be restored with."""
+    artifact_id = _publish_markdown(api, "# One")
+    _comment(api, artifact_id, exact="One")
+
+    assert (
+        api.client.delete(
+            f"/api/artifacts/{artifact_id}", headers=AUTH_HEADERS
+        ).status_code
+        == 200
+    )
+    # Unreachable while trashed...
+    assert api.client.get(f"/a/{artifact_id}/comments").status_code == 404
+    # ...but still in Storage, and back after a restore.
+    assert len(main.app.state.comments.list_for(artifact_id)) == 1
+    assert (
+        api.client.post(
+            f"/api/artifacts/{artifact_id}/restore", headers=AUTH_HEADERS
+        ).status_code
+        == 200
+    )
+    threads = api.client.get(f"/a/{artifact_id}/comments").json()["threads"]
+    assert len(threads) == 1
 
 
 # --------------------------------------------------------------------------
@@ -2752,14 +2832,16 @@ def _break_backend_delete(api: Api, monkeypatch) -> None:
     monkeypatch.setattr(api.backend, "delete", failing_delete)
 
 
-def test_delete_artifact_reports_partial_failure_as_502(
+def test_purge_artifact_reports_partial_failure_as_502(
     api: Api, monkeypatch
 ) -> None:
     """Never claim 'deleted' over files that are still being served."""
     artifact_id = _publish_markdown(api, "# Mine")
     _break_backend_delete(api, monkeypatch)
 
-    resp = api.client.delete(f"/api/artifacts/{artifact_id}", headers=AUTH_HEADERS)
+    resp = api.client.delete(
+        f"/api/artifacts/{artifact_id}/purge", headers=AUTH_HEADERS
+    )
     assert resp.status_code == 502
     assert resp.json()["error"] == "artifact not fully deleted"
     assert "retry" in resp.json()["detail"].lower()
@@ -2842,3 +2924,1611 @@ class TestVaultProposalPrivacy:
         ).content
         names = zipfile.ZipFile(io.BytesIO(payload)).namelist()
         assert any(n.endswith("versions/v2.md") for n in names)
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — share ids and link rotation
+#
+# Every /a/{...} route addresses an artifact by its share id; the /api/* routes
+# keep addressing it by the internal id. The two start out equal, so these
+# tests rotate the link to force them apart before asserting anything.
+# --------------------------------------------------------------------------
+
+
+def _rotate(api: Api, artifact_id: str, headers: dict[str, str] = AUTH_HEADERS):
+    return api.client.post(
+        f"/api/artifacts/{artifact_id}/rotate-link", headers=headers
+    )
+
+
+def test_publish_reports_a_share_id_equal_to_the_id(api: Api) -> None:
+    resp = api.client.post(
+        "/api/artifacts", json={"markdown": "# One"}, headers=AUTH_HEADERS
+    )
+    body = resp.json()
+    assert body["share_id"] == body["id"]
+    assert body["url"].endswith(f"/a/{body['share_id']}")
+
+
+def test_rotation_revokes_the_old_link_and_serves_the_new_one(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Rotate me")
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+
+    rotated = _rotate(api, artifact_id)
+    assert rotated.status_code == 200, rotated.text
+    body = rotated.json()
+    share_id = body["share_id"]
+    assert share_id != artifact_id
+    assert body["id"] == artifact_id
+    assert body["previous_share_id"] == artifact_id
+    assert "404" in body["warning"]
+    assert body["url"] == f"https://testserver/a/{share_id}"
+
+    # The new link works; the old one — and the bare artifact id — do not.
+    assert api.client.get(f"/a/{share_id}").status_code == 200
+    assert api.client.get(f"/a/{artifact_id}").status_code == 404
+    for suffix in ("/raw", "/source", "/meta", "/versions", "/comments", "/review"):
+        assert api.client.get(f"/a/{artifact_id}{suffix}").status_code == 404
+        assert api.client.get(f"/a/{share_id}{suffix}").status_code == 200
+
+
+def test_every_public_route_follows_the_rotated_share_id(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+    assert _submit_version(api, artifact_id, "# Two").status_code == 201
+    thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+    share_id = _rotate(api, artifact_id).json()["share_id"]
+
+    assert api.client.get(f"/a/{share_id}/v/2").status_code == 200
+    assert api.client.get(f"/a/{share_id}/diff/1..2").status_code == 200
+    assert api.client.get(f"/a/{share_id}/export/markdown").status_code == 200
+    assert api.client.get(f"/a/{share_id}/export/vault").status_code == 200
+    threads = api.client.get(f"/a/{share_id}/comments").json()["threads"]
+    assert [t["id"] for t in threads] == [thread_id]
+
+    # And none of them answer on the revoked identifier.
+    assert api.client.get(f"/a/{artifact_id}/v/2").status_code == 404
+    assert api.client.get(f"/a/{artifact_id}/diff/1..2").status_code == 404
+    assert api.client.get(f"/a/{artifact_id}/export/vault").status_code == 404
+
+
+def test_api_routes_still_address_the_internal_id_after_rotation(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+    share_id = _rotate(api, artifact_id).json()["share_id"]
+
+    # Everything owner-facing keeps working on the id it was published under.
+    assert _submit_version(api, artifact_id, "# Two").status_code == 201
+    assert _comment(api, artifact_id, exact="One").status_code == 201
+    assert (
+        api.client.put(
+            f"/api/artifacts/{artifact_id}",
+            json={"accept_versions": False},
+            headers=AUTH_HEADERS,
+        ).status_code
+        == 200
+    )
+    # ...and the share id is *not* an /api/* handle.
+    assert (
+        api.client.put(
+            f"/api/artifacts/{share_id}",
+            json={"accept_versions": False},
+            headers=AUTH_HEADERS,
+        ).status_code
+        == 404
+    )
+
+
+def test_returned_urls_are_rebuilt_from_the_new_share_id(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    share_id = _rotate(api, artifact_id).json()["share_id"]
+    root = f"https://testserver/a/{share_id}"
+
+    listed = api.client.get("/api/artifacts", headers=AUTH_HEADERS).json()
+    row = next(a for a in listed["artifacts"] if a["id"] == artifact_id)
+    assert row["share_id"] == share_id
+    assert row["url"] == root
+    assert row["raw_url"] == f"{root}/raw"
+
+    updated = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"markdown": "# Two"},
+        headers=AUTH_HEADERS,
+    ).json()
+    assert updated["share_id"] == share_id
+    assert updated["url"] == root
+
+    submitted = _submit_version(api, artifact_id, "# Three").json()
+    assert submitted["url"] == f"{root}/v/{submitted['version']}"
+
+    # The public metadata and history name the artifact publicly, too.
+    assert api.client.get(f"{root}/meta").json()["id"] == share_id
+    versions = api.client.get(f"{root}/versions").json()
+    assert versions["id"] == share_id
+    assert versions["versions"][0]["url"].startswith(f"{root}/v/")
+
+
+def test_rotate_link_is_owner_only_and_404s_for_unknown(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    assert _rotate(api, artifact_id, OTHER_AUTH_HEADERS).status_code == 403
+    assert _rotate(api, "does-not-exist").status_code == 404
+
+
+def test_rotation_moves_the_unlock_cookie_to_the_new_path(api: Api) -> None:
+    """The cookie is path-scoped, so a rotated link asks for the password again."""
+    artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
+    unlocked = api.client.post(
+        f"/a/{artifact_id}/unlock",
+        data={"password": "hunter2"},
+        follow_redirects=False,
+    )
+    assert unlocked.status_code == 303
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+
+    share_id = _rotate(api, artifact_id).json()["share_id"]
+    # The old cookie's path no longer matches, so the gate is up again.
+    assert api.client.get(f"/a/{share_id}").status_code == 401
+    again = api.client.post(
+        f"/a/{share_id}/unlock", data={"password": "hunter2"}, follow_redirects=False
+    )
+    assert again.status_code == 303
+    assert again.headers["location"] == f"/a/{share_id}"
+    assert api.client.get(f"/a/{share_id}").status_code == 200
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — trash, restore and purge
+# --------------------------------------------------------------------------
+
+
+def _trash(api: Api, artifact_id: str, headers: dict[str, str] = AUTH_HEADERS):
+    return api.client.delete(f"/api/artifacts/{artifact_id}", headers=headers)
+
+
+def _restore(api: Api, artifact_id: str, headers: dict[str, str] = AUTH_HEADERS):
+    return api.client.post(f"/api/artifacts/{artifact_id}/restore", headers=headers)
+
+
+def test_trash_restore_round_trip(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Round trip", accept_versions=True)
+
+    assert _trash(api, artifact_id).status_code == 200
+    assert api.client.get(f"/a/{artifact_id}").status_code == 404
+
+    restored = _restore(api, artifact_id)
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["restored"] is True
+    assert restored.json()["artifact_status"] == "draft"
+    assert restored.json()["url"] == f"https://testserver/a/{artifact_id}"
+
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+    assert _submit_version(api, artifact_id, "# Two").status_code == 201
+
+
+def test_restore_returns_to_the_status_it_was_trashed_from(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Done")
+    assert _policy(api, artifact_id, status="final").status_code == 200
+
+    assert _trash(api, artifact_id).status_code == 200
+    assert _restore(api, artifact_id).json()["artifact_status"] == "final"
+    # Still frozen, because that is the state it went into the trash in.
+    assert _submit_version(api, artifact_id, "# Nope").status_code == 409
+
+
+def test_owner_listing_shows_the_trash(api: Api) -> None:
+    kept = _publish_markdown(api, "# Kept")
+    binned = _publish_markdown(api, "# Binned")
+    assert _trash(api, binned).status_code == 200
+
+    rows = {
+        row["id"]: row
+        for row in api.client.get("/api/artifacts", headers=AUTH_HEADERS).json()[
+            "artifacts"
+        ]
+    }
+    assert rows[kept]["status"] == "draft"
+    assert rows[kept]["trashed_at"] == ""
+    assert rows[binned]["status"] == "trashed"
+    assert rows[binned]["trashed_at"]
+
+
+def test_trashed_artifact_freezes_versions_and_comments(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+    thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+    assert _trash(api, artifact_id).status_code == 200
+
+    version = _submit_version(api, artifact_id, "# Two")
+    assert version.status_code == 409
+    assert version.json()["error"] == "document is trashed"
+    assert "restore" in version.json()["detail"]
+
+    comment = _comment(api, artifact_id, exact="One")
+    assert comment.status_code == 409
+    assert comment.json()["error"] == "document is trashed"
+
+    reply = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}/replies",
+        json={"body": "frozen"},
+        headers=AUTH_HEADERS,
+    )
+    assert reply.status_code == 409
+    assert reply.json()["error"] == "document is trashed"
+
+    content = _policy(api, artifact_id, markdown="# Two")
+    assert content.status_code == 409
+    assert content.json()["error"] == "document is trashed"
+
+
+def test_trashed_artifact_cannot_be_thawed_through_the_status_field(api: Api) -> None:
+    """Restoring is its own route, never a side effect of a settings PUT."""
+    artifact_id = _publish_markdown(api, "# One")
+    assert _trash(api, artifact_id).status_code == 200
+
+    resp = _policy(api, artifact_id, status="draft")
+    assert resp.status_code == 409
+    assert "restore" in resp.json()["detail"]
+    assert api.client.get(f"/a/{artifact_id}").status_code == 404
+
+
+def test_status_trashed_is_not_settable(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    resp = _policy(api, artifact_id, status="trashed")
+    assert resp.status_code == 422
+    assert "draft" in resp.json()["detail"] and "final" in resp.json()["detail"]
+    # Still perfectly readable — nothing was applied.
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+
+
+def test_trashing_twice_is_a_successful_no_op(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    assert _trash(api, artifact_id).status_code == 200
+    assert _trash(api, artifact_id).status_code == 200
+
+
+def test_restore_of_a_live_artifact_is_409(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    resp = _restore(api, artifact_id)
+    assert resp.status_code == 409
+    assert resp.json()["error"] == "artifact is not in the trash"
+
+
+def test_restore_is_owner_only_and_404s_for_unknown(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    assert _trash(api, artifact_id).status_code == 200
+    assert _restore(api, artifact_id, OTHER_AUTH_HEADERS).status_code == 403
+    assert _restore(api, "does-not-exist").status_code == 404
+
+
+def test_trash_then_purge_erases_everything(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    _comment(api, artifact_id, exact="One")
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+    stats_before = api.client.get(
+        f"/api/artifacts/{artifact_id}/stats", headers=AUTH_HEADERS
+    ).json()
+    assert stats_before["total"] >= 1
+
+    assert _trash(api, artifact_id).status_code == 200
+    purged = api.client.delete(
+        f"/api/artifacts/{artifact_id}/purge", headers=AUTH_HEADERS
+    )
+    assert purged.status_code == 200
+    assert purged.json()["comment_threads_deleted"] == 1
+
+    # Gone from every angle: content, threads, view statistics, owner listing.
+    assert api.client.get(f"/a/{artifact_id}").status_code == 404
+    assert main.app.state.comments.list_for(artifact_id) == []
+    assert main.app.state.statedb.views(artifact_id)["total"] == 0
+    assert (
+        api.client.get(
+            f"/api/artifacts/{artifact_id}/stats", headers=AUTH_HEADERS
+        ).status_code
+        == 404
+    )
+    listed = api.client.get("/api/artifacts", headers=AUTH_HEADERS).json()
+    assert artifact_id not in {row["id"] for row in listed["artifacts"]}
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — base_version and the "outdated" flag
+# --------------------------------------------------------------------------
+
+
+def test_base_version_is_stored_and_echoed(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+    resp = api.client.post(
+        f"/api/artifacts/{artifact_id}/versions",
+        json={"markdown": "# Two", "base_version": 1},
+        headers=OTHER_AUTH_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["base_version"] == 1
+
+    rows = api.client.get(f"/a/{artifact_id}/versions").json()["versions"]
+    proposal = next(row for row in rows if row["version"] == 2)
+    assert proposal["base_version"] == 1
+
+
+def test_base_version_defaults_to_none(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    assert _submit_version(api, artifact_id, "# Two").json()["base_version"] is None
+
+
+def test_unknown_base_version_is_422(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    resp = api.client.post(
+        f"/api/artifacts/{artifact_id}/versions",
+        json={"markdown": "# Two", "base_version": 99},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert "base_version" in resp.json()["detail"]
+    # Nothing was stored, so the history is untouched.
+    assert len(api.client.get(f"/a/{artifact_id}/versions").json()["versions"]) == 1
+
+
+def test_outdated_flag_tracks_the_head(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+    # A proposal written against the current head (v1) is not outdated.
+    assert (
+        api.client.post(
+            f"/api/artifacts/{artifact_id}/versions",
+            json={"markdown": "# Proposal", "base_version": 1},
+            headers=OTHER_AUTH_HEADERS,
+        ).status_code
+        == 201
+    )
+
+    def proposal_row():
+        rows = api.client.get(f"/a/{artifact_id}/versions").json()["versions"]
+        return next(row for row in rows if row["version"] == 2)
+
+    assert proposal_row()["outdated"] is False
+
+    # The owner publishes v3, so the head moves and the proposal falls behind.
+    assert _submit_version(api, artifact_id, "# Owner update").status_code == 201
+    assert proposal_row()["outdated"] is True
+
+
+def test_a_proposal_without_a_base_version_is_never_outdated(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+    assert (
+        _submit_version(
+            api, artifact_id, "# Proposal", headers=OTHER_AUTH_HEADERS
+        ).status_code
+        == 201
+    )
+    assert _submit_version(api, artifact_id, "# Owner update").status_code == 201
+
+    rows = api.client.get(f"/a/{artifact_id}/versions").json()["versions"]
+    proposal = next(row for row in rows if row["version"] == 2)
+    assert proposal["base_version"] is None
+    assert proposal["outdated"] is False
+
+
+def test_live_versions_carry_no_outdated_flag(api: Api) -> None:
+    """"outdated" answers a question only a pending proposal raises."""
+    artifact_id = _publish_markdown(api, "# One")
+    assert _submit_version(api, artifact_id, "# Two").status_code == 201
+    rows = api.client.get(f"/a/{artifact_id}/versions").json()["versions"]
+    assert rows
+    assert all("outdated" not in row for row in rows)
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — view statistics
+# --------------------------------------------------------------------------
+
+
+def test_stats_count_each_surface(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Counted")
+    assert _submit_version(api, artifact_id, "# Counted v2").status_code == 201
+
+    api.client.get(f"/a/{artifact_id}")
+    api.client.get(f"/a/{artifact_id}")
+    api.client.get(f"/a/{artifact_id}/raw")
+    api.client.get(f"/a/{artifact_id}/source")
+    api.client.get(f"/a/{artifact_id}/v/1")
+
+    resp = api.client.get(
+        f"/api/artifacts/{artifact_id}/stats", headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["id"] == artifact_id
+    assert body["share_id"] == artifact_id
+    assert body["by_kind"] == {"page": 2, "raw": 1, "source": 1, "version": 1}
+    assert body["total"] == 5
+    assert len(body["by_day"]) == 1
+    assert body["by_day"][0]["count"] == 5
+
+
+def test_stats_of_an_unread_artifact_are_zero(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Unread")
+    body = api.client.get(
+        f"/api/artifacts/{artifact_id}/stats", headers=AUTH_HEADERS
+    ).json()
+    assert body == {
+        "total": 0,
+        "by_day": [],
+        "by_kind": {},
+        "id": artifact_id,
+        "share_id": artifact_id,
+    }
+
+
+def test_stats_report_the_current_share_id(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    share_id = _rotate(api, artifact_id).json()["share_id"]
+    api.client.get(f"/a/{share_id}")
+
+    body = api.client.get(
+        f"/api/artifacts/{artifact_id}/stats", headers=AUTH_HEADERS
+    ).json()
+    assert body["id"] == artifact_id
+    assert body["share_id"] == share_id
+    # Views are counted against the internal id, so rotation does not reset them.
+    assert body["total"] == 1
+
+
+def test_stats_are_owner_only_and_404_for_unknown(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    assert (
+        api.client.get(
+            f"/api/artifacts/{artifact_id}/stats", headers=OTHER_AUTH_HEADERS
+        ).status_code
+        == 403
+    )
+    assert (
+        api.client.get(
+            "/api/artifacts/does-not-exist/stats", headers=AUTH_HEADERS
+        ).status_code
+        == 404
+    )
+
+
+def test_a_404_read_is_not_counted(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    api.client.get("/a/does-not-exist")
+    assert api.client.get(f"/a/{artifact_id}/raw").status_code == 200
+    body = api.client.get(
+        f"/api/artifacts/{artifact_id}/stats", headers=AUTH_HEADERS
+    ).json()
+    assert body["by_kind"] == {"raw": 1}
+
+
+def test_a_gated_read_is_not_counted(api: Api) -> None:
+    """A 401 from the password gate never reaches the content, so it is no view."""
+    artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
+    assert api.client.get(f"/a/{artifact_id}").status_code == 401
+    assert (
+        api.client.get(
+            f"/a/{artifact_id}/raw", headers={"X-Artifact-Password": "hunter2"}
+        ).status_code
+        == 200
+    )
+    body = api.client.get(
+        f"/api/artifacts/{artifact_id}/stats", headers=AUTH_HEADERS
+    ).json()
+    assert body["by_kind"] == {"raw": 1}
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — rate-limit counters live in the state sidecar
+# --------------------------------------------------------------------------
+
+
+def test_rate_limit_counters_land_in_the_state_database(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    assert _submit_version(api, artifact_id, "# Two").status_code == 201
+    _comment(api, artifact_id, exact="One")
+
+    day = main._utc_day()
+    # The key convention statedb documents: internal artifact id first (so
+    # forget_artifact can purge it), then the contributor's owner key.
+    key = f"{artifact_id}:123@connection.keboola.com"
+    database = main.app.state.statedb
+    assert database.count("submissions", key, day) == 1, key
+    assert database.count("comments", key, day) == 1
+
+
+def test_submission_counters_survive_a_new_statedb_over_the_same_backend(
+    api: Api, monkeypatch, tmp_path
+) -> None:
+    """The point of the sidecar: a redeploy must not hand out a fresh budget."""
+    artifact_id = _publish_markdown(api, "# One")
+    monkeypatch.setattr(
+        main, "settings", dataclasses.replace(api.settings, max_versions_per_day=2)
+    )
+    assert _submit_version(api, artifact_id, "# Two").status_code == 201
+    assert _submit_version(api, artifact_id, "# Three").status_code == 201
+    assert _submit_version(api, artifact_id, "# Four").status_code == 429
+
+    # Snapshot to Storage, then rebuild a sidecar from scratch the way a
+    # restarted container would, and check the tally came back.
+    assert main.app.state.statedb.snapshot_now() is True
+    revived = StateDB(api.backend, tmp_path / "revived.sqlite3", 0, 0)
+    revived.start()
+    try:
+        key = f"{artifact_id}:123@connection.keboola.com"
+        assert revived.count("submissions", key, main._utc_day()) >= 3
+    finally:
+        revived.stop()
+
+
+def test_unlock_failures_are_counted_in_the_state_database(
+    api: Api, monkeypatch
+) -> None:
+    artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
+    _low_unlock_limit(api, monkeypatch, limit=2)
+
+    for _ in range(2):
+        assert (
+            api.client.post(
+                f"/a/{artifact_id}/unlock",
+                data={"password": "nope"},
+                follow_redirects=False,
+            ).status_code
+            == 401
+        )
+
+    database = main.app.state.statedb
+    key = f"{artifact_id}:testclient"
+    assert database.count("unlock_failures", key, main._utc_hour()) == 2
+
+
+def test_counters_still_work_without_a_state_database(api: Api, monkeypatch) -> None:
+    """A missing sidecar degrades to per-process counting, never to no limit."""
+    artifact_id = _publish_markdown(api, "# One")
+    monkeypatch.setattr(
+        main, "settings", dataclasses.replace(api.settings, max_versions_per_day=1)
+    )
+    monkeypatch.delattr(main.app.state, "statedb", raising=False)
+    main._fallback_counts.clear()
+
+    assert _submit_version(api, artifact_id, "# Two").status_code == 201
+    assert _submit_version(api, artifact_id, "# Three").status_code == 429
+    main._fallback_counts.clear()
+
+
+def test_a_broken_state_database_never_breaks_serving(api: Api, monkeypatch) -> None:
+    """Analytics are best effort: a failing sidecar must not 500 a page load."""
+    artifact_id = _publish_markdown(api, "# One")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("state database is on fire")
+
+    monkeypatch.setattr(main.app.state.statedb, "record_view", boom)
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+    assert api.client.get(f"/a/{artifact_id}/raw").status_code == 200
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — outbound webhooks
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def hooked(api: Api, monkeypatch):
+    """An api whose webhook validator accepts the test host and records posts.
+
+    ``validate_webhook_url`` is patched at the seam ``src.main`` imported it
+    through, so the real https/SSRF rules keep applying to everything except
+    the one host these tests register. Deliveries are drained synchronously,
+    exactly like tests/test_webhooks.py does.
+    """
+    real_validate = main.validate_webhook_url
+
+    def fake_validate(url: str) -> str:
+        # A localhost URL would be (correctly) refused by the SSRF guard, so
+        # the test host bypasses resolution only for itself.
+        if url.startswith("https://hooks.test/"):
+            return url
+        return real_validate(url)
+
+    monkeypatch.setattr(main, "validate_webhook_url", fake_validate)
+
+    posts: list[tuple[str, bytes, dict]] = []
+
+    def record(url: str, body: bytes, headers: dict) -> int:
+        posts.append((url, body, dict(headers)))
+        return 200
+
+    dispatcher = main.app.state.webhooks
+    monkeypatch.setattr(dispatcher, "_post", record)
+    # The dispatcher's own thread would race drain(); stop it and drive
+    # delivery from the test thread instead.
+    dispatcher.stop()
+    return api, posts, dispatcher
+
+
+def _register_hook(api: Api, artifact_id: str, urls: list[str]):
+    return api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"webhooks": urls},
+        headers=AUTH_HEADERS,
+    )
+
+
+HOOK = "https://hooks.test/artifact"
+
+
+def test_webhook_delivers_a_signed_event_for_a_submitted_version(hooked) -> None:
+    api, posts, dispatcher = hooked
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+
+    registered = _register_hook(api, artifact_id, [HOOK])
+    assert registered.status_code == 200, registered.text
+    # The owner who set them gets them back in full.
+    assert registered.json()["webhooks"] == [HOOK]
+
+    assert (
+        _submit_version(
+            api, artifact_id, "# Two", headers=OTHER_AUTH_HEADERS
+        ).status_code
+        == 201
+    )
+    assert dispatcher.drain() == 1
+
+    url, body, headers = posts[0]
+    assert url == HOOK
+    envelope = json.loads(body)
+    assert envelope["event"] == "version.proposed"
+    assert envelope["artifact_id"] == artifact_id
+    assert envelope["created_at"]
+    payload = envelope["payload"]
+    assert payload["version"] == 2
+    assert payload["actor"] == "Other"
+    assert payload["url"] == f"https://testserver/a/{artifact_id}"
+    # Signed with the hub's secret, over the exact bytes sent.
+    expected = hmac.new(
+        api.settings.secret_key.encode("utf-8"), body, hashlib.sha256
+    ).hexdigest()
+    assert headers["X-Hub-Signature-256"] == f"sha256={expected}"
+    # And nothing secret rode along.
+    assert "token" not in body.decode("utf-8").lower()
+    _assert_no_sensitive_keys(envelope)
+
+
+@pytest.mark.parametrize(
+    "action, kind",
+    [
+        ("promote", "version.promoted"),
+        ("comment", "comment.created"),
+        ("reply", "comment.replied"),
+        ("finalize", "artifact.finalized"),
+        ("trash", "artifact.trashed"),
+        ("restore", "artifact.restored"),
+        ("rotate", "link.rotated"),
+        ("owner_version", "version.published"),
+    ],
+)
+def test_webhook_event_kinds(hooked, action: str, kind: str) -> None:
+    api, posts, dispatcher = hooked
+    artifact_id = _publish_markdown(api, "# One", accept_versions=True)
+    assert _register_hook(api, artifact_id, [HOOK]).status_code == 200
+    dispatcher.drain()
+    posts.clear()
+
+    if action == "promote":
+        assert (
+            _submit_version(
+                api, artifact_id, "# Two", headers=OTHER_AUTH_HEADERS
+            ).status_code
+            == 201
+        )
+        dispatcher.drain()
+        posts.clear()
+        assert (
+            api.client.post(
+                f"/api/artifacts/{artifact_id}/versions/2/promote",
+                headers=AUTH_HEADERS,
+            ).status_code
+            == 200
+        )
+    elif action == "comment":
+        assert _comment(api, artifact_id, exact="One").status_code == 201
+    elif action == "reply":
+        thread_id = _comment(api, artifact_id, exact="One").json()["id"]
+        dispatcher.drain()
+        posts.clear()
+        assert (
+            api.client.post(
+                f"/api/artifacts/{artifact_id}/comments/{thread_id}/replies",
+                json={"body": "hi"},
+                headers=AUTH_HEADERS,
+            ).status_code
+            == 201
+        )
+    elif action == "finalize":
+        assert _policy(api, artifact_id, status="final").status_code == 200
+    elif action == "trash":
+        assert _trash(api, artifact_id).status_code == 200
+    elif action == "restore":
+        assert _trash(api, artifact_id).status_code == 200
+        dispatcher.drain()
+        posts.clear()
+        assert _restore(api, artifact_id).status_code == 200
+    elif action == "rotate":
+        assert _rotate(api, artifact_id).status_code == 200
+    else:
+        assert _submit_version(api, artifact_id, "# Two").status_code == 201
+
+    assert dispatcher.drain() == 1
+    assert json.loads(posts[0][1])["event"] == kind
+
+
+def test_the_initial_publish_emits_nothing(hooked) -> None:
+    """v1 is the owner's own doing; only later versions are news."""
+    api, posts, dispatcher = hooked
+    artifact_id = _publish_markdown(api, "# One")
+    assert _register_hook(api, artifact_id, [HOOK]).status_code == 200
+    assert dispatcher.drain() == 0
+    assert posts == []
+
+
+def test_an_artifact_without_webhooks_queues_nothing(hooked) -> None:
+    api, posts, dispatcher = hooked
+    artifact_id = _publish_markdown(api, "# One")
+    assert _submit_version(api, artifact_id, "# Two").status_code == 201
+    assert dispatcher.pending() == 0
+    assert dispatcher.drain() == 0
+
+
+def test_every_registered_url_gets_its_own_delivery(hooked) -> None:
+    api, posts, dispatcher = hooked
+    artifact_id = _publish_markdown(api, "# One")
+    second = "https://hooks.test/other"
+    assert _register_hook(api, artifact_id, [HOOK, second]).status_code == 200
+
+    assert _submit_version(api, artifact_id, "# Two").status_code == 201
+    assert dispatcher.drain() == 2
+    assert {url for url, _, _ in posts} == {HOOK, second}
+
+
+def test_webhooks_can_be_cleared_and_are_left_alone_when_omitted(hooked) -> None:
+    api, posts, dispatcher = hooked
+    artifact_id = _publish_markdown(api, "# One")
+    assert _register_hook(api, artifact_id, [HOOK]).status_code == 200
+
+    # Omitting the field leaves the list untouched.
+    untouched = _policy(api, artifact_id, comments_mode="off")
+    assert untouched.json()["webhooks"] == [HOOK]
+
+    cleared = _register_hook(api, artifact_id, [])
+    assert cleared.status_code == 200
+    assert cleared.json()["webhooks"] == []
+    assert _submit_version(api, artifact_id, "# Two").status_code == 201
+    assert dispatcher.drain() == 0
+
+
+def test_an_invalid_webhook_url_is_422(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    plain_http = _register_hook(api, artifact_id, ["http://example.com/hook"])
+    assert plain_http.status_code == 422
+    assert "https" in plain_http.json()["detail"]
+
+    # The SSRF guard applies to webhooks exactly as it does to git clones.
+    loopback = _register_hook(api, artifact_id, ["https://127.0.0.1/hook"])
+    assert loopback.status_code == 422
+    assert "private" in loopback.json()["detail"]
+
+    metadata = _register_hook(api, artifact_id, ["https://metadata.google.internal/x"])
+    assert metadata.status_code == 422
+
+    # Nothing was stored by any of the refusals.
+    assert (
+        api.client.put(
+            f"/api/artifacts/{artifact_id}", json={}, headers=AUTH_HEADERS
+        ).json()["webhooks"]
+        == []
+    )
+
+
+def test_too_many_webhooks_is_422(hooked) -> None:
+    api, _posts, _dispatcher = hooked
+    artifact_id = _publish_markdown(api, "# One")
+    cap = api.settings.max_webhooks_per_artifact
+    urls = [f"https://hooks.test/h{n}" for n in range(cap + 1)]
+
+    resp = _register_hook(api, artifact_id, urls)
+    assert resp.status_code == 422
+    assert str(cap) in resp.json()["detail"]
+
+    # Exactly at the cap is fine.
+    assert _register_hook(api, artifact_id, urls[:cap]).status_code == 200
+
+
+def test_listing_reports_a_webhook_count_never_the_urls(hooked) -> None:
+    api, _posts, _dispatcher = hooked
+    artifact_id = _publish_markdown(api, "# One")
+    assert _register_hook(api, artifact_id, [HOOK]).status_code == 200
+
+    listed = api.client.get("/api/artifacts", headers=AUTH_HEADERS)
+    row = next(a for a in listed.json()["artifacts"] if a["id"] == artifact_id)
+    assert row["webhooks_count"] == 1
+    assert "webhooks" not in row
+    # The URL is a capability; it must not appear anywhere in the listing.
+    assert HOOK not in listed.text
+
+
+def test_webhooks_survive_a_restart(hooked) -> None:
+    api, _posts, _dispatcher = hooked
+    artifact_id = _publish_markdown(api, "# One")
+    assert _register_hook(api, artifact_id, [HOOK]).status_code == 200
+
+    second_store = ArtifactStore(
+        backend=api.backend,
+        cache_dir=api.settings.cache_dir / "restart",
+        cache_max_entries=api.settings.cache_max_entries,
+        max_versions=api.settings.max_versions,
+    )
+    second_store.hydrate()
+    meta = second_store.get_meta(artifact_id)
+    assert meta is not None and meta.webhooks == [HOOK]
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — OpenAPI coverage of the new surface
+# --------------------------------------------------------------------------
+
+
+def test_openapi_documents_the_new_routes(api: Api) -> None:
+    schema = api.client.get("/openapi.json").json()
+    for path, method in (
+        ("/api/artifacts/{artifact_id}/restore", "post"),
+        ("/api/artifacts/{artifact_id}/purge", "delete"),
+        ("/api/artifacts/{artifact_id}/rotate-link", "post"),
+        ("/api/artifacts/{artifact_id}/stats", "get"),
+    ):
+        operation = schema["paths"][path][method]
+        assert operation["summary"].strip()
+        assert operation["description"].strip()
+        assert set(operation["responses"]) >= {"200", "403", "404"}
+        parameter = _parameter(schema, path, method, "artifact_id")
+        assert parameter["description"].strip()
+
+    # The two destructive routes say so in their own words.
+    assert (
+        "irreversible"
+        in schema["paths"]["/api/artifacts/{artifact_id}/purge"]["delete"][
+            "description"
+        ].lower()
+    )
+    rotate = schema["paths"]["/api/artifacts/{artifact_id}/rotate-link"]["post"]
+    assert "stops working immediately" in rotate["description"]
+
+
+def test_openapi_documents_the_new_body_fields(api: Api) -> None:
+    schemas = api.client.get("/openapi.json").json()["components"]["schemas"]
+    webhooks = schemas["UpdateBody"]["properties"]["webhooks"]
+    assert "https" in webhooks["description"]
+    base_version = schemas["VersionBody"]["properties"]["base_version"]
+    assert "outdated" in base_version["description"]
+
+
+def test_openapi_public_routes_document_the_share_id(api: Api) -> None:
+    schema = api.client.get("/openapi.json").json()
+    parameter = _parameter(schema, "/a/{artifact_id}", "get", "artifact_id")
+    assert "share" in parameter["description"].lower()
+    assert "capability" in parameter["description"]
+    # The /api/* handle is documented as the internal, stable one.
+    internal = _parameter(schema, "/api/artifacts/{artifact_id}", "put", "artifact_id")
+    assert "internal" in internal["description"].lower()
+
+
+def test_context_documents_the_new_capabilities(api: Api) -> None:
+    body = api.client.get("/context").json()
+    assert "rotate" in body["sharing"]["rotation"].lower()
+    assert "trash" in body["sharing"]["trash"].lower()
+    assert "outdated" in body["sharing"]["base_version"]
+    assert "link.rotated" in body["webhooks"]["events"]
+    assert body["limits"]["max_webhooks_per_artifact"] == (
+        api.settings.max_webhooks_per_artifact
+    )
+    assert "page" in body["analytics"]["views"]
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — guest invitations
+#
+# An invitation is a named, revocable capability that lets one human without a
+# Keboola account comment on one artifact. The credential is
+# "{invitation_id}.{secret}"; it is minted once, stored hashed, and presented
+# in the X-Artifact-Guest header.
+# --------------------------------------------------------------------------
+
+
+def _invite(
+    api: Api,
+    artifact_id: str,
+    name: str = "Jana",
+    headers: dict[str, str] = AUTH_HEADERS,
+):
+    """Mint one guest invitation; returns the raw response."""
+    return api.client.post(
+        f"/api/artifacts/{artifact_id}/invitations",
+        json={"name": name},
+        headers=headers,
+    )
+
+
+def _guest_headers(review_url: str) -> dict[str, str]:
+    """Turn an invitation review URL into the header a guest actually sends.
+
+    This mirrors what the review page's JavaScript does: the credential lives
+    in the URL *fragment* and only ever travels in a header.
+    """
+    assert "#invite=" in review_url
+    return {"X-Artifact-Guest": review_url.split("#invite=", 1)[1]}
+
+
+def _guest_comment(
+    api: Api,
+    artifact_id: str,
+    guest: dict[str, str],
+    *,
+    version: int = 1,
+    exact: str = "Body text",
+    body: str = "A guest question.",
+):
+    return api.client.post(
+        f"/api/artifacts/{artifact_id}/comments",
+        json={
+            "version": version,
+            "exact": exact,
+            "prefix": "",
+            "suffix": "",
+            "body": body,
+        },
+        headers=guest,
+    )
+
+
+def test_invitation_returns_a_one_time_review_url(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+
+    created = _invite(api, artifact_id, "Jana (legal)")
+    assert created.status_code == 201, created.text
+    payload = created.json()
+    assert set(payload) == {"invitation_id", "name", "review_url", "warning"}
+    assert payload["name"] == "Jana (legal)"
+
+    share_id = api.client.get(f"/a/{artifact_id}/meta").json()["id"]
+    prefix = f"https://testserver/a/{share_id}/review#invite="
+    assert payload["review_url"].startswith(prefix)
+
+    # The credential is {invitation_id}.{secret}: the id is public, the secret
+    # is not, and neither half may be guessable from the other.
+    credential = payload["review_url"][len(prefix):]
+    invitation_id, _, secret = credential.partition(".")
+    assert invitation_id == payload["invitation_id"]
+    assert len(secret) >= 20
+    assert secret not in invitation_id
+
+    # ...and it is shown exactly once: nothing else ever echoes it.
+    listing = api.client.get(
+        f"/api/artifacts/{artifact_id}/invitations", headers=AUTH_HEADERS
+    )
+    assert listing.status_code == 200
+    assert secret not in listing.text
+    assert secret not in api.client.get(f"/a/{share_id}/comments").text
+
+
+def test_invitation_secret_is_stored_hashed_not_in_the_clear(api: Api) -> None:
+    """A leaked meta file must not be replayable as an invitation."""
+    artifact_id = _publish_markdown(api, "# Title")
+    review_url = _invite(api, artifact_id).json()["review_url"]
+    secret = review_url.split("#invite=", 1)[1].split(".", 1)[1]
+
+    meta = main.app.state.store.get_meta(artifact_id)
+    assert meta is not None
+    record = meta.invitations[0]["secret"]
+    assert record["algo"] == "pbkdf2-sha256"
+    assert secret not in json.dumps(meta.invitations)
+
+
+def test_invitation_listing_omits_secrets_and_tracks_revocation(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title")
+    first = _invite(api, artifact_id, "Jana").json()
+    second = _invite(api, artifact_id, "Petr").json()
+
+    listed = api.client.get(
+        f"/api/artifacts/{artifact_id}/invitations", headers=AUTH_HEADERS
+    ).json()
+    assert listed["id"] == artifact_id
+    assert [inv["id"] for inv in listed["invitations"]] == [
+        first["invitation_id"],
+        second["invitation_id"],
+    ]
+    for invitation in listed["invitations"]:
+        assert set(invitation) == {"id", "name", "created_at", "revoked"}
+        assert invitation["revoked"] is False
+        assert invitation["created_at"]
+
+    revoked = api.client.delete(
+        f"/api/artifacts/{artifact_id}/invitations/{first['invitation_id']}",
+        headers=AUTH_HEADERS,
+    )
+    assert revoked.status_code == 200
+    assert revoked.json()["revoked"] is True
+
+    after = api.client.get(
+        f"/api/artifacts/{artifact_id}/invitations", headers=AUTH_HEADERS
+    ).json()["invitations"]
+    assert [inv["revoked"] for inv in after] == [True, False]
+
+    # Revoking twice is a no-op, and an unknown invitation is a 404.
+    assert api.client.delete(
+        f"/api/artifacts/{artifact_id}/invitations/{first['invitation_id']}",
+        headers=AUTH_HEADERS,
+    ).status_code == 200
+    assert api.client.delete(
+        f"/api/artifacts/{artifact_id}/invitations/nope", headers=AUTH_HEADERS
+    ).status_code == 404
+
+
+def test_invitations_are_owner_only(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title")
+    invitation_id = _invite(api, artifact_id).json()["invitation_id"]
+
+    assert _invite(api, artifact_id, headers=OTHER_AUTH_HEADERS).status_code == 403
+    assert api.client.get(
+        f"/api/artifacts/{artifact_id}/invitations", headers=OTHER_AUTH_HEADERS
+    ).status_code == 403
+    assert api.client.delete(
+        f"/api/artifacts/{artifact_id}/invitations/{invitation_id}",
+        headers=OTHER_AUTH_HEADERS,
+    ).status_code == 403
+    assert _invite(api, "does-not-exist").status_code == 404
+
+
+def test_invitation_name_is_validated(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title")
+    assert _invite(api, artifact_id, "").status_code == 422
+    assert _invite(api, artifact_id, "   ").status_code == 422
+    assert _invite(api, artifact_id, "x" * 81).status_code == 422
+    assert _invite(api, artifact_id, "x" * 80).status_code == 201
+
+
+def test_invitation_cap_is_enforced_and_revoking_frees_a_slot(
+    api: Api, monkeypatch
+) -> None:
+    artifact_id = _publish_markdown(api, "# Title")
+    monkeypatch.setattr(
+        main,
+        "settings",
+        dataclasses.replace(api.settings, max_invitations_per_artifact=2),
+    )
+
+    first = _invite(api, artifact_id, "One").json()
+    assert _invite(api, artifact_id, "Two").status_code == 201
+
+    full = _invite(api, artifact_id, "Three")
+    assert full.status_code == 422
+    assert "limit" in full.json()["detail"]
+
+    # Revoking makes room: the tombstone is dropped rather than kept forever,
+    # so "revoke somebody, invite somebody else" works indefinitely.
+    api.client.delete(
+        f"/api/artifacts/{artifact_id}/invitations/{first['invitation_id']}",
+        headers=AUTH_HEADERS,
+    )
+    assert _invite(api, artifact_id, "Three").status_code == 201
+    listed = api.client.get(
+        f"/api/artifacts/{artifact_id}/invitations", headers=AUTH_HEADERS
+    ).json()["invitations"]
+    assert [inv["name"] for inv in listed] == ["Two", "Three"]
+
+
+def test_invitations_are_refused_on_a_frozen_artifact(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title")
+    assert _policy(api, artifact_id, status="final").status_code == 200
+    frozen = _invite(api, artifact_id)
+    assert frozen.status_code == 409
+    assert frozen.json()["error"] == "document is final"
+
+    trashed_id = _publish_markdown(api, "# Trash me")
+    assert _trash(api, trashed_id).status_code == 200
+    assert _invite(api, trashed_id).json()["error"] == "document is trashed"
+
+
+# ---------------------------------------------------------------- guest writes
+
+
+def test_guest_can_comment_with_the_invitation_header(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    invitation = _invite(api, artifact_id, "Jana").json()
+    guest = _guest_headers(invitation["review_url"])
+
+    created = _guest_comment(api, artifact_id, guest, body="Is this the final wording?")
+    assert created.status_code == 201, created.text
+    thread = created.json()
+    assert thread["author"] == {"kind": "guest", "name": "Jana"}
+    assert thread["body"] == "Is this the final wording?"
+
+    # Nothing about the invitation itself reaches a public response.
+    listing = api.client.get(f"/a/{artifact_id}/comments")
+    assert listing.status_code == 200
+    published = listing.json()["threads"][0]
+    assert published["author"] == {"kind": "guest", "name": "Jana"}
+    assert invitation["invitation_id"] not in listing.text
+    assert guest["X-Artifact-Guest"].split(".", 1)[1] not in listing.text
+    _assert_no_credentials(listing.json())
+
+
+def test_guest_can_reply_and_the_reply_is_attributed(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    guest = _guest_headers(_invite(api, artifact_id, "Jana").json()["review_url"])
+    thread_id = _comment(api, artifact_id, exact="Body text").json()["id"]
+
+    replied = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}/replies",
+        json={"body": "One question about this."},
+        headers=guest,
+    )
+    assert replied.status_code == 201, replied.text
+    assert replied.json()["replies"][0]["author"] == {"kind": "guest", "name": "Jana"}
+
+
+def test_revoked_invitation_is_401(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    invitation = _invite(api, artifact_id, "Jana").json()
+    guest = _guest_headers(invitation["review_url"])
+    assert _guest_comment(api, artifact_id, guest).status_code == 201
+
+    api.client.delete(
+        f"/api/artifacts/{artifact_id}/invitations/{invitation['invitation_id']}",
+        headers=AUTH_HEADERS,
+    )
+    refused = _guest_comment(api, artifact_id, guest)
+    assert refused.status_code == 401
+    assert "revoked" in refused.json()["detail"]
+
+
+def test_unknown_and_tampered_guest_credentials_are_401(api: Api) -> None:
+    """Revoked, unknown and wrong-secret all answer alike — no oracle."""
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    invitation = _invite(api, artifact_id, "Jana").json()
+    good = _guest_headers(invitation["review_url"])["X-Artifact-Guest"]
+    invitation_id, secret = good.split(".", 1)
+
+    wrong_secret = f"{invitation_id}.{'x' * len(secret)}"
+    unknown_id = f"nosuchinvitation.{secret}"
+    detail = None
+    for value in (wrong_secret, unknown_id, "no-dot-at-all", "half."):
+        answer = _guest_comment(api, artifact_id, {"X-Artifact-Guest": value})
+        assert answer.status_code == 401, value
+        # One answer for all of them: a guest must not be able to tell a
+        # revoked invitation from an unknown one from a wrong secret.
+        detail = detail or answer.json()["detail"]
+        assert answer.json()["detail"] == detail, value
+
+    # No header at all is not a guest; it falls through to token auth, which
+    # has nothing to verify either.
+    assert _guest_comment(api, artifact_id, {}).status_code in (400, 401)
+
+    # An invitation minted for one artifact does not open another.
+    other_id = _publish_markdown(api, "# Other\n\nBody text here.")
+    assert _guest_comment(
+        api, other_id, {"X-Artifact-Guest": good}
+    ).status_code == 401
+
+
+def test_guest_is_frozen_out_of_a_final_or_trashed_artifact(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    guest = _guest_headers(_invite(api, artifact_id).json()["review_url"])
+
+    assert _policy(api, artifact_id, status="final").status_code == 200
+    frozen = _guest_comment(api, artifact_id, guest)
+    assert frozen.status_code == 409
+    assert frozen.json()["error"] == "document is final"
+
+    assert _policy(api, artifact_id, status="draft").status_code == 200
+    assert _trash(api, artifact_id).status_code == 200
+    binned = _guest_comment(api, artifact_id, guest)
+    assert binned.status_code == 409
+    assert binned.json()["error"] == "document is trashed"
+
+
+def test_comments_mode_does_not_gate_a_guest(api: Api) -> None:
+    """The invitation *is* the grant — its issuer is the owner of that mode."""
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    guest = _guest_headers(_invite(api, artifact_id).json()["review_url"])
+    assert _policy(api, artifact_id, comments_mode="off").status_code == 200
+
+    assert _comment(api, artifact_id, headers=OTHER_AUTH_HEADERS).status_code == 403
+    assert _guest_comment(api, artifact_id, guest).status_code == 201
+
+
+def test_guests_are_rate_limited_per_invitation(api: Api, monkeypatch) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    first = _guest_headers(_invite(api, artifact_id, "Jana").json()["review_url"])
+    second = _guest_headers(_invite(api, artifact_id, "Petr").json()["review_url"])
+    monkeypatch.setattr(
+        main, "settings", dataclasses.replace(api.settings, max_comments_per_day=2)
+    )
+
+    assert _guest_comment(api, artifact_id, first).status_code == 201
+    thread_id = _guest_comment(api, artifact_id, first).json()["id"]
+    limited = _guest_comment(api, artifact_id, first)
+    assert limited.status_code == 429
+    assert limited.json()["limit"] == 2
+    assert "invitation" in limited.json()["detail"].lower()
+
+    # Replies draw on the same bucket...
+    assert api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{thread_id}/replies",
+        json={"body": "also blocked"},
+        headers=first,
+    ).status_code == 429
+
+    # ...but budgets are per invitation, and never shared with a project.
+    assert _guest_comment(api, artifact_id, second).status_code == 201
+    assert _comment(api, artifact_id, exact="Body text").status_code == 201
+
+
+def test_guest_moderates_only_their_own_threads(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    guest = _guest_headers(_invite(api, artifact_id, "Jana").json()["review_url"])
+
+    mine = _guest_comment(api, artifact_id, guest).json()["id"]
+    theirs = _comment(api, artifact_id, exact="Body text").json()["id"]
+
+    resolved = api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{mine}/resolve", headers=guest
+    )
+    assert resolved.status_code == 200
+    assert resolved.json()["resolved"] is True
+    assert resolved.json()["resolved_by"] == {"kind": "guest", "name": "Jana"}
+
+    # Reopening their own thread works too.
+    assert api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{mine}/resolve",
+        json={"resolved": False},
+        headers=guest,
+    ).status_code == 200
+
+    # Somebody else's thread is not theirs to resolve or delete.
+    assert api.client.post(
+        f"/api/artifacts/{artifact_id}/comments/{theirs}/resolve", headers=guest
+    ).status_code == 403
+    assert api.client.delete(
+        f"/api/artifacts/{artifact_id}/comments/{theirs}", headers=guest
+    ).status_code == 403
+
+    assert api.client.delete(
+        f"/api/artifacts/{artifact_id}/comments/{mine}", headers=guest
+    ).status_code == 200
+
+
+def test_guest_cannot_use_the_management_api(api: Api) -> None:
+    """An invitation is a voice in one discussion, not a credential.
+
+    Every management route ignores the guest header outright, so a guest is
+    simply an unauthenticated caller there — refused before anything happens.
+    """
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    guest = _guest_headers(_invite(api, artifact_id).json()["review_url"])
+
+    refused = [
+        api.client.get("/api/artifacts", headers=guest),
+        api.client.post(
+            f"/api/artifacts/{artifact_id}/versions",
+            json={"markdown": "# Mine now"},
+            headers=guest,
+        ),
+        api.client.put(
+            f"/api/artifacts/{artifact_id}", json={"status": "final"}, headers=guest
+        ),
+        api.client.delete(f"/api/artifacts/{artifact_id}", headers=guest),
+        api.client.get(f"/api/artifacts/{artifact_id}/invitations", headers=guest),
+        api.client.post(f"/api/artifacts/{artifact_id}/rotate-link", headers=guest),
+    ]
+    for answer in refused:
+        assert answer.status_code in (400, 401), answer.request.url
+
+    # The artifact is untouched by any of it.
+    listed = api.client.get("/api/artifacts", headers=AUTH_HEADERS).json()
+    row = next(r for r in listed["artifacts"] if r["id"] == artifact_id)
+    assert row["status"] == "draft"
+
+
+def test_guest_comments_emit_a_webhook_naming_the_guest(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    assert _policy(
+        api, artifact_id, webhooks=["https://example.com/hook"]
+    ).status_code == 200
+    guest = _guest_headers(_invite(api, artifact_id, "Jana").json()["review_url"])
+
+    sent: list[Any] = []
+    main.app.state.webhooks.emit = lambda urls, event: sent.append((urls, event))
+
+    assert _guest_comment(api, artifact_id, guest).status_code == 201
+    assert len(sent) == 1
+    urls, event = sent[0]
+    assert urls == ["https://example.com/hook"]
+    assert event.kind == "comment.created"
+    assert event.payload["actor"] == "Jana (guest)"
+    # A notification is not a place to leak the credential either.
+    assert guest["X-Artifact-Guest"] not in json.dumps(event.payload)
+
+
+# --------------------------------------------------------------- /a/{x}/guest
+
+
+def test_guest_endpoint_resolves_a_credential_to_a_name(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title")
+    invitation = _invite(api, artifact_id, "Jana").json()
+    guest = _guest_headers(invitation["review_url"])
+
+    answer = api.client.get(f"/a/{artifact_id}/guest", headers=guest)
+    assert answer.status_code == 200
+    assert answer.json() == {
+        "id": artifact_id,
+        "invitation_id": invitation["invitation_id"],
+        "name": "Jana",
+    }
+
+
+def test_guest_endpoint_refuses_anything_but_a_live_invitation(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title")
+    invitation = _invite(api, artifact_id).json()
+    guest = _guest_headers(invitation["review_url"])
+
+    assert api.client.get(f"/a/{artifact_id}/guest").status_code == 401
+    assert api.client.get(
+        f"/a/{artifact_id}/guest", headers={"X-Artifact-Guest": "garbage"}
+    ).status_code == 401
+    assert api.client.get("/a/does-not-exist/guest", headers=guest).status_code == 404
+
+    api.client.delete(
+        f"/api/artifacts/{artifact_id}/invitations/{invitation['invitation_id']}",
+        headers=AUTH_HEADERS,
+    )
+    assert api.client.get(f"/a/{artifact_id}/guest", headers=guest).status_code == 401
+
+
+def test_guest_endpoint_follows_the_share_id_and_the_password_gate(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title", password="hunter2")
+    invitation = _invite(api, artifact_id, "Jana").json()
+    guest = _guest_headers(invitation["review_url"])
+    share_id = invitation["review_url"].split("/a/", 1)[1].split("/", 1)[0]
+
+    # An invitation grants a voice, not a way around the reader password.
+    assert api.client.get(f"/a/{share_id}/guest", headers=guest).status_code == 401
+    unlocked = {**guest, "X-Artifact-Password": "hunter2"}
+    assert api.client.get(f"/a/{share_id}/guest", headers=unlocked).status_code == 200
+
+    rotated = _rotate(api, artifact_id).json()["share_id"]
+    assert api.client.get(f"/a/{rotated}/guest", headers=unlocked).status_code == 200
+    assert api.client.get(f"/a/{share_id}/guest", headers=unlocked).status_code == 404
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — comment writes accept the share id as well as the internal id
+# --------------------------------------------------------------------------
+
+
+def test_comment_writes_accept_the_share_id_after_a_rotation(api: Api) -> None:
+    """The review UI and every capability-URL holder only know the share id."""
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    share_id = _rotate(api, artifact_id).json()["share_id"]
+    assert share_id != artifact_id
+
+    created = _comment(api, share_id, exact="Body text")
+    assert created.status_code == 201, created.text
+    thread_id = created.json()["id"]
+    # The thread belongs to the artifact, under its internal id.
+    assert created.json()["artifact_id"] == artifact_id
+
+    assert api.client.post(
+        f"/api/artifacts/{share_id}/comments/{thread_id}/replies",
+        json={"body": "Answering."},
+        headers=AUTH_HEADERS,
+    ).status_code == 201
+    assert api.client.post(
+        f"/api/artifacts/{share_id}/comments/{thread_id}/resolve", headers=AUTH_HEADERS
+    ).status_code == 200
+    assert api.client.delete(
+        f"/api/artifacts/{share_id}/comments/{thread_id}", headers=AUTH_HEADERS
+    ).status_code == 200
+
+    # The internal id keeps working throughout — this widens the door, not moves it.
+    assert _comment(api, artifact_id, exact="Body text").status_code == 201
+
+
+def test_a_rotated_away_share_id_cannot_be_commented_on(api: Api) -> None:
+    """Widening the path to share ids must not weaken what rotation revokes."""
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    stale = _rotate(api, artifact_id).json()["share_id"]
+    live = _rotate(api, artifact_id).json()["share_id"]
+
+    assert _comment(api, stale, exact="Body text").status_code == 404
+    assert _comment(api, live, exact="Body text").status_code == 201
+
+
+def test_guest_comments_through_the_share_id(api: Api) -> None:
+    """Exactly the path the review page takes: share id plus guest header."""
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
+    review_url = _invite(api, artifact_id, "Jana").json()["review_url"]
+    share_id = review_url.split("/a/", 1)[1].split("/", 1)[0]
+    guest = _guest_headers(review_url)
+
+    created = _guest_comment(api, share_id, guest)
+    assert created.status_code == 201, created.text
+    assert created.json()["author"] == {"kind": "guest", "name": "Jana"}
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — visual diff
+# --------------------------------------------------------------------------
+
+
+def _two_versions(api: Api) -> str:
+    artifact_id = _publish_markdown(api, "# Report\n\nFirst draft.\n")
+    assert _submit_version(api, artifact_id, "# Report\n\nSecond draft.\n").status_code == 201
+    return artifact_id
+
+
+def test_visual_diff_renders_two_sandboxed_frames(api: Api) -> None:
+    artifact_id = _two_versions(api)
+    resp = api.client.get(f"/a/{artifact_id}/diff/1..2?format=visual")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    page = resp.text
+
+    # Two panes, each in its own opaque origin: no allow-same-origin anywhere.
+    assert page.count('sandbox="allow-scripts allow-popups"') == 2
+    assert page.count("<iframe") == 2
+    assert "allow-same-origin" not in page
+    assert 'id="vd-older"' in page and 'id="vd-newer"' in page
+
+    # Version labels and the diff statistics from the ordinary diff.
+    assert "v1 &rarr; v2" in page or "v1 → v2" in page
+    assert "Visual diff" in page
+    assert "First draft" in page and "Second draft" in page
+    assert "ahd-scroll" in page
+
+
+def test_visual_diff_counts_agree_with_the_json_diff(api: Api) -> None:
+    artifact_id = _two_versions(api)
+    stats = api.client.get(f"/a/{artifact_id}/diff/1..2?format=json").json()["stats"]
+    page = api.client.get(f"/a/{artifact_id}/diff/1..2?format=visual").text
+    assert f'+{stats["added"]}' in page
+    assert f'-{stats["removed"]}' in page
+
+
+def test_visual_diff_refuses_an_oversized_side(api: Api, monkeypatch) -> None:
+    artifact_id = _two_versions(api)
+    monkeypatch.setattr(
+        main, "settings", dataclasses.replace(api.settings, diff_max_bytes=64)
+    )
+    resp = api.client.get(f"/a/{artifact_id}/diff/1..2?format=visual")
+    assert resp.status_code == 413
+    assert "too large" in resp.json()["error"]
+
+
+def test_visual_diff_hides_a_proposal_from_strangers(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Report\n\nFirst.\n", accept_versions=True)
+    proposed = _submit_version(
+        api, artifact_id, "# Report\n\nProposed.\n", headers=OTHER_AUTH_HEADERS
+    )
+    assert proposed.status_code == 201
+    number = proposed.json()["version"]
+
+    anonymous = api.client.get(f"/a/{artifact_id}/diff/1..{number}?format=visual")
+    assert anonymous.status_code == 403
+
+    # The owner and the proposal's author may both see it.
+    for headers in (AUTH_HEADERS, OTHER_AUTH_HEADERS):
+        allowed = api.client.get(
+            f"/a/{artifact_id}/diff/1..{number}?format=visual", headers=headers
+        )
+        assert allowed.status_code == 200, headers
+        assert "Proposed." in allowed.text
+
+
+def test_visual_diff_follows_the_share_id_and_rejects_unknown_formats(api: Api) -> None:
+    artifact_id = _two_versions(api)
+    share_id = _rotate(api, artifact_id).json()["share_id"]
+    assert api.client.get(f"/a/{share_id}/diff/1..2?format=visual").status_code == 200
+    assert api.client.get(f"/a/{artifact_id}/diff/1..2?format=visual").status_code == 404
+    assert api.client.get(f"/a/{share_id}/diff/1..2?format=nope").status_code == 400
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — the changelog is a page of this service, not a published artifact
+# --------------------------------------------------------------------------
+
+
+def test_changelog_uses_the_shell_design_system(api: Api) -> None:
+    resp = api.client.get("/changelog")
+    assert resp.status_code == 200
+    page = resp.text
+
+    # Shell chrome: the graph-paper grid, the mono/prose font pair and the
+    # footer every other service page carries.
+    assert 'class="changelog"' in page
+    assert "--font-mono" in page
+    assert "<footer>" in page
+    assert "/changelog.md" in page
+
+    # ...and none of the standalone artifact template.
+    assert "{{ARTIFACT_BODY}}" not in page
+    assert "hljs" not in page
+    assert "mermaid" not in page
+
+
+def test_changelog_titles_itself_from_the_file(api: Api) -> None:
+    """The document's own h1 becomes the hero — it is never rendered twice."""
+    resp = api.client.get("/changelog")
+    assert resp.text.count("<h1") == 1
+    assert "Changelog" in resp.text
+    # Release headings still render as content.
+    assert "<h2" in resp.text
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — the admin studio grew the new controls
+# --------------------------------------------------------------------------
+
+
+def test_admin_page_wires_up_the_new_controls(api: Api) -> None:
+    page = api.client.get("/admin").text
+
+    # Every new endpoint the studio drives.
+    for path in (
+        '"/stats"',
+        '"/rotate-link"',
+        '"/purge"',
+        '"/restore"',
+        '"/invitations"',
+    ):
+        assert path in page, path
+
+    # ...and the affordances that drive them.
+    for hook in (
+        "Rotate link",
+        "Trash",
+        "Restore",
+        "Purge",
+        "Type PURGE to confirm",
+        "webhooks",
+        "Invite",
+        "Revoke",
+        "Load stats",
+        "shown once",
+        "note-modal",
+        "trashed \\u00b7 link dead",
+    ):
+        assert hook in page, hook
+
+
+def test_review_page_supports_guest_mode(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Title")
+    page = api.client.get(f"/a/{artifact_id}/review").text
+
+    assert "#invite=" in page or "invite=" in page
+    assert "X-Artifact-Guest" in page
+    assert "rv-guest" in page
+    assert "Commenting as " in page
+    # The credential is read from the fragment and cleared from the address bar;
+    # it must never be appended to a URL.
+    assert "location.hash" in page
+    assert "replaceState" in page
+    assert '"/guest"' in page
+
+
+def test_context_documents_guests_and_the_visual_diff(api: Api) -> None:
+    body = api.client.get("/context").json()
+    paths = {(e["method"], e["path"]) for e in body["endpoints"]}
+    assert ("POST", "/api/artifacts/{id}/invitations") in paths
+    assert ("GET", "/a/{id}/guest") in paths
+
+    assert "X-Artifact-Guest" in body["auth"]["guest_header"]
+    assert "fragment" in body["guests"]["secret"]
+    assert "invitations/{iid}" in body["guests"]["revocation"]
+    assert "visual" in body["versioning"]["diff"]
+    assert body["limits"]["max_invitations_per_artifact"] == (
+        api.settings.max_invitations_per_artifact
+    )
+    assert "artifact.trashed" in body["webhooks"]["events"]

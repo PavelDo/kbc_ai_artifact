@@ -192,7 +192,7 @@ curl -s -X PUT "$HUB/api/artifacts/$ID" \
   -d '{"accept_versions_mode": "allowlist", "contributors": ["1234@connection.eu-central-1.keboola.com"], "comments_mode": "allowlist"}'
 ```
 
-### Update, delete, list (owner project only for update/delete)
+### Update, trash, restore, purge, list (owner project only)
 
 ```bash
 # Update — adds a new version, never overwrites
@@ -201,16 +201,30 @@ curl -s -X PUT "$HUB/api/artifacts/$ID" \
   -H "Content-Type: application/json" \
   -d '{"markdown": "# Updated title\n\nNew content."}'
 
-# Delete — irreversible, removes every version and the meta record
+# Trash — soft delete, reversible, kills the public link immediately
 curl -s -X DELETE "$HUB/api/artifacts/$ID" \
   -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu"
 
-# List your own project's artifacts
+# Restore — brings it back on the same URL
+curl -s -X POST "$HUB/api/artifacts/$ID/restore" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu"
+
+# Purge — permanent, no undo; removes every version, thread and the meta record
+curl -s -X DELETE "$HUB/api/artifacts/$ID/purge" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu"
+
+# List your own project's artifacts (trashed ones included, status "trashed")
 curl -s "$HUB/api/artifacts" \
   -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu"
 ```
 
 A `title` can only be set together with new content (422 if sent alone).
+
+**`DELETE /api/artifacts/{id}` is soft.** It moves the artifact to the trash:
+its public link answers 404 immediately, new versions/comments answer 409,
+but nothing is erased and `POST .../restore` undoes it on the same URL. Only
+`DELETE /api/artifacts/{id}/purge` is permanent — see *Behavioral rules*
+below for when to prefer which.
 
 ### Versioning
 
@@ -226,14 +240,19 @@ version's own author until promoted).
 | Other project | `false` (default) | **403** |
 | Other project | `true` | version added as **proposed** |
 
-**Submit a version:**
+**Submit a version — always include `base_version`:**
 
 ```bash
 curl -s -X POST "$HUB/api/artifacts/$ID/versions" \
   -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu" \
   -H "Content-Type: application/json" \
-  -d '{"markdown": "# Q3 review\n\nCorrected the revenue table.", "note": "fix Q3 totals"}'
+  -d '{"markdown": "# Q3 review\n\nCorrected the revenue table.", "note": "fix Q3 totals", "base_version": 3}'
 ```
+
+`base_version` is the version number you built this change against — read
+`head_version` from `GET /a/$ID/meta` (or `/versions`) right before you write,
+and send that number back here. See *Behavioral rules* for why this is not
+optional in practice.
 
 **List versions:**
 
@@ -241,6 +260,11 @@ curl -s -X POST "$HUB/api/artifacts/$ID/versions" \
 curl -s "$HUB/a/$ID/versions"                # JSON, newest first
 curl -s "$HUB/a/$ID/versions?format=html"    # human picker page
 ```
+
+Every *proposed* row carries `"outdated": true` when its `base_version` is no
+longer the head — the document moved on after that proposal was written.
+Re-check an outdated proposal against the current head before promoting or
+reviewing it; its own diff is against a base that no longer reflects reality.
 
 **Read one version** (send both auth headers if it's `proposed`):
 
@@ -254,10 +278,14 @@ curl -s "$HUB/a/$ID/v/2" -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack
 curl -s "$HUB/a/$ID/diff/1..2"                  # side-by-side HTML (default)
 curl -s "$HUB/a/$ID/diff/1..2?format=unified"   # unified text — best for you to read
 curl -s "$HUB/a/$ID/diff/1..2?format=json"      # unified diff + add/remove line counts
+curl -s "$HUB/a/$ID/diff/1..2?format=visual"    # the two rendered pages side by side
 ```
 
-Always fetch and read the diff before promoting or rejecting a proposal —
-never promote blind.
+`format=visual` renders what a reader actually *sees* rather than the
+underlying source — reach for it when a change is visual (layout, styling, a
+chart) and a text diff would not show what changed. Always fetch and read a
+diff (text or visual) before promoting or rejecting a proposal — never promote
+blind.
 
 **Promote a proposal (owner only, irreversible — confirm with the user first):**
 
@@ -298,6 +326,32 @@ Owner only; the pinned version must exist and be live (422 otherwise).
 
 **Toggle `accept_versions`** — same `PUT /api/artifacts/{id}` shown above, in
 the body: `{"accept_versions": true|false}`.
+
+### Rotate the public link (owner only — warn before running)
+
+```bash
+curl -s -X POST "$HUB/api/artifacts/$ID/rotate-link" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu"
+```
+
+Mints a fresh share id; **the old link stops resolving immediately**, for
+everyone, with no grace period and no way to un-rotate. This is how the user
+revokes a URL sent to the wrong place. Response carries the new `share_id`
+and every URL rebuilt from it, plus the now-dead `previous_share_id`. Always
+confirm with the user before calling this (see *Behavioral rules*), and
+remind them to reshare the new link with everyone who should keep access.
+
+### View statistics (owner only)
+
+```bash
+curl -s "$HUB/api/artifacts/$ID/stats" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu"
+```
+
+Returns `total`, `by_kind` (`page`/`raw`/`source`/`version`), and `by_day` for
+the last 30 UTC days. No reader identity or address is ever recorded — this is
+traffic volume only. Use it when the user asks "is anyone actually reading
+this?"
 
 ### Inline comments
 
@@ -351,6 +405,86 @@ never see the reviewer's Storage token (same `sessionStorage` pattern as
 `/admin`). Hand this link to a human reviewer instead of asking them to run
 the curl commands above.
 
+### Guest invitations — for reviewers with no Keboola account
+
+When the user wants feedback from someone who will never have a Storage
+token — a client, an external reviewer — invite them by name instead of
+trying to get them a Keboola account:
+
+```bash
+curl -s -X POST "$HUB/api/artifacts/$ID/invitations" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Jana (legal)"}'
+```
+
+Response carries a one-time `review_url` ending in
+`#invite=<invitation_id>.<secret>`. **This is the only time the secret is
+ever shown** — it is hashed on the hub's side the instant this call returns
+and cannot be recovered afterward. Hand the whole `review_url` to the named
+person directly (chat, email) and tell them to just open it — no sign-in, no
+account, the review page recognizes the link on its own. See *Behavioral
+rules* for how to relay this safely.
+
+A guest can open threads, reply, and resolve/delete only threads they opened
+themselves — nothing else (no versions, no other `/api/*` call). List and
+revoke like this:
+
+```bash
+curl -s "$HUB/api/artifacts/$ID/invitations" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu"
+
+curl -s -X DELETE "$HUB/api/artifacts/$ID/invitations/<invitation_id>" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu"
+```
+
+Revoking is per person and instant — everyone else's invitation keeps
+working. Up to `HUB_MAX_INVITATIONS_PER_ARTIFACT` (default 20) live
+invitations per artifact.
+
+### Webhooks — Slack or a generic endpoint on every event
+
+Register push notifications instead of asking the user to keep checking back:
+
+```bash
+curl -s -X PUT "$HUB/api/artifacts/$ID" \
+  -H "X-StorageApi-Token: $KBC_TOKEN" -H "X-Storage-Stack: eu" \
+  -H "Content-Type: application/json" \
+  -d '{"webhooks": ["https://hooks.slack.com/services/T000/B000/XXXX"]}'
+```
+
+`webhooks` replaces the whole list (`[]` clears it, omit to leave unchanged);
+each URL must be `https` and must not resolve to a private/internal address
+(422 otherwise, with the reason). Up to `HUB_MAX_WEBHOOKS_PER_ARTIFACT`
+(default 5) per artifact. A `hooks.slack.com` URL gets a formatted one-line
+Slack message; any other URL gets the generic signed JSON envelope. Fired on:
+`version.published`, `version.proposed`, `version.promoted`,
+`comment.created`, `comment.replied`, `artifact.finalized`,
+`artifact.trashed`, `artifact.restored`, `link.rotated`.
+
+**Verifying a delivery's signature** (skip for Slack — it has no signature
+header): every non-Slack POST carries
+`X-Hub-Signature-256: sha256=<hex>`, an HMAC-SHA256 of the exact request body
+bytes keyed with the hub's `HUB_SECRET_KEY`. If you are ever the one
+implementing or debugging a receiver:
+
+```python
+import hashlib, hmac
+
+def verify(body: bytes, header_value: str, secret: str) -> bool:
+    expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, header_value)
+```
+
+Always compare with a constant-time function (`hmac.compare_digest` or your
+language's equivalent) against the *raw* body bytes, never a re-serialized
+copy of the JSON. Webhook URLs are themselves credentials (a Slack hook's path
+is its only secret): `GET /api/artifacts` reports a `webhooks_count`, never
+the URLs — only the `PUT` response that set them ever echoes them back.
+Delivery is best-effort and in-memory (a hub restart drops what was pending,
+retried up to `HUB_WEBHOOK_MAX_ATTEMPTS` times) — treat it as a nudge to go
+check `/versions` or `/comments`, never as the system of record.
+
 ### Export
 
 ```bash
@@ -379,15 +513,23 @@ artifact is marked `final`, as the permanent archived record of the review.
 | `GET /a/{id}/source` | Original submitted source (markdown or html) |
 | `GET /a/{id}/meta` | JSON metadata: title, timestamps, head version, version counts, content type, `accept_versions_mode`, `contributors`, `comments_mode`, `status` |
 | `GET /a/{id}/v/{n}` | One specific version |
-| `GET /a/{id}/versions` | Version history |
-| `GET /a/{id}/diff/{a}..{b}` | Diff of two versions |
+| `GET /a/{id}/versions` | Version history, proposed rows flagged `outdated` when stale |
+| `GET /a/{id}/diff/{a}..{b}` | Diff of two versions (`?format=html\|unified\|json\|visual`) |
 | `GET /a/{id}/comments` | Every inline comment thread, open and resolved |
-| `GET /a/{id}/review` | Browser review UI (select text to comment, sandboxed artifact) |
+| `GET /a/{id}/guest` | Resolve an `X-Artifact-Guest` credential to its display name |
+| `GET /a/{id}/review` | Browser review UI (select text to comment, sandboxed artifact; also the guest entry point) |
 | `GET /a/{id}/export/markdown` | Head version's Markdown source (or HTML) |
 | `GET /a/{id}/export/vault` | ZIP of a ready-to-open Obsidian vault |
+| `GET /changelog` | Rendered changelog, hub's own design |
 
 If password-protected, send `X-Artifact-Password: <password>` on these; a
-browser gets an HTML unlock form instead.
+browser gets an HTML unlock form instead. `/a/{id}` and `/a/{id}/v/{n}` serve
+the document inside a sandboxed iframe rather than the hub's own origin — use
+`/a/{id}/raw` when you need the exact bytes with nothing to unwrap.
+
+`GET /api/artifacts/{id}/stats` and every `/invitations` route are
+authenticated and owner-only — see *Rotate the public link* / *View
+statistics* and *Guest invitations* above, not this public table.
 
 ### The `/admin` moderation studio — hand this to the human
 
@@ -427,10 +569,11 @@ the loop below rather than jumping straight to a new version.
    step 6), `accept_versions_mode`/`comments_mode` (know before you try
    whether you're even allowed to contribute), and who owns it.
    `versions` shows what has already been proposed or promoted, including
-   proposals still awaiting the owner. `comments` shows what other
-   contributors already asked, flagged, or resolved. Skipping this step means
-   you risk re-raising a point someone already made, or missing a question
-   that was addressed directly to your area of expertise.
+   proposals still awaiting the owner — note its `head_version`, you need it
+   next. `comments` shows what other contributors already asked, flagged, or
+   resolved. Skipping this step means you risk re-raising a point someone
+   already made, or missing a question that was addressed directly to your
+   area of expertise.
 
 2. **Do your research locally.** Read the served document (`GET /a/{id}` or
    `/raw`), any specific version under discussion (`GET /a/{id}/v/{n}`), and
@@ -447,6 +590,9 @@ the loop below rather than jumping straight to a new version.
      with a `note` explaining what changed and why (`POST
      /api/artifacts/{id}/versions`). A vague note like "updates" is not
      enough — write what a reviewer needs to decide whether to promote it.
+     **Always send `base_version`** set to the `head_version` you read in
+     step 1 — this is what lets the owner see, in `/versions`, whether your
+     proposal is still current or `outdated` by the time they get to it.
 
 4. **Reply to threads addressed to your point.** Before opening a new thread,
    check whether an existing open thread already covers the same ground —
@@ -459,6 +605,17 @@ the loop below rather than jumping straight to a new version.
    sidebar of threads) and `$HUB/admin` if they own the artifact and need to
    promote/reject proposals or change `status`/`comments_mode`. Don't
    describe the UI to them over chat — give them the link.
+
+   - **If the owner keeps asking "did anything change?"**, offer to register
+     a Slack webhook once instead of them checking back: `PUT
+     /api/artifacts/{id}` with `{"webhooks": ["https://hooks.slack.com/..."]}`
+     (see *Webhooks* above). From then on every proposal, promotion, comment
+     and reply posts to that channel on its own.
+   - **If a reviewer has no Keboola account** (a client, an external
+     stakeholder), invite them by name instead of trying to get them one:
+     `POST /api/artifacts/{id}/invitations` with `{"name": "their name"}`,
+     then hand them the returned `review_url` directly — see *Guest
+     invitations* above and the confirmation rule below.
 
 6. **When the owner marks it `final`, the conversation is over — archive it.**
    A `"final"` `status` means new versions and comments are frozen for
@@ -478,14 +635,14 @@ the loop below rather than jumping straight to a new version.
 | Status | Meaning |
 |---|---|
 | 400 | Unknown/disallowed `X-Storage-Stack`, malformed diff spec, unknown diff `format` |
-| 401 | Storage token rejected by the stack, or wrong artifact password |
-| 403 | Token valid but not the owning project (update/delete/promote/head); artifact doesn't accept versions from other projects; reading a proposal you didn't author; or comments are `"off"` / you're not on the `contributors` allowlist |
-| 404 | Unknown artifact id (same response whether never-existed or deleted), or no such version or comment thread |
-| 409 | Promoting an already-live version; deleting the only live version; submitting a version or comment while `status` is `"final"`; or resolving/reopening a thread already in that state |
-| 413 | Built HTML over the size limit, or a diff side over the configured limit |
-| 422 | Build failure (bad git repo, no entry file, markdown render error), `git_token`/`git_username` without `git_url`, `title` without content, or pinning to a version that doesn't exist or isn't live |
-| 429 | Daily version-submission cap reached for this project on this artifact, or the daily `HUB_MAX_COMMENTS_PER_DAY` comment cap |
-| 502 | The Keboola stack itself was unreachable to verify the token |
+| 401 | Storage token rejected by the stack, wrong artifact password, or a bad `X-Artifact-Guest` credential (unknown, revoked and malformed all look identical on purpose) |
+| 403 | Token valid but not the owning project (update/trash/restore/purge/rotate-link/stats/invitations/promote/head); artifact doesn't accept versions from other projects; reading a proposal you didn't author; or comments are `"off"` / you're not on the `contributors` allowlist |
+| 404 | Unknown artifact id (same response whether never-existed, purged, or its link was rotated away), or no such version, comment thread, or invitation |
+| 409 | Promoting an already-live version; deleting the only live version; submitting a version, comment or invitation while `status` is `"final"` or the artifact is trashed (message says which, and the fix — reopen vs. restore); resolving/reopening a thread already in that state; or restoring something not in the trash |
+| 413 | Built HTML over the size limit, or a diff side over the configured limit (for `format=visual`, the larger rendered side) |
+| 422 | Build failure (bad git repo, no entry file, markdown render error), `git_token`/`git_username` without `git_url`, `title` without content, pinning to a version that doesn't exist or isn't live, a `base_version` naming a version that doesn't exist, a bad/blocked/excess webhook URL, or a bad/excess invitation name |
+| 429 | Daily version-submission cap reached for this project on this artifact, the daily `HUB_MAX_COMMENTS_PER_DAY` comment cap (per project or per guest), or too many wrong unlock-password attempts this hour |
+| 502 | The Keboola stack itself was unreachable to verify the token, or the hub's own Storage is unavailable |
 
 On any of these, report the status and meaning to the user in plain language
 rather than retrying blindly — retrying will not fix a 401/403/422.
@@ -497,6 +654,8 @@ rather than retrying blindly — retrying will not fix a 401/403/422.
   non-pinned versions are pruned automatically. Proposals are never pruned.
 - At most **20 versions per contributing project per artifact per UTC day**
   (429 past that).
+- At most **5 webhooks** and **20 live guest invitations** per artifact
+  (`HUB_MAX_WEBHOOKS_PER_ARTIFACT`, `HUB_MAX_INVITATIONS_PER_ARTIFACT`).
 
 ## Authoring content
 
@@ -522,10 +681,39 @@ When you generate the content to publish yourself:
 ## Behavioral rules
 
 - **Confirm before any irreversible or content-publishing action**: `DELETE`
-  of an artifact or version, `promote`, and any first-time publish of
-  something the user hasn't explicitly said to publish. A quick "publishing
-  X as a public URL — go ahead?" is enough; don't re-confirm routine reads or
-  version listings.
+  (trash) of an artifact, `DELETE .../purge`, `DELETE` of a version,
+  `rotate-link`, `promote`, and any first-time publish of something the user
+  hasn't explicitly said to publish. A quick "publishing X as a public URL —
+  go ahead?" is enough; don't re-confirm routine reads or version listings.
+- **Prefer trash over purge.** `DELETE /api/artifacts/{id}` is reversible
+  (`.../restore` undoes it); `DELETE /api/artifacts/{id}/purge` is not, and
+  erases everything for good. Default to trashing when the user says
+  "delete this" — only purge when they specifically say permanent, forever,
+  or confirm it after you explain there is no undo.
+- **Always warn before `rotate-link`.** State plainly, before calling it,
+  that the *current* link will stop working for absolutely everyone the
+  instant the call succeeds, with no grace period and no way back — including
+  people who should keep access. Get an explicit go-ahead, then immediately
+  hand back the new URLs from the response and remind the user to reshare
+  them with anyone who still needs access.
+- **Always send `base_version`** on `POST /api/artifacts/{id}/versions` when
+  you have a specific version you started from — read `head_version` first
+  (`GET /a/{id}/meta` or `/versions`) and pass that number. This is what
+  drives the `outdated` flag the owner relies on; skipping it when you do
+  know the base is not a shortcut, it just removes a safety check for no
+  reason.
+- **Handing a human a guest invite is a one-shot, sensitive action.** The
+  `review_url` from `POST /api/artifacts/{id}/invitations` contains a secret
+  that can never be shown again — treat it like a password reset link: send
+  it directly to the named person (or hand it to the user to forward), don't
+  paste it into a group channel or a document, and don't log it. If it gets
+  lost, the fix is revoke-and-reinvite, not trying to recover it.
+- **Verify webhook signatures before trusting a delivery**, if you are ever
+  the one consuming them: recompute `X-Hub-Signature-256` over the raw body
+  with `HUB_SECRET_KEY` and compare with a constant-time function (see
+  *Webhooks* above). Never treat an unsigned or mismatched delivery as
+  genuine, and never treat a webhook as the source of truth — it is a nudge
+  to go read `/versions` or `/comments`, which are.
 - **Artifact URLs are capabilities.** Before publishing anything that looks
   sensitive (internal data, credentials-adjacent content, anything the user
   wouldn't want to leak if the link were forwarded), say so and suggest a
@@ -533,7 +721,8 @@ When you generate the content to publish yourself:
 - **Never publish secrets** in the content itself — a password protects the
   URL, not what's inside it.
 - **Review diffs before promoting or rejecting** a proposal — never act on a
-  proposal you haven't read.
+  proposal you haven't read. An `outdated` proposal deserves a fresh look at
+  the current head, not just its own (stale) diff.
 - **After every successful publish or version submission, report back:** the
   artifact `id`, the human `url`, the `raw_url`, and the `meta_url` (and the
   version's own `url` for a version submission). The user needs these to

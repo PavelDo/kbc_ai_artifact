@@ -85,6 +85,33 @@ class Settings:
     # HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR). Each attempt costs a full PBKDF2
     # verification, so this bounds both brute force and the CPU it can burn.
     max_unlock_attempts_per_hour: int = 30
+    # Operational state sidecar (phase 4, src/statedb.py)
+    # Seconds between SQLite snapshots into the host project's Storage Files
+    # (env HUB_STATE_SNAPSHOT_INTERVAL_S). 0 disables the background thread and
+    # leaves snapshots to explicit calls — what the tests use.
+    state_snapshot_interval_s: int = 300
+    # Largest state snapshot the hub will upload or restore
+    # (env HUB_STATE_MAX_SNAPSHOT_BYTES). 0 disables the bound. An oversized
+    # snapshot is skipped with a warning rather than restored.
+    state_max_snapshot_bytes: int = 50 * 1024 * 1024
+    # File name of the SQLite sidecar; main.py joins it with cache_dir, which is
+    # the only writable (and ephemeral) path the container has.
+    state_db_filename: str = "state.sqlite3"
+    # Outbound webhooks (phase 4, src/webhooks.py)
+    # Per-request HTTP timeout for a webhook delivery (HUB_WEBHOOK_TIMEOUT_S).
+    webhook_timeout_s: int = 10
+    # Total POST attempts per (url, event) before giving up
+    # (HUB_WEBHOOK_MAX_ATTEMPTS); retries back off 2**n seconds, capped at 60.
+    webhook_max_attempts: int = 3
+    # How many webhook URLs one artifact may register
+    # (HUB_MAX_WEBHOOKS_PER_ARTIFACT).
+    max_webhooks_per_artifact: int = 5
+    # Guest invitations (0.7.0)
+    # How many invitations one artifact may hold at once
+    # (HUB_MAX_INVITATIONS_PER_ARTIFACT). Each entry is a named capability
+    # stored in the artifact's meta record, so this bounds both the meta file
+    # and the number of people who can comment without a Keboola account.
+    max_invitations_per_artifact: int = 20
 
 
 def load_settings() -> Settings:
@@ -132,5 +159,18 @@ def load_settings() -> Settings:
         trust_forwarded_headers=_bool_env("HUB_TRUST_FORWARDED_HEADERS", False),
         max_unlock_attempts_per_hour=_int_env(
             "HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR", 30
+        ),
+        state_snapshot_interval_s=_int_env("HUB_STATE_SNAPSHOT_INTERVAL_S", 300),
+        state_max_snapshot_bytes=_int_env(
+            "HUB_STATE_MAX_SNAPSHOT_BYTES", 50 * 1024 * 1024
+        ),
+        state_db_filename=(
+            os.environ.get("HUB_STATE_DB_FILENAME", "").strip() or "state.sqlite3"
+        ),
+        webhook_timeout_s=_int_env("HUB_WEBHOOK_TIMEOUT_S", 10),
+        webhook_max_attempts=_int_env("HUB_WEBHOOK_MAX_ATTEMPTS", 3),
+        max_webhooks_per_artifact=_int_env("HUB_MAX_WEBHOOKS_PER_ARTIFACT", 5),
+        max_invitations_per_artifact=_int_env(
+            "HUB_MAX_INVITATIONS_PER_ARTIFACT", 20
         ),
     )

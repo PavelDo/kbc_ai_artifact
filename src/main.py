@@ -62,17 +62,26 @@ from src.auth import (
     verify_token,
 )
 from src.builder import BuildError, BuiltArtifact
-from src.comments import CommentStore, CommentThread, Reply, Selector
+from src.comments import (
+    CommentStore,
+    CommentThread,
+    Reply,
+    Selector,
+    author_key_of,
+    guest_author,
+)
 from src.config import Settings, load_settings
 from src.diff import DiffError, compute_diff
 from src.kbc import BackendError, KbcFilesBackend
 from src.pages import (
     admin_page,
     artifact_frame_page,
+    changelog_page,
     landing_page,
     review_page,
     unlock_page,
     versions_page,
+    visual_diff_page,
 )
 from src.security import (
     CookieSigner,
@@ -80,10 +89,12 @@ from src.security import (
     hash_password,
     new_artifact_id,
 )
+from src.statedb import StateDB
 from src.store import (
     ACCEPT_MODES,
     ARTIFACT_DRAFT,
-    ARTIFACT_STATUSES,
+    ARTIFACT_FINAL,
+    ARTIFACT_SETTABLE_STATUSES,
     COMMENTS_MODES,
     HEAD_LATEST,
     HEAD_PINNED,
@@ -94,6 +105,7 @@ from src.store import (
     Envelope,
     tag_for_id,
 )
+from src.webhooks import WebhookDispatcher, WebhookEvent, validate_webhook_url
 
 SERVICE_NAME = "kbc-artifact-hub"
 
@@ -134,6 +146,15 @@ MAX_CONTRIBUTORS = 50
 #: typo becomes a 422 instead of an entry that can never match anybody.
 _CONTRIBUTOR_KEY = re.compile(r"^[0-9]+@[A-Za-z0-9._-]+$")
 
+#: Longest display name an invitation may carry.
+MAX_INVITATION_NAME_CHARS = 80
+
+#: Header carrying a guest's invitation credential, ``{invitation_id}.{secret}``.
+#: The secret half rides the *fragment* of the review URL and is only ever put
+#: in this header — never in a path, a query string or a cookie — so it stays
+#: out of access logs, referrers and browser history on the server side.
+GUEST_HEADER = "X-Artifact-Guest"
+
 # --------------------------------------------------------------------------
 # OpenAPI documentation constants
 #
@@ -141,10 +162,26 @@ _CONTRIBUTOR_KEY = re.compile(r"^[0-9]+@[A-Za-z0-9._-]+$")
 # stays one edit and no operation can quietly ship an undescribed parameter.
 # --------------------------------------------------------------------------
 
-#: Description attached to every ``artifact_id`` path parameter.
+#: Description attached to every ``artifact_id`` path parameter of an
+#: authenticated ``/api/*`` route: the *internal* handle, which never changes.
 ARTIFACT_ID_DESC = (
-    "Artifact identifier from the publish response — the capability part of "
-    "the URL. Unguessable by design; there is no public listing."
+    "Internal artifact identifier from the publish response ('id'). Stable for "
+    "the life of the artifact and unaffected by link rotation, so it stays the "
+    "handle for every authenticated operation. Unguessable by design; there is "
+    "no public listing."
+)
+
+#: Description attached to the identifier in every public ``/a/{...}`` route.
+#: The parameter is still *named* ``artifact_id`` (it identifies an artifact,
+#: and renaming it would churn every documented path), but what belongs there
+#: is the **share id**.
+SHARE_ID_DESC = (
+    "Public share identifier of the artifact — the capability part of the URL, "
+    "as returned in 'share_id' and in every '*_url' field. Equal to the "
+    "internal artifact id until the owner rotates the link with POST "
+    "/api/artifacts/{id}/rotate-link, after which only the new share id "
+    "resolves here and the old one (and the bare artifact id) answer 404. "
+    "Unguessable by design; there is no public listing."
 )
 
 #: Description attached to every ``version`` path parameter.
@@ -157,6 +194,26 @@ VERSION_DESC = (
 THREAD_ID_DESC = (
     "Comment thread identifier, as returned by POST "
     "/api/artifacts/{id}/comments and listed by GET /a/{id}/comments."
+)
+
+#: Description of the identifier in the path of a comment *write*. These four
+#: routes are the only ones that accept either half of the identity pair,
+#: because the review UI and everyone holding a capability URL know an artifact
+#: by its share id, while agents and owners address it by the internal one.
+COMMENT_TARGET_ID_DESC = (
+    "Either identifier of the artifact: the internal id from the publish "
+    "response, or the public share id that appears in its /a/{...} URLs. The "
+    "internal id is tried first; a share id that has been rotated away no "
+    "longer resolves, and neither does the bare artifact id of an artifact "
+    "whose link was rotated."
+)
+
+#: Description attached to every ``invitation_id`` path parameter.
+INVITATION_ID_DESC = (
+    "Invitation identifier, as returned by POST "
+    "/api/artifacts/{id}/invitations and listed by GET "
+    "/api/artifacts/{id}/invitations. This is the half of the invitation "
+    "credential that is *not* secret."
 )
 
 #: Description of the ``spec`` path parameter of the diff endpoint.
@@ -175,8 +232,46 @@ PASSWORD_GATE_NOTE = (
     "client address, so a wrong password may answer 429 instead of 401."
 )
 
+#: Paragraph appended to every comment-write route: the guest alternative.
+GUEST_WRITE_NOTE = (
+    "**Guests.** Instead of a Storage token, this route also accepts a guest "
+    "invitation in the X-Artifact-Guest header, shaped "
+    "'{invitation_id}.{secret}' — what the #invite= fragment of an invitation "
+    "review URL carries. A guest is one invited human without a Keboola "
+    "account: they may open threads, reply, and resolve or delete threads "
+    "they opened themselves, and nothing else. 'comments_mode' does not gate "
+    "them (the invitation is the grant, and the owner issued it), but a final "
+    "or trashed artifact freezes them like everybody else, and they draw on "
+    "the same daily comment budget, counted per invitation. Their comments "
+    "are published as {'kind': 'guest', 'name': ...} — the invitation id "
+    "never appears in a public response."
+)
+
+#: Paragraph appended to every comment-write route: which id the path takes.
+COMMENT_TARGET_NOTE = (
+    "**Either identifier works in the path** on this route, unlike the rest of "
+    "/api/*: the internal artifact id (tried first) or the public share id "
+    "that /a/{...} URLs carry. Capability-URL holders, the review UI and "
+    "invited guests only ever saw the share id, so refusing it here would "
+    "make them unable to address the artifact they are looking at."
+)
+
 #: Reused ``responses`` entries, so the same failure never gets two wordings.
 RESP_STACK_400 = {"description": "Unknown or disallowed X-Storage-Stack value."}
+RESP_COMMENT_401 = {
+    "description": (
+        "Storage token missing or rejected by the stack — or, when an "
+        "X-Artifact-Guest header was sent, an invitation that is unknown to "
+        "this artifact, revoked, or whose secret does not verify. The three "
+        "guest cases are deliberately indistinguishable."
+    )
+}
+RESP_COMMENTS_429 = {
+    "description": (
+        "This project — or this invitation — reached "
+        "HUB_MAX_COMMENTS_PER_DAY comments and replies on this artifact today."
+    )
+}
 RESP_TOKEN_401 = {"description": "Storage token missing or rejected by the stack."}
 RESP_STACK_502 = {
     "description": (
@@ -207,9 +302,16 @@ RESP_THREAD_404 = {
 }
 RESP_FINAL_409 = {
     "description": (
-        "The artifact's status is 'final', which freezes new versions and new "
-        "comments for everyone. Its owner can reopen it with PUT "
-        "/api/artifacts/{id} and {\"status\": \"draft\"}."
+        "The artifact is frozen, so this write is refused. Either its status "
+        "is 'final' (error 'document is final'; the owner reopens it with PUT "
+        "/api/artifacts/{id} and {\"status\": \"draft\"}) or it is in the "
+        "trash (error 'document is trashed'; the owner brings it back with "
+        "POST /api/artifacts/{id}/restore)."
+    )
+}
+RESP_OWNER_403 = {
+    "description": (
+        "Token is valid but not from the project that owns this artifact."
     )
 }
 
@@ -292,23 +394,36 @@ settings: Settings = load_settings()
 #: Storage at once after a failed startup hydration.
 _hydrate_lock = threading.Lock()
 
-#: Per-contributor version-submission counters, ``{(id, key, UTC day): count}``.
-#: In-memory and therefore per-replica — a soft cap against accidental floods,
-#: not a security control.
-_submission_counts: dict[tuple[str, str, str], int] = {}
-_submission_lock = threading.Lock()
+# --------------------------------------------------------------------------
+# Rate-limit counters
+#
+# Since 0.7.0 every counter lives in the SQLite sidecar (``src.statedb``), which
+# snapshots itself into Storage Files: a redeploy no longer hands everybody a
+# fresh daily budget. The three scopes and their key conventions are fixed by
+# statedb's contract:
+#
+#   scope "submissions"     key "{artifact_id}:{contributor_key}"  bucket UTC day
+#   scope "comments"        key "{artifact_id}:{contributor_key}"  bucket UTC day
+#   scope "unlock_failures" key "{artifact_id}:{client_ip}"        bucket UTC hour
+#
+# The key always starts with the *internal* artifact id, which is what
+# ``StateDB.forget_artifact`` purges by — so purging an artifact takes its
+# counters with it.
+#
+# The dicts below are a fallback for the window where no StateDB is attached to
+# the app (an unstarted app object, or a Storage failure that made the sidecar
+# unusable). Limits must keep being enforced then, so the counters degrade to
+# the pre-0.7.0 per-process behavior rather than to "no limit at all".
+# --------------------------------------------------------------------------
 
-#: The same, for inline comments (threads and replies alike).
-_comment_counts: dict[tuple[str, str, str], int] = {}
-_comment_lock = threading.Lock()
+COUNTER_SUBMISSIONS = "submissions"
+COUNTER_COMMENTS = "comments"
+COUNTER_UNLOCK_FAILURES = "unlock_failures"
 
-#: Failed unlock attempts, ``{(artifact id, client ip, UTC hour): count}``.
-#: Only *failures* are counted, and the hour in the key makes the window reset
-#: itself. In-memory and therefore per-replica, like the counters above.
-_unlock_failures: dict[tuple[str, str, str], int] = {}
-_unlock_lock = threading.Lock()
+_fallback_counts: dict[tuple[str, str, str], int] = {}
+_fallback_lock = threading.Lock()
 
-#: Above this many live buckets, stale days are swept on the next submission.
+#: Above this many live fallback buckets, stale ones are swept on the next bump.
 _SUBMISSION_SWEEP_AT = 1000
 
 
@@ -327,55 +442,101 @@ def _utc_hour() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
 
 
+def _counter_key(artifact_id: str, who: str) -> str:
+    """Counter key: the internal artifact id first, so purging can find it."""
+    return f"{artifact_id}:{who}"
+
+
+def _statedb(app_obj: FastAPI | None) -> StateDB | None:
+    """The app's state sidecar, or None when there is none to use."""
+    if app_obj is None:
+        return None
+    return getattr(app_obj.state, "statedb", None)
+
+
+def _fallback_bump(scope: str, key: str, bucket: str) -> int:
+    """Per-process counter used when the state sidecar is unavailable."""
+    entry = (scope, key, bucket)
+    with _fallback_lock:
+        if len(_fallback_counts) > _SUBMISSION_SWEEP_AT:
+            for stale in [k for k in _fallback_counts if k[2] != bucket]:
+                del _fallback_counts[stale]
+        value = _fallback_counts.get(entry, 0) + 1
+        _fallback_counts[entry] = value
+        return value
+
+
+def _bump_counter(app_obj: FastAPI | None, scope: str, key: str, bucket: str) -> int:
+    """Add one to a counter and return its new value, sidecar or fallback."""
+    database = _statedb(app_obj)
+    if database is not None:
+        try:
+            return database.bump(scope, key, bucket)
+        except Exception as exc:  # noqa: BLE001 - a limit must survive a bad DB
+            logger.warning("State counter bump failed (%s/%s): %s", scope, key, exc)
+    return _fallback_bump(scope, key, bucket)
+
+
+def _read_counter(app_obj: FastAPI | None, scope: str, key: str, bucket: str) -> int:
+    """Current value of a counter, sidecar or fallback."""
+    database = _statedb(app_obj)
+    if database is not None:
+        try:
+            return database.count(scope, key, bucket)
+        except Exception as exc:  # noqa: BLE001 - a limit must survive a bad DB
+            logger.warning("State counter read failed (%s/%s): %s", scope, key, exc)
+    with _fallback_lock:
+        return _fallback_counts.get((scope, key, bucket), 0)
+
+
 def _claim_slot(
-    counts: dict[tuple[str, str, str], int],
-    lock: threading.Lock,
+    app_obj: FastAPI | None,
+    scope: str,
     artifact_id: str,
     contributor_key: str,
     limit: int,
 ) -> bool:
     """Count one write against a per-(artifact, project, UTC day) bucket.
 
-    Returns False when the bucket is exhausted. The counters are in-memory and
-    therefore per-replica — a soft cap against accidental floods, not a
-    security control.
+    Returns False when the bucket is exhausted. The bump happens either way —
+    a caller who keeps hammering a spent budget keeps being counted, which is
+    what makes the window self-limiting rather than a retry loop.
     """
-    day = _utc_day()
-    bucket = (artifact_id, contributor_key, day)
-    with lock:
-        if len(counts) > _SUBMISSION_SWEEP_AT:
-            for stale in [key for key in counts if key[2] != day]:
-                del counts[stale]
-        count = counts.get(bucket, 0)
-        if count >= limit:
-            return False
-        counts[bucket] = count + 1
-        return True
+    used = _bump_counter(
+        app_obj, scope, _counter_key(artifact_id, contributor_key), _utc_day()
+    )
+    return used <= limit
 
 
-def _claim_submission_slot(artifact_id: str, contributor_key: str) -> bool:
+def _claim_submission_slot(
+    app_obj: FastAPI | None, artifact_id: str, contributor_key: str
+) -> bool:
     """Count one version submission; False when the daily cap is exhausted."""
     return _claim_slot(
-        _submission_counts,
-        _submission_lock,
+        app_obj,
+        COUNTER_SUBMISSIONS,
         artifact_id,
         contributor_key,
         settings.max_versions_per_day,
     )
 
 
-def _claim_comment_slot(artifact_id: str, contributor_key: str) -> bool:
+def _claim_comment_slot(
+    app_obj: FastAPI | None, artifact_id: str, contributor_key: str
+) -> bool:
     """Count one comment or reply; False when the daily cap is exhausted."""
     return _claim_slot(
-        _comment_counts,
-        _comment_lock,
+        app_obj,
+        COUNTER_COMMENTS,
         artifact_id,
         contributor_key,
         settings.max_comments_per_day,
     )
 
 
-def _unlock_throttled(artifact_id: str, client_ip: str) -> bool:
+def _unlock_throttled(
+    app_obj: FastAPI | None, artifact_id: str, client_ip: str
+) -> bool:
     """True when this (artifact, client) burnt its failed-attempt budget.
 
     Verifying an artifact password runs a full PBKDF2 (200k iterations), so an
@@ -384,20 +545,40 @@ def _unlock_throttled(artifact_id: str, client_ip: str) -> bool:
     password correctly is never affected, and the hour in the bucket key makes
     the window reset on its own.
     """
-    with _unlock_lock:
-        count = _unlock_failures.get((artifact_id, client_ip, _utc_hour()), 0)
+    count = _read_counter(
+        app_obj,
+        COUNTER_UNLOCK_FAILURES,
+        _counter_key(artifact_id, client_ip),
+        _utc_hour(),
+    )
     return count >= settings.max_unlock_attempts_per_hour
 
 
-def _record_unlock_failure(artifact_id: str, client_ip: str) -> None:
+def _record_unlock_failure(
+    app_obj: FastAPI | None, artifact_id: str, client_ip: str
+) -> None:
     """Count one *failed* password attempt against the hourly budget."""
-    hour = _utc_hour()
-    bucket = (artifact_id, client_ip, hour)
-    with _unlock_lock:
-        if len(_unlock_failures) > _SUBMISSION_SWEEP_AT:
-            for stale in [key for key in _unlock_failures if key[2] != hour]:
-                del _unlock_failures[stale]
-        _unlock_failures[bucket] = _unlock_failures.get(bucket, 0) + 1
+    _bump_counter(
+        app_obj,
+        COUNTER_UNLOCK_FAILURES,
+        _counter_key(artifact_id, client_ip),
+        _utc_hour(),
+    )
+
+
+def _record_view(app_obj: FastAPI | None, artifact_id: str, kind: str) -> None:
+    """Count one successful read of an artifact. Never raises into serving.
+
+    Analytics are strictly best effort: a broken or unstarted state sidecar
+    must degrade to "no numbers", never to a failed page load.
+    """
+    database = _statedb(app_obj)
+    if database is None:
+        return
+    try:
+        database.record_view(artifact_id, _utc_day(), kind)
+    except Exception as exc:  # noqa: BLE001 - analytics never break serving
+        logger.warning("Could not record a %s view of %s: %s", kind, artifact_id, exc)
 
 
 def _client_ip(request: Request) -> str:
@@ -431,11 +612,21 @@ def _version_rate_limited() -> JSONResponse:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Build both stores and try (but do not require) an initial hydration."""
+    """Build the stores and sidecars, and try (not require) an initial hydration.
+
+    Four pieces of state hang off ``app.state``: the two content stores, the
+    operational-state sidecar (:class:`~src.statedb.StateDB`: rate-limit
+    counters and view analytics, snapshotted into Storage Files) and the
+    outbound webhook dispatcher. The sidecar is started *after* hydration, so a
+    slow Storage listing never delays the counters becoming usable, and both
+    background workers are stopped on the way out — the sidecar's ``stop()``
+    takes a final snapshot, so a clean shutdown loses nothing.
+    """
     app.state.settings = settings
     # One backend instance serves both stores: they read the same host project
     # and only differ in the tags they list (``artifact-hub`` vs.
-    # ``artifact-hub-cmt``), so neither ever sees the other's files.
+    # ``artifact-hub-cmt``), so neither ever sees the other's files. The state
+    # sidecar shares it too, under its own disjoint ``artifact-hub-state`` tag.
     backend = KbcFilesBackend(settings.hub_stack_url, settings.hub_storage_token)
     app.state.store = ArtifactStore(
         backend,
@@ -452,6 +643,19 @@ async def lifespan(app: FastAPI):
     )
     app.state.signer = CookieSigner(settings.secret_key)
     app.state.hydrated = False
+    statedb = StateDB(
+        backend,
+        settings.cache_dir / settings.state_db_filename,
+        settings.state_snapshot_interval_s,
+        settings.state_max_snapshot_bytes,
+    )
+    app.state.statedb = statedb
+    webhooks = WebhookDispatcher(
+        settings.webhook_timeout_s,
+        settings.webhook_max_attempts,
+        settings.secret_key,
+    )
+    app.state.webhooks = webhooks
     try:
         artifacts, threads = _hydrate(app)
         app.state.hydrated = True
@@ -464,7 +668,23 @@ async def lifespan(app: FastAPI):
         logger.error(
             "Startup hydration failed, serving in degraded mode: %s", exc
         )
-    yield
+    statedb.start()
+    # Buckets are ISO-ish strings, so lexicographic order is chronological
+    # order and today's day string sorts before today's hour strings
+    # ("2026-09-01" < "2026-09-01T14"). Pruning at that boundary drops every
+    # window that has already closed and keeps today's intact.
+    try:
+        removed = statedb.prune_counters_before(_utc_day())
+        if removed:
+            logger.info("Pruned %d expired rate-limit counter(s)", removed)
+    except Exception as exc:  # noqa: BLE001 - housekeeping must not block boot
+        logger.warning("Could not prune expired rate-limit counters: %s", exc)
+    webhooks.start()
+    try:
+        yield
+    finally:
+        webhooks.stop()
+        statedb.stop()
 
 
 def _hydrate(app_obj: FastAPI) -> tuple[int, int]:
@@ -800,9 +1020,16 @@ def base_url(request: Request) -> str:
     return f"{scheme.split(',')[0].strip()}://{host.split(',')[0].strip()}"
 
 
-def artifact_urls(base: str, artifact_id: str) -> dict[str, str]:
-    """Every public URL of one artifact."""
-    root = f"{base.rstrip('/')}/a/{artifact_id}"
+def artifact_urls(base: str, share_id: str) -> dict[str, str]:
+    """Every public URL of one artifact, built from its **share id**.
+
+    Since 0.7.0 ``/a/{...}`` addresses an artifact by the public share id its
+    meta record publishes, not by the internal artifact id the ``/api/*``
+    routes use. The two are equal until the owner rotates the link, after which
+    only the share id resolves publicly — so every URL the API hands out has to
+    be built from :attr:`~src.store.ArtifactMeta.share_id`.
+    """
+    root = f"{base.rstrip('/')}/a/{share_id}"
     return {
         "url": root,
         "raw_url": f"{root}/raw",
@@ -859,6 +1086,19 @@ def optional_caller(request: Request) -> Owner | None:
         return None
 
 
+def unlock_cookie_name(meta: ArtifactMeta) -> str:
+    """Name of the unlock cookie for one artifact.
+
+    Keyed by the **share id**, because a cookie is only sent back when its path
+    prefixes the request path — and the path the browser sees is
+    ``/a/{share_id}``. The signed *value* still carries the internal artifact
+    id (see :func:`unlock_artifact`), so the cookie identifies an artifact, not
+    a URL. A rotated link therefore also drops every unlock cookie: the new
+    path has no cookie yet, and readers unlock again.
+    """
+    return f"art_{meta.share_id}"
+
+
 def password_scope(meta: ArtifactMeta) -> str:
     """Cookie scope binding an unlock cookie to the *current* password record.
 
@@ -888,7 +1128,7 @@ def reader_allowed(meta: ArtifactMeta, request: Request) -> bool:
         return True
     # The cookie is checked first: it is a cheap HMAC, and a reader who
     # already unlocked must never be caught by the brute-force throttle.
-    cookie = request.cookies.get(f"art_{meta.id}")
+    cookie = request.cookies.get(unlock_cookie_name(meta))
     if cookie and request.app.state.signer.check(
         meta.id, cookie, settings.unlock_cookie_max_age_s, password_scope(meta)
     ):
@@ -897,7 +1137,9 @@ def reader_allowed(meta: ArtifactMeta, request: Request) -> bool:
     if not supplied:
         return False
     client_ip = _client_ip(request)
-    if _unlock_throttled(meta.id, client_ip):
+    # Throttle buckets are keyed by the *internal* id, so rotating the link
+    # does not hand an attacker a fresh budget.
+    if _unlock_throttled(request.app, meta.id, client_ip):
         raise HTTPException(
             status_code=429,
             detail=(
@@ -908,7 +1150,7 @@ def reader_allowed(meta: ArtifactMeta, request: Request) -> bool:
         )
     if check_password(supplied, meta.password):
         return True
-    _record_unlock_failure(meta.id, client_ip)
+    _record_unlock_failure(request.app, meta.id, client_ip)
     return False
 
 
@@ -1028,8 +1270,29 @@ def _thread_not_found(artifact_id: str, thread_id: str) -> JSONResponse:
     )
 
 
-def _document_is_final(artifact_id: str, what: str) -> JSONResponse:
-    """409 for any write frozen by ``status: final``."""
+def _document_frozen(meta: ArtifactMeta, what: str) -> JSONResponse:
+    """409 for any write frozen by the artifact's status.
+
+    Two very different states freeze an artifact, and telling them apart is the
+    whole point of this answer: ``final`` is a deliberate "this is done", while
+    ``trashed`` means the artifact is in the trash and its public link is dead.
+    The caller needs to know which, because the way out differs — reopen with
+    ``PUT /api/artifacts/{id}`` versus restore with
+    ``POST /api/artifacts/{id}/restore``.
+    """
+    if meta.is_trashed():
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "document is trashed",
+                "detail": (
+                    f"This artifact is in the trash, so {what} are frozen and "
+                    "its public link no longer resolves. Its owner can bring "
+                    "it back with POST /api/artifacts/{id}/restore."
+                ),
+                "id": meta.id,
+            },
+        )
     return JSONResponse(
         status_code=409,
         content={
@@ -1039,7 +1302,7 @@ def _document_is_final(artifact_id: str, what: str) -> JSONResponse:
                 "owner can reopen it with PUT /api/artifacts/{id} and "
                 '{"status": "draft"}.'
             ),
-            "id": artifact_id,
+            "id": meta.id,
         },
     )
 
@@ -1063,9 +1326,176 @@ def _comments_closed(meta: ArtifactMeta) -> JSONResponse:
 
 
 def _meta_of(request: Request, artifact_id: str) -> ArtifactMeta | None:
-    """Fetch an artifact's meta record, hydrating the index first when needed."""
+    """Fetch an artifact's meta record, hydrating the index first when needed.
+
+    Takes an **internal** artifact id — the ``/api/*`` handle. Public routes go
+    through :func:`_public_meta_of`, which resolves the share id first.
+    """
     ensure_hydrated(request.app)
     return request.app.state.store.get_meta(artifact_id)
+
+
+def _public_meta_of(request: Request, public_id: str) -> ArtifactMeta | None:
+    """Resolve a public ``/a/{...}`` identifier and load its meta record.
+
+    ``public_id`` is a *share id*: what the URL a reader holds actually
+    carries. :meth:`~src.store.ArtifactStore.resolve_share` maps it to the
+    internal artifact id, and answers ``None`` for everything that must not
+    resolve publicly — a rotated-away link, the bare artifact id of a rotated
+    artifact, an artifact in the trash, or an identifier naming nothing. All
+    four are the same 404 to the caller, deliberately: distinguishing them
+    would turn the endpoint into an oracle for revoked links.
+
+    Every public handler starts here and then works with ``meta.id``; nothing
+    downstream ever sees the share id again except URL building.
+    """
+    ensure_hydrated(request.app)
+    artifact_id = request.app.state.store.resolve_share(public_id)
+    if artifact_id is None:
+        return None
+    return request.app.state.store.get_meta(artifact_id)
+
+
+def _comment_target_of(request: Request, path_id: str) -> ArtifactMeta | None:
+    """Resolve the identifier in a comment-write path, internal id first.
+
+    The comment write routes are the one place where both halves of an
+    artifact's identity pair are legitimate. An agent or an owner holds the
+    internal id (it is what the publish response and ``/api/artifacts`` hand
+    them); the review UI, a capability-URL holder and every invited guest only
+    ever saw the **share id**, because that is what ``/a/{...}`` carries. Trying
+    the internal id first keeps the owner path a single index lookup and makes
+    the share id a fallback rather than a second namespace.
+
+    Answers ``None`` for anything neither lookup resolves — including a share id
+    that has been rotated away, which is exactly the revocation
+    :meth:`~src.store.ArtifactStore.resolve_share` exists to enforce.
+    """
+    ensure_hydrated(request.app)
+    store = request.app.state.store
+    meta = store.get_meta(path_id)
+    if meta is not None:
+        return meta
+    internal_id = store.resolve_share(path_id)
+    if internal_id is None:
+        return None
+    return store.get_meta(internal_id)
+
+
+# ------------------------------------------------------------ guest invitations
+
+
+def _guest_credential(request: Request) -> tuple[str, str] | None:
+    """Split the ``X-Artifact-Guest`` header into ``(invitation_id, secret)``.
+
+    ``None`` means "this caller is not presenting a guest credential at all" —
+    the header is absent or blank — which is what sends the request down the
+    ordinary token-authenticated path. A header that is *present* but
+    unparseable is a guest whose link got mangled in a chat client, so it
+    raises the guest 401 rather than falling through to token auth and
+    answering something about Storage stacks they have never heard of.
+    """
+    raw = request.headers.get(GUEST_HEADER.lower(), "").strip()
+    if not raw:
+        return None
+    invitation_id, separator, secret = raw.partition(".")
+    if not separator or not invitation_id or not secret:
+        raise _guest_refused()
+    return invitation_id, secret
+
+
+def _guest_refused() -> HTTPException:
+    """The single 401 every guest-credential failure answers with.
+
+    Malformed, unknown, revoked and wrong-secret are deliberately one answer:
+    telling them apart would turn the header into an oracle over other
+    people's invitations.
+    """
+    return HTTPException(
+        status_code=401,
+        detail=(
+            "this invitation link is not valid for this artifact; it may have "
+            "been revoked, or the link may be incomplete — ask whoever "
+            "invited you for a fresh one"
+        ),
+    )
+
+
+def _verify_guest(meta: ArtifactMeta, credential: tuple[str, str]) -> dict:
+    """Return the invitation this credential proves, or raise 401.
+
+    Three things have to hold: the invitation still exists on this artifact, it
+    has not been revoked, and the secret verifies against its stored PBKDF2
+    record. All three failures answer :func:`_guest_refused` — a guest must not
+    be able to tell "revoked" from "never existed" from "wrong secret".
+    """
+    invitation_id, secret = credential
+    for invitation in meta.invitations or []:
+        if invitation.get("id") != invitation_id:
+            continue
+        if invitation.get("revoked"):
+            break
+        record = invitation.get("secret")
+        if isinstance(record, dict) and check_password(secret, record):
+            return invitation
+        break
+    raise _guest_refused()
+
+
+def _guest_identity(invitation: dict) -> dict:
+    """The author record stored beside a guest's comment."""
+    return guest_author(
+        str(invitation.get("id") or ""), str(invitation.get("name") or "")
+    )
+
+
+def _guest_actor(invitation: dict) -> str:
+    """How a guest is named in a webhook notification."""
+    name = str(invitation.get("name") or "").strip() or "someone"
+    return f"{name} (guest)"
+
+
+def _public_invitation(invitation: dict) -> dict:
+    """One invitation as its owner may see it — never including the secret."""
+    return {
+        "id": str(invitation.get("id") or ""),
+        "name": str(invitation.get("name") or ""),
+        "created_at": str(invitation.get("created_at") or ""),
+        "revoked": bool(invitation.get("revoked")),
+    }
+
+
+def _make_room_for_invitation(meta: ArtifactMeta) -> None:
+    """Ensure one more invitation fits, or raise 422.
+
+    The cap bounds the meta record, which is a single Storage File rewritten on
+    every artifact change — an unbounded list would eventually make the
+    artifact itself expensive to load. Revoked invitations are tombstones with
+    no remaining use (their secret can never verify again), so the oldest of
+    them are dropped to make room before the cap is enforced. That is what
+    makes "revoke somebody, invite somebody else" work indefinitely while the
+    stored list stays bounded.
+    """
+    limit = settings.max_invitations_per_artifact
+    if len(meta.invitations) < limit:
+        return
+    live = [inv for inv in meta.invitations if not inv.get("revoked")]
+    # Oldest revoked first — the list keeps creation order.
+    droppable = [str(inv.get("id")) for inv in meta.invitations if inv.get("revoked")]
+    room_needed = len(meta.invitations) - limit + 1
+    if room_needed > len(droppable):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"this artifact already has {len(live)} live invitations, "
+                f"which is the limit of {limit} per artifact; revoke one "
+                "before inviting somebody else"
+            ),
+        )
+    dropped = set(droppable[:room_needed])
+    meta.invitations = [
+        inv for inv in meta.invitations if str(inv.get("id")) not in dropped
+    ]
 
 
 def _owner_only(meta: ArtifactMeta, caller: Owner) -> None:
@@ -1074,6 +1504,92 @@ def _owner_only(meta: ArtifactMeta, caller: Owner) -> None:
         raise HTTPException(
             status_code=403, detail="this artifact belongs to another project"
         )
+
+
+def _emit_webhook(
+    request: Request,
+    meta: ArtifactMeta,
+    kind: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    actor: Owner | None = None,
+    actor_name: str | None = None,
+) -> None:
+    """Queue one webhook delivery per URL this artifact registered.
+
+    A no-op when the artifact registered nothing, which is the common case, so
+    the cost of the feature on an ordinary publish is one attribute read.
+
+    What goes into the payload is deliberately narrow: the *internal* artifact
+    id (the handle its owner already knows), the title, whatever version or
+    thread the event is about, the acting project's **name** — never a token,
+    never an owner key, never a password record — and the public ``url``, built
+    from the share id. That last one is the only capability in the envelope,
+    and it is the very link whose owner configured the receiver.
+
+    Never raises into the request path: a webhook is a notification about
+    something that already happened and is already durable in Storage.
+    """
+    urls = list(meta.webhooks or [])
+    if not urls:
+        return
+    dispatcher = getattr(request.app.state, "webhooks", None)
+    if dispatcher is None:
+        return
+    body: dict[str, Any] = {
+        "artifact_id": meta.id,
+        "url": f"{base_url(request).rstrip('/')}/a/{meta.share_id}",
+        **(payload or {}),
+    }
+    if actor is not None:
+        body["actor"] = actor.project_name
+    elif actor_name:
+        # A guest has no project to name, so the receiver gets the display name
+        # their inviter chose, marked as a guest. Still not a capability: it is
+        # a label, and it is the one the artifact's own owner typed.
+        body["actor"] = actor_name
+    try:
+        dispatcher.emit(
+            urls,
+            WebhookEvent(
+                artifact_id=meta.id, kind=kind, payload=body, created_at=_now()
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - notifications never break a write
+        logger.warning(
+            "Could not queue the %s webhook for artifact %s: %s", kind, meta.id, exc
+        )
+
+
+def _validate_webhooks(urls: list[str]) -> list[str]:
+    """Clean and validate a webhook URL list, or raise 422.
+
+    Each entry goes through :func:`src.webhooks.validate_webhook_url`, which
+    enforces https and refuses hosts resolving into private, loopback,
+    link-local, reserved or cloud-metadata ranges — the same SSRF guard git
+    clones get. A refusal is a 422 carrying the validator's own sentence, so
+    the owner learns *why* rather than just "invalid".
+    """
+    cleaned: list[str] = []
+    for raw in urls:
+        candidate = str(raw).strip()
+        if not candidate:
+            continue
+        try:
+            normalized = validate_webhook_url(candidate)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if normalized not in cleaned:
+            cleaned.append(normalized)
+    if len(cleaned) > settings.max_webhooks_per_artifact:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"too many webhooks ({len(cleaned)}); the limit is "
+                f"{settings.max_webhooks_per_artifact} per artifact"
+            ),
+        )
+    return cleaned
 
 
 # --------------------------------------------------------------------------
@@ -1301,7 +1817,25 @@ class UpdateBody(BaseModel):
             "'draft' (the default) or 'final'. Marking an artifact final "
             "freezes it: new versions and new comments answer 409 for "
             "everyone, the owner included. Set it back to 'draft' to reopen. "
-            "Omit to leave unchanged."
+            "'trashed' is deliberately not settable here — use DELETE "
+            "/api/artifacts/{id} and POST /api/artifacts/{id}/restore, which "
+            "also record when it was trashed and what to restore it to. Omit "
+            "to leave unchanged."
+        ),
+    )
+    webhooks: list[str] | None = Field(
+        None,
+        description=(
+            "https URLs notified when something happens to this artifact "
+            "(version published or proposed, proposal promoted, comment or "
+            "reply, finalized, trashed, restored, link rotated). Each delivery "
+            "is a small JSON envelope signed with X-Hub-Signature-256; a "
+            "hooks.slack.com URL gets Slack's {\"text\": ...} shape instead. "
+            "Replaces the whole list; [] clears it; omit to leave unchanged. "
+            "URLs must be https and must not resolve to a private, loopback, "
+            "link-local or metadata address. Treated as semi-secret: they are "
+            "returned in this response only, never in GET /api/artifacts, "
+            "which reports 'webhooks_count' instead."
         ),
     )
 
@@ -1387,6 +1921,24 @@ class ResolveBody(BaseModel):
     )
 
 
+class InvitationBody(BaseModel):
+    """Body of ``POST /api/artifacts/{id}/invitations``."""
+
+    model_config = {"json_schema_extra": {"examples": [{"name": "Jana (legal)"}]}}
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_INVITATION_NAME_CHARS,
+        description=(
+            "Who this invitation is for, as it will appear beside their "
+            "comments. Purely a label chosen by the owner — the hub never "
+            "verifies it and never emails it anywhere — but it is the only "
+            "thing readers see about a guest, so make it recognisable."
+        ),
+    )
+
+
 class VersionBody(BaseModel):
     """Body of ``POST /api/artifacts/{id}/versions``.
 
@@ -1432,6 +1984,17 @@ class VersionBody(BaseModel):
         description=(
             "Short description of what changed, shown in the version history. "
             f"At most {MAX_NOTE_CHARS} characters."
+        ),
+    )
+    base_version: int | None = Field(
+        None,
+        description=(
+            "The version this submission was written against. Must name a "
+            "version that exists (422 otherwise). Recorded on the version and "
+            "reported in the history, where a proposal whose base_version is "
+            "no longer the head is flagged 'outdated': true — so a reviewer "
+            "can see that the document moved on while the proposal was being "
+            "written. Omit when you did not start from a specific version."
         ),
     )
 
@@ -1586,11 +2149,30 @@ def _apply_policy(meta: ArtifactMeta, body: UpdateBody) -> None:
             )
         meta.comments_mode = body.comments_mode
 
+    if body.webhooks is not None:
+        meta.webhooks = _validate_webhooks(body.webhooks)
+
     if body.status is not None:
-        if body.status not in ARTIFACT_STATUSES:
+        # ARTIFACT_SETTABLE_STATUSES, not ARTIFACT_STATUSES: "trashed" is
+        # reachable only through DELETE (which also stamps trashed_at and the
+        # status to restore to) and left only through the restore route.
+        # Accepting it here would produce a meta record that claims to be in
+        # the trash without either of those, so it is a 422.
+        if body.status not in ARTIFACT_SETTABLE_STATUSES:
             raise HTTPException(
                 status_code=422,
-                detail=f"status must be one of {', '.join(ARTIFACT_STATUSES)}",
+                detail=(
+                    "status must be one of "
+                    f"{', '.join(ARTIFACT_SETTABLE_STATUSES)}"
+                ),
+            )
+        if meta.is_trashed():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "this artifact is in the trash; restore it with POST "
+                    "/api/artifacts/{id}/restore before changing its status"
+                ),
             )
         meta.status = body.status
 
@@ -1716,6 +2298,24 @@ def _public_version_meta(row: dict) -> dict:
     return {**row, "git": {k: v for k, v in git.items() if k != "url"}}
 
 
+def _outdated_flag(row: dict, head_version: int | None) -> dict:
+    """``{"outdated": bool}`` for a proposal, or nothing for any other row.
+
+    A proposal is *outdated* when its author told us which version they wrote
+    it against (``base_version``) and the head has moved on since. That is the
+    one thing a reviewer cannot see from the numbers alone: a proposal based on
+    v3 while the head is v5 was written without seeing two live versions, and
+    promoting it silently reverts them.
+
+    Only proposals carry the key: for a live version — already promoted, or the
+    head itself — "outdated" would be meaningless rather than false.
+    """
+    if row.get("status") != STATUS_PROPOSED:
+        return {}
+    base = row.get("base_version")
+    return {"outdated": base is not None and base != head_version}
+
+
 def _head_version_of(request: Request, artifact_id: str) -> int | None:
     head = request.app.state.store.get_head(artifact_id)
     return head.version if head is not None else None
@@ -1730,6 +2330,9 @@ def _artifact_response(
     """Standard management-API response describing one artifact."""
     payload = {
         "id": meta.id,
+        # The public half of the identity pair. Equal to "id" until the link is
+        # rotated; every URL below is built from it.
+        "share_id": meta.share_id,
         "title": envelope.title,
         "protected": bool(meta.password),
         "accept_versions": meta.accept_versions,
@@ -1737,12 +2340,15 @@ def _artifact_response(
         "contributors": list(meta.contributors),
         "comments_mode": meta.comments_mode,
         "artifact_status": meta.status,
+        # Full URLs, not a count: this response only ever reaches the owning
+        # project, which is who set them. The listing endpoint reports a count.
+        "webhooks": list(meta.webhooks),
         "version": envelope.version,
         "status": envelope.status,
         "head_version": _head_version_of(request, meta.id),
         "owner_project_id": meta.owner.get("project_id"),
         "canonical_file_id": envelope.canonical_file_id,
-        **artifact_urls(base_url(request), meta.id),
+        **artifact_urls(base_url(request), meta.share_id),
     }
     return JSONResponse(status_code=status_code, content=payload)
 
@@ -1880,6 +2486,12 @@ def context(request: Request) -> dict:
             ),
             "token_storage": "never persisted; used only during the request",
             "reader_password_header": "X-Artifact-Password",
+            "guest_header": (
+                "X-Artifact-Guest: '{invitation_id}.{secret}' — an alternative "
+                "to the storage token on the four comment-write routes and on "
+                "GET /a/{id}/guest, for an invited human without a Keboola "
+                "account. See the 'guests' section."
+            ),
             "reading_proposals": (
                 "the same two management headers may be sent on /a/{id}/v/{n} "
                 "and /a/{id}/diff/{a}..{b} to read a proposed version as its "
@@ -2057,6 +2669,17 @@ def context(request: Request) -> dict:
             },
             {
                 "method": "GET",
+                "path": "/a/{id}/guest",
+                "auth": "X-Artifact-Guest invitation credential",
+                "purpose": (
+                    "resolve a guest invitation to the display name it "
+                    "carries, so a client can say who it is commenting as "
+                    "before it writes anything; 401 for a missing, revoked or "
+                    "wrong credential"
+                ),
+            },
+            {
+                "method": "GET",
                 "path": "/a/{id}/export/markdown",
                 "auth": "url capability",
                 "purpose": (
@@ -2096,7 +2719,74 @@ def context(request: Request) -> dict:
                 "method": "DELETE",
                 "path": "/api/artifacts/{id}",
                 "auth": "storage token (owner project)",
-                "purpose": "delete every version and the meta record",
+                "purpose": (
+                    "move the artifact to the trash: reversible soft delete "
+                    "that freezes it and kills its public link"
+                ),
+            },
+            {
+                "method": "POST",
+                "path": "/api/artifacts/{id}/restore",
+                "auth": "storage token (owner project)",
+                "purpose": (
+                    "bring a trashed artifact back on the same share id and "
+                    "URL"
+                ),
+            },
+            {
+                "method": "DELETE",
+                "path": "/api/artifacts/{id}/purge",
+                "auth": "storage token (owner project)",
+                "purpose": (
+                    "irreversibly erase every version, comment thread, meta "
+                    "record and view statistic"
+                ),
+            },
+            {
+                "method": "POST",
+                "path": "/api/artifacts/{id}/rotate-link",
+                "auth": "storage token (owner project)",
+                "purpose": (
+                    "mint a new share id; the previous public link stops "
+                    "resolving immediately"
+                ),
+            },
+            {
+                "method": "GET",
+                "path": "/api/artifacts/{id}/stats",
+                "auth": "storage token (owner project)",
+                "purpose": (
+                    "view counts for one artifact: total, by day and by "
+                    "surface"
+                ),
+            },
+            {
+                "method": "POST",
+                "path": "/api/artifacts/{id}/invitations",
+                "auth": "storage token (owner project)",
+                "purpose": (
+                    "invite one person without a Keboola account to comment; "
+                    "returns a review URL carrying a one-time secret in its "
+                    "fragment"
+                ),
+            },
+            {
+                "method": "GET",
+                "path": "/api/artifacts/{id}/invitations",
+                "auth": "storage token (owner project)",
+                "purpose": (
+                    "list this artifact's guest invitations (id, name, "
+                    "created_at, revoked); never the secrets"
+                ),
+            },
+            {
+                "method": "DELETE",
+                "path": "/api/artifacts/{id}/invitations/{iid}",
+                "auth": "storage token (owner project)",
+                "purpose": (
+                    "revoke one guest's invitation, leaving every other "
+                    "invitation working"
+                ),
             },
             {
                 "method": "POST",
@@ -2221,9 +2911,12 @@ def context(request: Request) -> dict:
             ),
             "diff": (
                 "GET /a/{id}/diff/{older}..{newer} renders a side-by-side page; "
-                "?format=unified returns text/plain and ?format=json returns the "
-                "unified diff plus added/removed counts. Markdown is compared "
-                "when both versions carry it, otherwise the built HTML."
+                "?format=unified returns text/plain, ?format=json returns the "
+                "unified diff plus added/removed counts, and ?format=visual "
+                "shows the two rendered documents themselves side by side in "
+                "sandboxed iframes with synchronized scrolling. Markdown is "
+                "compared when both versions carry it, otherwise the built "
+                "HTML."
             ),
             "retention": (
                 f"at most {settings.max_versions} live versions per artifact; "
@@ -2273,7 +2966,15 @@ def context(request: Request) -> dict:
             "comment_visibility": (
                 "Threads are readable by anyone holding the capability URL "
                 "(GET /a/{id}/comments); identities are reduced to project "
-                "id, project name and stack hostname."
+                "id, project name and stack hostname, and a guest to "
+                "{'kind': 'guest', 'name': ...}."
+            ),
+            "comment_addressing": (
+                "The four comment-write routes accept either the internal "
+                "artifact id or the public share id in their path (internal "
+                "first), because the review UI and every capability-URL "
+                "holder only ever saw the share id. Every other /api/* route "
+                "takes the internal id only."
             ),
             "comment_rate_limit": (
                 f"{settings.max_comments_per_day} comments and replies per "
@@ -2283,6 +2984,117 @@ def context(request: Request) -> dict:
                 "GET /a/{id}/export/markdown downloads the served version's "
                 "source; GET /a/{id}/export/vault downloads a deterministic "
                 "Obsidian vault ZIP of the whole history and discussion."
+            ),
+        },
+        "guests": {
+            "model": (
+                "A guest is one invited human without a Keboola account. An "
+                "invitation is a named, revocable capability on one artifact: "
+                "POST /api/artifacts/{id}/invitations mints it and returns a "
+                "review URL of the form "
+                "/a/{share_id}/review#invite={invitation_id}.{secret}."
+            ),
+            "secret": (
+                "Shown exactly once and stored only as a PBKDF2 record, like a "
+                "reader password. It rides the URL *fragment*, which browsers "
+                "never send to a server, and reaches the API only in the "
+                "X-Artifact-Guest header shaped '{invitation_id}.{secret}' — "
+                "so it stays out of access logs and Referer headers. A lost "
+                "link is replaced by revoking and minting another."
+            ),
+            "grants": (
+                "Open a comment thread, reply, and resolve or delete threads "
+                "the guest opened themselves. Never a version, never any "
+                "/api/* management call, never another artifact. "
+                "comments_mode does not gate a guest (the invitation is the "
+                "grant); 'final' and 'trashed' freeze them like everybody "
+                "else."
+            ),
+            "revocation": (
+                "DELETE /api/artifacts/{id}/invitations/{iid} turns off one "
+                "person's link immediately and leaves every other guest's "
+                "working. Comments they already wrote stay."
+            ),
+            "identity": (
+                "A guest's comments are published as {'kind': 'guest', "
+                "'name': ...} — the name their inviter chose, and nothing "
+                "else. Their daily comment budget is counted per invitation. "
+                "GET /a/{id}/guest resolves a credential to that name."
+            ),
+        },
+        "sharing": {
+            "model": (
+                "An artifact has two identifiers: the internal 'id' used by "
+                "every /api/* call, and the public 'share_id' that appears in "
+                "/a/{...} URLs. They are equal until the link is rotated."
+            ),
+            "rotation": (
+                "POST /api/artifacts/{id}/rotate-link mints a new share_id. "
+                "The previous share id stops resolving immediately, and so "
+                "does the bare artifact id once the two differ — there is no "
+                "grace period and no way to un-rotate. Unlock cookies are "
+                "scoped to the old path and go with it."
+            ),
+            "trash": (
+                "DELETE /api/artifacts/{id} is a reversible soft delete: the "
+                "status becomes 'trashed', the public link 404s and versions "
+                "and comments freeze (409), but the owner still sees the row "
+                "in GET /api/artifacts with a 'trashed_at'. POST "
+                "/api/artifacts/{id}/restore undoes it on the same URL; "
+                "DELETE /api/artifacts/{id}/purge is the irreversible erase. "
+                "'trashed' cannot be set through PUT status."
+            ),
+            "base_version": (
+                "POST /api/artifacts/{id}/versions accepts an optional "
+                "base_version naming the version the submission was written "
+                "against (422 when it does not exist). GET /a/{id}/versions "
+                "flags a proposal 'outdated': true when its base_version is no "
+                "longer the head — the document moved on while it was being "
+                "written."
+            ),
+        },
+        "webhooks": {
+            "registering": (
+                "PUT /api/artifacts/{id} with 'webhooks': [...] replaces the "
+                "artifact's list ([] clears it); at most "
+                f"{settings.max_webhooks_per_artifact} URLs, https only, and "
+                "hosts resolving to private, loopback, link-local or metadata "
+                "addresses are refused with 422."
+            ),
+            "events": (
+                "version.published, version.proposed, version.promoted, "
+                "comment.created, comment.replied, artifact.finalized, "
+                "artifact.trashed, artifact.restored, link.rotated. The "
+                "initial publish (v1) emits nothing — the owner just did it."
+            ),
+            "delivery": (
+                "POST of {'event', 'artifact_id', 'payload', 'created_at'} "
+                "signed with X-Hub-Signature-256: sha256=<hmac>; a "
+                "hooks.slack.com URL gets Slack's {'text': ...} shape "
+                f"instead. Up to {settings.webhook_max_attempts} attempts with "
+                "backoff, best effort: the queue is in memory and a restart "
+                "drops what was pending."
+            ),
+            "secrecy": (
+                "A webhook URL is itself a capability, so it is returned only "
+                "in the owner PUT response that set it; GET /api/artifacts "
+                "reports 'webhooks_count' instead."
+            ),
+        },
+        "analytics": {
+            "views": (
+                "GET /api/artifacts/{id}/stats (owner only) reports total, "
+                "per-day (30 days) and per-surface view counts. Surfaces are "
+                "'page', 'raw', 'source' and 'version'."
+            ),
+            "privacy": (
+                "Counts only — no reader identity, address or referrer is "
+                "recorded. Purging an artifact forgets its numbers."
+            ),
+            "durability": (
+                "Counters and view rows live in a SQLite sidecar snapshotted "
+                "into the host project's Storage Files, so rate limits survive "
+                "a redeploy; a crash can lose the last few minutes."
             ),
         },
         "limits": {
@@ -2299,6 +3111,11 @@ def context(request: Request) -> dict:
             "max_comments_per_day": settings.max_comments_per_day,
             "max_contributors": MAX_CONTRIBUTORS,
             "max_unlock_attempts_per_hour": settings.max_unlock_attempts_per_hour,
+            "max_webhooks_per_artifact": settings.max_webhooks_per_artifact,
+            "webhook_timeout_s": settings.webhook_timeout_s,
+            "webhook_max_attempts": settings.webhook_max_attempts,
+            "max_invitations_per_artifact": settings.max_invitations_per_artifact,
+            "max_invitation_name_chars": MAX_INVITATION_NAME_CHARS,
         },
         "notes": [
             "GET /a/{id} and /a/{id}/v/{n} return a wrapper page whose "
@@ -2319,6 +3136,15 @@ def context(request: Request) -> dict:
             "Artifact URLs are capabilities: the unguessable id is the only "
             "access control by default, there is no public listing, and every "
             "/a/* response carries X-Robots-Tag: noindex, nofollow.",
+            "/a/{...} addresses an artifact by its share_id, not by the "
+            "internal artifact id the /api/* routes use. They start out equal; "
+            "after POST /api/artifacts/{id}/rotate-link only the new share id "
+            "resolves publicly, and the old link — plus the bare artifact id — "
+            "answers 404 from the next request on.",
+            "DELETE /api/artifacts/{id} moves an artifact to the trash "
+            "(reversible with POST /api/artifacts/{id}/restore); DELETE "
+            "/api/artifacts/{id}/purge is the irreversible erase. A trashed "
+            "artifact 404s publicly but still appears in its owner's listing.",
             "An optional password adds a second layer; readers unlock in the "
             "browser (signed cookie scoped to the artifact path) or send the "
             "X-Artifact-Password header.",
@@ -2424,11 +3250,13 @@ def _changelog_not_found() -> JSONResponse:
     response_class=HTMLResponse,
     summary="Rendered changelog",
     description=(
-        "Serves CHANGELOG.md from the repository root, rendered through the "
-        "same Markdown template used for published artifacts (headings, "
-        "tables, dark mode). Read fresh from disk on every request, so "
-        "changes to the file appear immediately. Unauthenticated, and "
-        "identical for every caller. Use /changelog.md for the raw source."
+        "Serves CHANGELOG.md from the repository root, rendered as a page of "
+        "this service rather than as a published artifact: the hub's own "
+        "shell — graph-paper grid, monospace headings, the same footer as the "
+        "landing page — wrapped around the rendered Markdown. Read fresh from "
+        "disk on every request, so changes to the file appear immediately. "
+        "Unauthenticated, and identical for every caller. Use /changelog.md "
+        "for the raw source."
     ),
     responses={
         200: {"description": "The rendered changelog page.", "content": CONTENT_HTML},
@@ -2436,12 +3264,21 @@ def _changelog_not_found() -> JSONResponse:
     },
 )
 def changelog() -> Response:
-    """Serve CHANGELOG.md rendered through the standard artifact template."""
+    """Serve CHANGELOG.md inside the service's own shell design system.
+
+    The Markdown is rendered by the *builder's* configured markdown-it instance
+    (tables, task lists, anchors — the same dialect a published artifact gets)
+    but only down to a body fragment: the full artifact page template would
+    bring its own standalone look, and the changelog is a page of this service,
+    not somebody's document. ``src.pages`` supplies the chrome.
+    """
     text = _read_changelog()
     if text is None:
         return _changelog_not_found()
-    built = builder.build_from_markdown(text)
-    return HTMLResponse(built.html)
+    body_html = builder._render_markdown_body(text)
+    return HTMLResponse(
+        changelog_page(body_html, SERVICE_VERSION, GITHUB_REPO_URL)
+    )
 
 
 @app.get(
@@ -2550,17 +3387,21 @@ def admin(request: Request) -> HTMLResponse:
 )
 def read_artifact(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
 ) -> Response:
     """Serve the head version sandboxed, or the unlock form when protected."""
-    meta = _meta_of(request, artifact_id)
+    # The path carries the *public* share id; everything past resolution works
+    # with the internal artifact id (``meta.id``).
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
     if meta is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
     if not reader_allowed(meta, request):
-        return HTMLResponse(unlock_page(artifact_id, None), status_code=401)
-    envelope = request.app.state.store.get_head(artifact_id)
+        return HTMLResponse(unlock_page(public_id, None), status_code=401)
+    envelope = request.app.state.store.get_head(meta.id)
     if envelope is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
+    _record_view(request.app, meta.id, "page")
     return _framed(envelope)
 
 
@@ -2607,40 +3448,46 @@ def read_artifact(
 )
 def unlock_artifact(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
     password: str = Form(
         "", description="The artifact's reader password, from the unlock form."
     ),
 ) -> Response:
     """Password form target: on success set a signed, path-scoped cookie."""
-    meta = _meta_of(request, artifact_id)
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
     if meta is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
     if meta.password:
         # Each attempt costs a full PBKDF2, so the budget is checked *before*
         # the hash runs; only failures are counted, so a reader who gets it
-        # right on the first try is never throttled.
+        # right on the first try is never throttled. The bucket is keyed by the
+        # internal id, so rotating the link gives no fresh budget.
         client_ip = _client_ip(request)
-        if _unlock_throttled(artifact_id, client_ip):
+        if _unlock_throttled(request.app, meta.id, client_ip):
             return HTMLResponse(
                 unlock_page(
-                    artifact_id,
+                    public_id,
                     "Too many attempts — wait an hour and try again",
                 ),
                 status_code=429,
             )
         if not check_password(password, meta.password):
-            _record_unlock_failure(artifact_id, client_ip)
+            _record_unlock_failure(request.app, meta.id, client_ip)
             return HTMLResponse(
-                unlock_page(artifact_id, "Wrong password"), status_code=401
+                unlock_page(public_id, "Wrong password"), status_code=401
             )
-    response = RedirectResponse(f"/a/{artifact_id}", status_code=303)
+    response = RedirectResponse(f"/a/{meta.share_id}", status_code=303)
     response.set_cookie(
-        key=f"art_{artifact_id}",
+        # Name and path both carry the share id: a cookie only comes back when
+        # its path prefixes the request path, and what the browser sees is
+        # /a/{share_id}. The signed *value* carries the internal artifact id,
+        # so the cookie identifies the artifact rather than the URL.
+        key=unlock_cookie_name(meta),
         # Bound to the current password record: changing or clearing the
         # password invalidates every cookie issued under the old one.
-        value=request.app.state.signer.make(artifact_id, password_scope(meta)),
-        path=f"/a/{artifact_id}",
+        value=request.app.state.signer.make(meta.id, password_scope(meta)),
+        path=f"/a/{meta.share_id}",
         httponly=True,
         secure=True,
         samesite="lax",
@@ -2686,17 +3533,19 @@ def unlock_artifact(
 )
 def read_raw(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
 ) -> Response:
     """The head version's HTML itself, for machines."""
-    meta = _meta_of(request, artifact_id)
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
     if meta is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
     if not reader_allowed(meta, request):
         return _password_required()
-    envelope = request.app.state.store.get_head(artifact_id)
+    envelope = request.app.state.store.get_head(meta.id)
     if envelope is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
+    _record_view(request.app, meta.id, "raw")
     return HTMLResponse(envelope.html)
 
 
@@ -2737,24 +3586,27 @@ def read_raw(
 )
 def read_source(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
 ) -> Response:
     """The original source: markdown for markdown artifacts, HTML otherwise."""
-    meta = _meta_of(request, artifact_id)
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
     if meta is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
     if not reader_allowed(meta, request):
         return _password_required()
-    envelope = request.app.state.store.get_head(artifact_id)
+    envelope = request.app.state.store.get_head(meta.id)
     if envelope is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
 
     markdown = envelope.source.get("markdown")
     if isinstance(markdown, str):
+        _record_view(request.app, meta.id, "source")
         return PlainTextResponse(
             markdown, media_type="text/markdown; charset=utf-8"
         )
     if envelope.source_type in ("html", "git-html"):
+        _record_view(request.app, meta.id, "source")
         return HTMLResponse(envelope.html)
     return JSONResponse(
         status_code=404,
@@ -2794,21 +3646,24 @@ def read_source(
 )
 def read_meta(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
 ) -> Response:
     """Public metadata; available even when the artifact is password-protected."""
-    meta = _meta_of(request, artifact_id)
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
     if meta is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
     store = request.app.state.store
-    head = store.get_head(artifact_id)
+    head = store.get_head(meta.id)
     if head is None:
-        return _not_found(artifact_id)
-    versions = store.list_versions(artifact_id)
+        return _not_found(public_id)
+    versions = store.list_versions(meta.id)
     return JSONResponse(
         {
             **_public_version_meta(head.public_meta(is_head=True)),
-            "id": artifact_id,
+            # Public metadata names the artifact by its public identifier: a
+            # capability-URL holder is not entitled to the internal id.
+            "id": meta.share_id,
             "protected": bool(meta.password),
             "accept_versions": meta.accept_versions,
             "created_at": meta.created_at,
@@ -2818,7 +3673,7 @@ def read_meta(
             "proposed_count": sum(
                 1 for row in versions if row.get("status") == STATUS_PROPOSED
             ),
-            **artifact_urls(base_url(request), artifact_id),
+            **artifact_urls(base_url(request), meta.share_id),
         }
     )
 
@@ -2862,20 +3717,22 @@ def read_meta(
 )
 def read_version(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
     version: int = PathParam(..., description=VERSION_DESC),
 ) -> Response:
     """Serve one version, honoring both the password gate and proposal privacy."""
-    meta = _meta_of(request, artifact_id)
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
     if meta is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
     if not reader_allowed(meta, request):
-        return HTMLResponse(unlock_page(artifact_id, None), status_code=401)
-    envelope = request.app.state.store.get_version(artifact_id, version)
+        return HTMLResponse(unlock_page(public_id, None), status_code=401)
+    envelope = request.app.state.store.get_version(meta.id, version)
     if envelope is None:
-        return _version_not_found(artifact_id, version)
+        return _version_not_found(public_id, version)
     if not may_see(meta, envelope, optional_caller(request)):
-        return _proposal_hidden(artifact_id, version)
+        return _proposal_hidden(public_id, version)
+    _record_view(request.app, meta.id, "version")
     return _framed(envelope)
 
 
@@ -2891,6 +3748,10 @@ def read_version(
         "Proposal *metadata* is public to capability-URL holders; proposal "
         "*content* is not — fetching it still requires being the owner or the "
         "author (see GET /a/{id}/v/{n}).\n\n"
+        "Every proposed row also carries 'outdated': true when the submitter "
+        "declared a 'base_version' and the head has moved on since — the "
+        "proposal was written without seeing the versions published after it. "
+        "Live rows carry no 'outdated' key at all.\n\n"
         "The 'format' query parameter selects the rendering: 'json' (the "
         "default) returns the machine-readable history; 'html' returns a "
         "styled picker page with links to each version and to the diff of "
@@ -2918,7 +3779,7 @@ def read_version(
 )
 def read_versions(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
     format: str = Query(
         "json",
         description=(
@@ -2933,27 +3794,26 @@ def read_versions(
     ),
 ) -> Response:
     """Version history as JSON, or a styled picker page with ?format=html."""
-    meta = _meta_of(request, artifact_id)
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
     if meta is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
     wants_html = format == "html"
     if not reader_allowed(meta, request):
         if wants_html:
-            return HTMLResponse(unlock_page(artifact_id, None), status_code=401)
+            return HTMLResponse(unlock_page(public_id, None), status_code=401)
         return _password_required()
 
     store = request.app.state.store
-    versions = [
-        _public_version_meta(row) for row in store.list_versions(artifact_id)
-    ]
-    head_version = _head_version_of(request, artifact_id)
+    versions = [_public_version_meta(row) for row in store.list_versions(meta.id)]
+    head_version = _head_version_of(request, meta.id)
     base = base_url(request)
 
     if wants_html:
         return HTMLResponse(
             versions_page(
                 base,
-                artifact_id,
+                public_id,
                 versions,
                 head_version,
                 meta.accept_versions,
@@ -2961,15 +3821,20 @@ def read_versions(
             )
         )
 
-    root = f"{base.rstrip('/')}/a/{artifact_id}"
+    root = f"{base.rstrip('/')}/a/{meta.share_id}"
     return JSONResponse(
         {
-            "id": artifact_id,
+            "id": meta.share_id,
             "head_version": head_version,
             "accept_versions": meta.accept_versions,
             "protected": bool(meta.password),
             "versions": [
-                {**row, "url": f"{root}/v/{row['version']}"} for row in versions
+                {
+                    **row,
+                    **_outdated_flag(row, head_version),
+                    "url": f"{root}/v/{row['version']}",
+                }
+                for row in versions
             ],
         }
     )
@@ -2985,8 +3850,12 @@ def read_versions(
         "both versions carry Markdown source, otherwise the built HTML is.\n\n"
         "The 'format' query parameter selects the rendering: 'html' (the "
         "default) is a side-by-side page for humans, 'unified' is a "
-        "text/plain unified diff, and 'json' returns the unified diff plus "
-        "added/removed line counts. An unknown value is a 400.\n\n"
+        "text/plain unified diff, 'json' returns the unified diff plus "
+        "added/removed line counts, and 'visual' renders the two versions "
+        "themselves side by side — each in its own iframe sandboxed without "
+        "allow-same-origin, with the panes' scrolling synchronized — for "
+        "comparing what a reader actually sees rather than the source that "
+        "produced it. An unknown value is a 400.\n\n"
         "Either side may be a proposal, in which case the same rule as GET "
         "/a/{id}/v/{n} applies: send the two management headers to read it as "
         "the owner or the author, otherwise 403.\n\n" + PASSWORD_GATE_NOTE
@@ -3020,7 +3889,9 @@ def read_versions(
         },
         413: {
             "description": (
-                "One side is larger than the configured HUB_DIFF_MAX_BYTES."
+                "One side is larger than the configured HUB_DIFF_MAX_BYTES. "
+                "For 'visual' the rendered HTML of each side is what is "
+                "measured, since that is what the page has to carry."
             )
         },
         429: RESP_UNLOCK_429,
@@ -3029,18 +3900,20 @@ def read_versions(
 )
 def read_diff(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
     spec: str = PathParam(..., description=SPEC_DESC),
     format: str = Query(
         "html",
         description=(
             "Rendering of the diff: 'html' (default, side-by-side page), "
-            "'unified' (text/plain unified diff) or 'json' (unified diff plus "
-            "added/removed counts). Anything else is a 400."
+            "'unified' (text/plain unified diff), 'json' (unified diff plus "
+            "added/removed counts) or 'visual' (the two rendered documents "
+            "side by side in sandboxed iframes, scrolling in step). Anything "
+            "else is a 400."
         ),
         # Documentation only — validation stays in compute_diff so an unknown
         # format keeps answering 400 rather than FastAPI's 422.
-        json_schema_extra={"enum": ["html", "unified", "json"]},
+        json_schema_extra={"enum": ["html", "unified", "json", "visual"]},
     ),
 ) -> Response:
     """Diff two versions of one artifact in the requested rendering."""
@@ -3056,9 +3929,10 @@ def read_diff(
         )
     older, newer = int(match.group(1)), int(match.group(2))
 
-    meta = _meta_of(request, artifact_id)
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
     if meta is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
     if not reader_allowed(meta, request):
         return _password_required()
 
@@ -3066,15 +3940,18 @@ def read_diff(
     caller = None
     envelopes: list[Envelope] = []
     for number in (older, newer):
-        envelope = store.get_version(artifact_id, number)
+        envelope = store.get_version(meta.id, number)
         if envelope is None:
-            return _version_not_found(artifact_id, number)
+            return _version_not_found(public_id, number)
         if envelope.status == STATUS_PROPOSED:
             if caller is None:
                 caller = optional_caller(request)
             if not may_see(meta, envelope, caller):
-                return _proposal_hidden(artifact_id, number)
+                return _proposal_hidden(public_id, number)
         envelopes.append(envelope)
+
+    if format == "visual":
+        return _visual_diff(request, envelopes[0], envelopes[1])
 
     try:
         content_type, body = compute_diff(
@@ -3084,6 +3961,55 @@ def read_diff(
         status_code = 413 if "too large" in str(exc).lower() else 400
         return JSONResponse(status_code=status_code, content={"error": str(exc)})
     return Response(content=body, media_type=content_type)
+
+
+def _visual_diff(request: Request, older: Envelope, newer: Envelope) -> Response:
+    """Render the ``format=visual`` page: two documents, side by side.
+
+    Unlike the other three formats this one carries the *rendered* documents
+    rather than a comparison of their source, so the size guard is applied to
+    the HTML each pane has to hold — one 10 MB artifact would otherwise arrive
+    as a 20 MB page. The add/remove counts in the header still come from
+    :func:`~src.diff.compute_diff`, so the numbers a reader sees here and on
+    ``?format=json`` can never drift apart.
+    """
+    limit = settings.diff_max_bytes
+    for env in (older, newer):
+        size = len((env.html or "").encode("utf-8"))
+        if size > limit:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "error": (
+                        f"v{env.version} is too large to show side by side "
+                        f"({size} bytes > {limit})"
+                    )
+                },
+            )
+
+    added = removed = None
+    try:
+        _content_type, payload = compute_diff(older, newer, "json", limit)
+        stats = json.loads(payload).get("stats") or {}
+        added, removed = stats.get("added"), stats.get("removed")
+    except DiffError as exc:
+        # The rendered sides fit but their comparable text does not (or cannot
+        # be compared). The page is still the useful answer — it just says
+        # nothing about how many lines moved.
+        logger.info(
+            "No diff statistics for the visual diff of %s (v%d..v%d): %s",
+            older.id,
+            older.version,
+            newer.version,
+            exc,
+        )
+    except (ValueError, TypeError) as exc:  # pragma: no cover - defensive
+        logger.warning("Unreadable diff statistics: %s", exc)
+
+    return HTMLResponse(
+        visual_diff_page(older, newer, added=added, removed=removed),
+        headers={"Content-Security-Policy": "frame-ancestors 'self'"},
+    )
 
 
 @app.get(
@@ -3122,18 +4048,19 @@ def read_diff(
 )
 def read_comments(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
 ) -> Response:
     """List every comment thread of one artifact, oldest first."""
-    meta = _meta_of(request, artifact_id)
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
     if meta is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
     if not reader_allowed(meta, request):
         return _password_required()
-    threads = request.app.state.comments.list_for(artifact_id)
+    threads = request.app.state.comments.list_for(meta.id)
     return JSONResponse(
         {
-            "id": artifact_id,
+            "id": meta.share_id,
             "comments_mode": meta.comments_mode,
             "status": meta.status,
             "threads": [thread.public_dict() for thread in threads],
@@ -3176,17 +4103,18 @@ def read_comments(
 )
 def export_markdown(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
 ) -> Response:
     """The head version's source as a downloadable file."""
-    meta = _meta_of(request, artifact_id)
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
     if meta is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
     if not reader_allowed(meta, request):
         return _password_required()
-    head = request.app.state.store.get_head(artifact_id)
+    head = request.app.state.store.get_head(meta.id)
     if head is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
 
     filename, content_type, body = export.head_source(head)
     return Response(
@@ -3229,12 +4157,13 @@ def export_markdown(
 )
 def export_vault(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
 ) -> Response:
     """The whole artifact — versions, comments and timeline — as a vault ZIP."""
-    meta = _meta_of(request, artifact_id)
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
     if meta is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
     if not reader_allowed(meta, request):
         return _password_required()
 
@@ -3244,17 +4173,85 @@ def export_vault(
     # token headers) gets them included in their download.
     caller = optional_caller(request)
     envelopes: list[Envelope] = []
-    for row in store.list_versions(artifact_id):
-        envelope = store.get_version(artifact_id, row["version"])
+    for row in store.list_versions(meta.id):
+        envelope = store.get_version(meta.id, row["version"])
         if envelope is not None and may_see(meta, envelope, caller):
             envelopes.append(envelope)
-    threads = request.app.state.comments.list_for(artifact_id)
+    threads = request.app.state.comments.list_for(meta.id)
 
     filename, payload = export.build_vault(meta, envelopes, threads)
     return Response(
         content=payload,
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get(
+    "/a/{artifact_id}/guest",
+    tags=["public"],
+    summary="Who am I, as an invited guest?",
+    description=(
+        "Checks a guest invitation and answers with the name it carries, so a "
+        "client can say 'commenting as Jana (guest)' before anybody writes "
+        "anything. Send the credential in the X-Artifact-Guest header, shaped "
+        "'{invitation_id}.{secret}' — the two halves of what the review URL's "
+        "#invite= fragment contains.\n\n"
+        "The review UI calls this on load; an agent holding an invitation can "
+        "use it the same way, as a cheap 'is this link still good?' probe. "
+        "Nothing is recorded and nothing is returned but the display name and "
+        "the (non-secret) invitation id.\n\n"
+        "A missing, malformed, revoked or wrong credential all answer the same "
+        "401, deliberately: telling them apart would make this an oracle over "
+        "somebody else's invitation."
+    ),
+    responses={
+        200: {
+            "description": (
+                "The invitation is valid; JSON with 'name', 'invitation_id' "
+                "and the artifact's share 'id'."
+            )
+        },
+        401: {
+            "description": (
+                "No usable X-Artifact-Guest credential for this artifact."
+            )
+        },
+        404: RESP_NOT_FOUND,
+        429: RESP_UNLOCK_429,
+        502: RESP_HUB_502,
+    },
+)
+def guest_identity(
+    request: Request,
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
+) -> Response:
+    """Resolve an invitation credential to the guest's display name."""
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
+    if meta is None:
+        return _not_found(public_id)
+    # A password-protected artifact still gates its guests: an invitation is a
+    # grant to *comment*, not a way around the reader password.
+    if not reader_allowed(meta, request):
+        return _password_required()
+
+    credential = _guest_credential(request)
+    if credential is None:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "send the invitation credential in the "
+                f"{GUEST_HEADER} header, shaped '{{invitation_id}}.{{secret}}'"
+            ),
+        )
+    invitation = _verify_guest(meta, credential)
+    return JSONResponse(
+        {
+            "id": meta.share_id,
+            "invitation_id": str(invitation.get("id") or ""),
+            "name": str(invitation.get("name") or ""),
+        }
     )
 
 
@@ -3276,7 +4273,16 @@ def export_vault(
         "the page nor the Storage token a visitor may sign in with. "
         "Commenting requires signing in inside the page; the token lives in "
         "sessionStorage (shared with /admin) and is only ever sent to this "
-        "hub's own API.\n\n" + PASSWORD_GATE_NOTE
+        "hub's own API.\n\n"
+        "**Guest mode.** Opened through an invitation link — the URL POST "
+        "/api/artifacts/{id}/invitations returns, ending in "
+        "'#invite={invitation_id}.{secret}' — the page reads that fragment, "
+        "clears it from the address bar, checks it against GET /a/{id}/guest "
+        "and shows 'Commenting as {name} (guest)'. The composer then works "
+        "with no Keboola account at all, sending the credential in the "
+        "X-Artifact-Guest header. Browsers never send a fragment to a server, "
+        "and the page never puts it in a URL, so the secret stays out of the "
+        "hub's logs.\n\n" + PASSWORD_GATE_NOTE
     ),
     responses={
         200: {"description": "The review page.", "content": CONTENT_HTML},
@@ -3293,18 +4299,21 @@ def export_vault(
 )
 def read_review(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=SHARE_ID_DESC),
 ) -> Response:
     """Serve the review shell; all of its data is fetched client-side."""
-    meta = _meta_of(request, artifact_id)
+    public_id = artifact_id
+    meta = _public_meta_of(request, public_id)
     if meta is None:
-        return _not_found(artifact_id)
+        return _not_found(public_id)
     if not reader_allowed(meta, request):
         # Unlocking here sets the same path-scoped cookie the page's own
         # same-origin fetches then ride on.
-        return HTMLResponse(unlock_page(artifact_id, None), status_code=401)
+        return HTMLResponse(unlock_page(public_id, None), status_code=401)
+    # The page's own fetches are all /a/{...} reads, so it gets the *public*
+    # identifier — the one those URLs have to carry.
     return HTMLResponse(
-        review_page(base_url(request), artifact_id, SERVICE_VERSION)
+        review_page(base_url(request), public_id, SERVICE_VERSION)
     )
 
 
@@ -3526,16 +4535,21 @@ def update_artifact(
             ),
         )
 
-    # A final artifact is frozen for content. The owner may reopen it in this
-    # very call by sending status="draft" alongside the new content.
-    if present and meta.is_final() and body.status != ARTIFACT_DRAFT:
-        return _document_is_final(artifact_id, "new versions")
+    # A frozen artifact takes no new content. "final" has an escape hatch: the
+    # owner may reopen it in this very call by sending status="draft" alongside
+    # the new content. "trashed" has none — restoring is its own route, so that
+    # bringing an artifact back is never a side effect of editing it.
+    if present and meta.is_frozen():
+        if not (meta.is_final() and body.status == ARTIFACT_DRAFT):
+            return _document_frozen(meta, "new versions")
+
+    was_final = meta.is_final()
 
     # An owner update that carries content is a version submission like any
     # other, so it draws on the same per-project daily budget contributors
     # have. Checked before anything is persisted, so a throttled call changes
     # nothing at all.
-    if present and not _claim_submission_slot(artifact_id, owner.key):
+    if present and not _claim_submission_slot(request.app, artifact_id, owner.key):
         return _version_rate_limited()
 
     now = _now()
@@ -3576,10 +4590,29 @@ def update_artifact(
             created_at=now,
         )
         envelope.version = store.add_version_next(envelope)
+        # v1 is the publish itself, which the owner just did by hand and does
+        # not need a notification about; every later live version is news.
+        if envelope.version > 1:
+            _emit_webhook(
+                request,
+                meta,
+                "version.published",
+                {"title": envelope.title, "version": envelope.version},
+                actor=owner,
+            )
     else:
         envelope = store.get_head(artifact_id)
         if envelope is None:
             return _not_found(artifact_id)
+
+    if meta.status == ARTIFACT_FINAL and not was_final:
+        _emit_webhook(
+            request,
+            meta,
+            "artifact.finalized",
+            {"title": envelope.title, "version": envelope.version},
+            actor=owner,
+        )
 
     logger.info(
         "Updated artifact %s (owner project %s, version %d, source %s, "
@@ -3605,10 +4638,17 @@ def update_artifact(
         "Lists the artifacts owned by the caller's own project — ownership is "
         "the pair (stack, project id) derived from the Storage token, so the "
         "listing depends only on the credentials, never on a query. Each row "
-        "carries the title, timestamps, 'protected' and 'accept_versions' "
-        "flags, head version, total version count, pending 'proposed_count', "
-        "and every public URL. Newest 'updated_at' first. This is the "
-        "endpoint the /admin studio calls to sign a visitor in."
+        "carries the internal 'id' and the public 'share_id', the title, "
+        "timestamps, 'protected' and 'accept_versions' flags, head version, "
+        "total version count, pending 'proposed_count', the artifact 'status' "
+        "with 'trashed_at', a 'webhooks_count' (never the URLs themselves), "
+        "and every public URL built from the share id. Newest 'updated_at' "
+        "first.\n\n"
+        "Trashed artifacts are listed too, with status 'trashed' and a "
+        "'trashed_at' timestamp: this is the owner's own view, so it is also "
+        "their trash can. Their public URLs answer 404 until they are "
+        "restored. This is the endpoint the /admin studio calls to sign a "
+        "visitor in."
     ),
     responses={
         200: {
@@ -3630,43 +4670,218 @@ def update_artifact(
 def list_artifacts(
     request: Request, auth: tuple[Owner, str] = Depends(require_owner)
 ) -> dict:
-    """List the artifacts owned by the caller's project."""
+    """List the artifacts owned by the caller's project, trash included."""
     owner, _token = auth
     ensure_hydrated(request.app)
+    store = request.app.state.store
     base = base_url(request)
-    rows = request.app.state.store.list_owner(owner.key)
-    return {
-        "project_id": owner.project_id,
-        "artifacts": [{**row, **artifact_urls(base, row["id"])} for row in rows],
-    }
+    rows = store.list_owner(owner.key)
+    artifacts = []
+    for row in rows:
+        meta = store.get_meta(row["id"])
+        artifacts.append(
+            {
+                **row,
+                # A count, never the URLs: a webhook URL is a capability (a
+                # Slack hook's path *is* its credential), so the only response
+                # that echoes them is the owner PUT that set them.
+                "webhooks_count": len(meta.webhooks) if meta is not None else 0,
+                # Built from share_id, so a rotated link is reflected here.
+                **artifact_urls(base, row["share_id"]),
+            }
+        )
+    return {"project_id": owner.project_id, "artifacts": artifacts}
 
 
 @app.delete(
     "/api/artifacts/{artifact_id}",
     tags=["artifacts"],
-    summary="Delete an artifact",
+    summary="Move an artifact to the trash",
     description=(
-        "Deletes every version, every comment thread and the meta record from "
-        "the hub's project, so the artifact and all its URLs stop resolving. "
-        "Irreversible. The canonical copies in the authors' own Keboola "
-        "projects are left untouched. Requires a Storage token from the "
-        "owning project; another project's valid token is a 403."
+        "Owner-only **soft** delete, reversible by design. Nothing is removed "
+        "from Storage: the artifact's status becomes 'trashed', its public "
+        "link stops resolving (every /a/{share_id} route answers 404, exactly "
+        "as if it had never existed) and it is frozen — new versions and new "
+        "comments answer 409.\n\n"
+        "The artifact keeps appearing in GET /api/artifacts with status "
+        "'trashed' and a 'trashed_at' timestamp, so its owner still sees it. "
+        "POST /api/artifacts/{id}/restore brings it back to whatever status "
+        "it had before, on the same share id and the same URL.\n\n"
+        "To erase it for good — versions, comment threads, view statistics and "
+        "counters — use DELETE /api/artifacts/{id}/purge, which is the "
+        "irreversible one. The canonical copies in the authors' own Keboola "
+        "projects are never touched by either route."
     ),
     responses={
         200: {
             "description": (
-                "Deleted; JSON reporting how many comment threads went with "
-                "it and confirming the canonical copies were kept."
+                "Moved to the trash (or already there — trashing twice is a "
+                "successful no-op); JSON with 'trashed': true, the artifact "
+                "id, the timestamp and a 'restore_hint' naming the way back."
             )
         },
         400: RESP_STACK_400,
         401: RESP_TOKEN_401,
-        403: {
+        403: RESP_OWNER_403,
+        404: RESP_NOT_FOUND,
+        502: {
             "description": (
-                "Token is valid but not from the project that owns this "
-                "artifact."
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable so the "
+                "meta record could not be rewritten."
             )
         },
+    },
+)
+def delete_artifact(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Soft-delete: freeze the artifact and kill its public link."""
+    owner, _token = auth
+    ensure_hydrated(request.app)
+    store = request.app.state.store
+
+    meta = store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    _owner_only(meta, owner)
+
+    now = _now()
+    if not store.trash(artifact_id, now):
+        # trash() only answers False for an artifact it cannot find, and we
+        # just loaded its meta — so this is a race with a concurrent purge.
+        return _not_found(artifact_id)
+
+    _emit_webhook(request, meta, "artifact.trashed", {"trashed_at": now}, actor=owner)
+    logger.info(
+        "Artifact %s moved to the trash (owner project %s)",
+        artifact_id,
+        owner.project_id,
+    )
+    return JSONResponse(
+        {
+            "trashed": True,
+            "id": artifact_id,
+            "trashed_at": meta.trashed_at or now,
+            "restore_hint": (
+                f"POST /api/artifacts/{artifact_id}/restore brings it back on "
+                "the same URL; DELETE /api/artifacts/"
+                f"{artifact_id}/purge erases it for good."
+            ),
+        }
+    )
+
+
+@app.post(
+    "/api/artifacts/{artifact_id}/restore",
+    tags=["artifacts"],
+    summary="Restore an artifact from the trash",
+    description=(
+        "Owner-only. Undoes DELETE /api/artifacts/{id}: the artifact returns "
+        "to the status it was trashed from ('draft' or 'final'), its public "
+        "link resolves again on the *same* share id, and versions and comments "
+        "unfreeze. Restoring an artifact that is not in the trash is a 409 — "
+        "there is nothing to undo."
+    ),
+    responses={
+        200: {
+            "description": (
+                "Restored; JSON with 'restored': true, the status it came back "
+                "to, and its public URLs."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: RESP_OWNER_403,
+        404: RESP_NOT_FOUND,
+        409: {"description": "This artifact is not in the trash."},
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable."
+            )
+        },
+    },
+)
+def restore_artifact(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Bring a trashed artifact back to the status it was trashed from."""
+    owner, _token = auth
+    ensure_hydrated(request.app)
+    store = request.app.state.store
+
+    meta = store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    _owner_only(meta, owner)
+
+    if not meta.is_trashed():
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "artifact is not in the trash",
+                "detail": (
+                    f"Its status is {meta.status!r}, so there is nothing to "
+                    "restore."
+                ),
+                "id": artifact_id,
+            },
+        )
+
+    if not store.restore(artifact_id, _now()):
+        return _not_found(artifact_id)
+
+    restored = store.get_meta(artifact_id) or meta
+    _emit_webhook(
+        request, restored, "artifact.restored", {"status": restored.status}, actor=owner
+    )
+    logger.info(
+        "Artifact %s restored from the trash to %s (owner project %s)",
+        artifact_id,
+        restored.status,
+        owner.project_id,
+    )
+    return JSONResponse(
+        {
+            "restored": True,
+            "id": artifact_id,
+            "share_id": restored.share_id,
+            "artifact_status": restored.status,
+            **artifact_urls(base_url(request), restored.share_id),
+        }
+    )
+
+
+@app.delete(
+    "/api/artifacts/{artifact_id}/purge",
+    tags=["artifacts"],
+    summary="Permanently erase an artifact",
+    description=(
+        "Owner-only, and **irreversible** — there is no undo and no trash to "
+        "fall back on. Deletes every version file, every comment thread and "
+        "the meta record from the hub's project, and forgets the artifact's "
+        "view statistics and rate-limit counters. All of its URLs stop "
+        "resolving for good.\n\n"
+        "An artifact does not have to be in the trash first, but the gentler "
+        "path is DELETE /api/artifacts/{id} (soft, reversible) followed by "
+        "this once you are sure. The canonical copies in the authors' own "
+        "Keboola projects are left untouched — this only erases the hub's."
+    ),
+    responses={
+        200: {
+            "description": (
+                "Purged; JSON reporting how many comment threads went with it "
+                "and confirming the canonical copies were kept."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: RESP_OWNER_403,
         404: RESP_NOT_FOUND,
         502: {
             "description": (
@@ -3679,12 +4894,12 @@ def list_artifacts(
         },
     },
 )
-def delete_artifact(
+def purge_artifact(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
     auth: tuple[Owner, str] = Depends(require_owner),
 ) -> Response:
-    """Delete every version; the authors' canonical copies are left untouched."""
+    """Erase every version; the authors' canonical copies are left untouched."""
     owner, _token = auth
     ensure_hydrated(request.app)
     store = request.app.state.store
@@ -3700,7 +4915,7 @@ def delete_artifact(
         # artifact stays readable. Reporting "deleted": true here would tell an
         # owner their content is unreachable while it is still being served.
         logger.error(
-            "Partial delete of artifact %s: some Storage files remain",
+            "Partial purge of artifact %s: some Storage files remain",
             artifact_id,
         )
         return JSONResponse(
@@ -3717,8 +4932,21 @@ def delete_artifact(
     # Comment threads live in their own files; without this they would outlive
     # the artifact as orphaned Storage files nothing can ever reach again.
     threads = request.app.state.comments.delete_all_for(artifact_id)
+    # Same reasoning for the state sidecar: view rows and rate-limit counters
+    # keyed by this artifact have nothing left to describe. Best effort — a
+    # sidecar failure must not turn a completed purge into an error.
+    database = _statedb(request.app)
+    if database is not None:
+        try:
+            database.forget_artifact(artifact_id)
+        except Exception as exc:  # noqa: BLE001 - the purge itself succeeded
+            logger.warning(
+                "Could not forget the state rows of artifact %s: %s",
+                artifact_id,
+                exc,
+            )
     logger.info(
-        "Deleted artifact %s and %d comment thread(s) (owner project %s)",
+        "Purged artifact %s and %d comment thread(s) (owner project %s)",
         artifact_id,
         threads,
         owner.project_id,
@@ -3726,8 +4954,433 @@ def delete_artifact(
     return JSONResponse(
         {
             "deleted": True,
+            "purged": True,
             "comment_threads_deleted": threads,
             "note": "canonical copies in the authors' projects were not touched",
+        }
+    )
+
+
+@app.post(
+    "/api/artifacts/{artifact_id}/rotate-link",
+    tags=["artifacts"],
+    summary="Rotate the public link",
+    description=(
+        "Owner-only. Mints a fresh share id for the artifact and returns its "
+        "new URLs.\n\n"
+        "**The old link stops working immediately.** Anyone holding the "
+        "previous /a/{share_id} URL — and anyone who noted the bare artifact "
+        "id, which stops resolving publicly the moment it differs from the "
+        "share id — gets a 404 from the next request on. That revocation is "
+        "the entire point: a capability URL sent to the wrong person can be "
+        "taken back. There is no grace period and no way to un-rotate, so "
+        "reshare the new URL with everyone who should still have it.\n\n"
+        "Unlock cookies handed out under the old link go with it (they are "
+        "scoped to the old path), so readers of a password-protected artifact "
+        "unlock once more. The internal artifact id, the content, the version "
+        "history and the comment threads are all unchanged — this rotates the "
+        "address, not the artifact."
+    ),
+    responses={
+        200: {
+            "description": (
+                "Rotated; JSON with the new 'share_id', every public URL "
+                "rebuilt from it, the previous share id and a warning that it "
+                "no longer resolves."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: RESP_OWNER_403,
+        404: RESP_NOT_FOUND,
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable so the "
+                "meta record could not be rewritten."
+            )
+        },
+    },
+)
+def rotate_link(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Mint a new public share id and revoke the previous link."""
+    owner, _token = auth
+    ensure_hydrated(request.app)
+    store = request.app.state.store
+
+    meta = store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    _owner_only(meta, owner)
+
+    previous = meta.share_id
+    new_share = store.rotate_share(artifact_id, when_iso=_now())
+    if new_share is None:
+        return _not_found(artifact_id)
+
+    # rotate_share persisted the new meta, so this reload sees the new share
+    # id; the fallback only guards an impossible read failure right after it.
+    rotated = store.get_meta(artifact_id) or meta
+    _emit_webhook(
+        request, rotated, "link.rotated", {"share_id": new_share}, actor=owner
+    )
+    logger.info(
+        "Rotated the public link of artifact %s (owner project %s)",
+        artifact_id,
+        owner.project_id,
+    )
+    return JSONResponse(
+        {
+            "id": artifact_id,
+            "share_id": new_share,
+            "previous_share_id": previous,
+            "warning": (
+                "The previous link stopped working immediately: "
+                f"/a/{previous} now answers 404, and so does the bare "
+                "artifact id. Reshare the new URL with everyone who should "
+                "still have access."
+            ),
+            **artifact_urls(base_url(request), new_share),
+        }
+    )
+
+
+@app.get(
+    "/api/artifacts/{artifact_id}/stats",
+    tags=["artifacts"],
+    summary="View statistics for one artifact",
+    description=(
+        "Owner-only. Reports how often the artifact was read: 'total' across "
+        "all of recorded history, 'by_kind' (which surface — 'page' for the "
+        "rendered wrapper, 'raw', 'source', 'version') and 'by_day' for the "
+        "most recent 30 UTC days, oldest first so it charts as-is.\n\n"
+        "Counts come from the hub's operational-state sidecar, which "
+        "snapshots itself into Storage periodically: a crash can lose the last "
+        "few minutes, and a purge forgets an artifact's numbers entirely. "
+        "These are traffic figures, not an audit log — no reader identity, no "
+        "address and no referrer is recorded anywhere."
+    ),
+    responses={
+        200: {
+            "description": (
+                "JSON with 'id', 'share_id', 'total', 'by_day' and 'by_kind'. "
+                "An artifact nobody has read yet reports zeros, not a 404."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: RESP_OWNER_403,
+        404: RESP_NOT_FOUND,
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable."
+            )
+        },
+    },
+)
+def artifact_stats(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Per-artifact view counts, for the owning project only."""
+    owner, _token = auth
+    ensure_hydrated(request.app)
+
+    meta = request.app.state.store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    _owner_only(meta, owner)
+
+    database = _statedb(request.app)
+    empty = {"total": 0, "by_day": [], "by_kind": {}}
+    if database is None:
+        views = empty
+    else:
+        try:
+            views = database.views(artifact_id)
+        except Exception as exc:  # noqa: BLE001 - stats never 500 the owner
+            logger.warning(
+                "Could not read view statistics of artifact %s: %s",
+                artifact_id,
+                exc,
+            )
+            views = empty
+    return JSONResponse({**views, "id": artifact_id, "share_id": meta.share_id})
+
+
+# --------------------------------------------------------------------------
+# Guest invitations
+#
+# An invitation is a named, revocable capability that lets one human without a
+# Keboola account comment on one artifact. It is a pair: a public
+# ``invitation_id`` stored in the artifact's meta record, and a secret that is
+# shown **once**, hashed exactly like a reader password and never stored in the
+# clear.
+#
+# The secret travels in the *fragment* of the review URL
+# (``/a/{share}/review#invite={id}.{secret}``), which browsers never send to
+# the server, and from there only ever into the ``X-Artifact-Guest`` request
+# header. It therefore stays out of access logs, out of ``Referer`` and out of
+# anything a proxy records — the same discipline the reader password gets.
+# --------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/artifacts/{artifact_id}/invitations",
+    status_code=201,
+    tags=["artifacts"],
+    summary="Invite a guest to comment",
+    description=(
+        "Owner-only. Mints a named, revocable invitation that lets one person "
+        "*without* a Keboola account comment on this artifact, and returns "
+        "the review URL that carries it.\n\n"
+        "**The secret is shown exactly once.** It is hashed before it is "
+        "stored (PBKDF2, like a reader password), so neither this hub nor its "
+        "owner can ever show it again — a lost link is replaced by revoking "
+        "the invitation and minting another one. It rides the URL *fragment* "
+        "(after the #), which browsers never send to a server, and reaches "
+        "this API only in the X-Artifact-Guest header.\n\n"
+        "What the invitation grants is narrow and only grows narrower: open a "
+        "comment thread, reply, and resolve or delete threads the guest "
+        "themselves opened. It never grants a version submission, never any "
+        "/api/* management call, and never access to another artifact. "
+        "'comments_mode' does not gate a guest — the invitation *is* the "
+        "grant — but a final or trashed artifact is frozen for them exactly "
+        "as it is for everybody else."
+    ),
+    responses={
+        201: {
+            "description": (
+                "Invitation created; JSON with 'invitation_id', 'name' and "
+                "the one-time 'review_url'."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: RESP_OWNER_403,
+        404: RESP_NOT_FOUND,
+        409: RESP_FINAL_409,
+        422: {
+            "description": (
+                "The name is empty or longer than "
+                f"{MAX_INVITATION_NAME_CHARS} characters, or the artifact "
+                "already holds HUB_MAX_INVITATIONS_PER_ARTIFACT live "
+                "invitations."
+            )
+        },
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable so the "
+                "meta record could not be rewritten."
+            )
+        },
+    },
+)
+def create_invitation(
+    body: InvitationBody,
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Mint a one-time guest invitation and return its review URL."""
+    owner, _token = auth
+    ensure_hydrated(request.app)
+    store = request.app.state.store
+
+    meta = store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    _owner_only(meta, owner)
+    if meta.is_frozen():
+        return _document_frozen(meta, "new invitations")
+
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(
+            status_code=422, detail="an invitation needs a name for the guest"
+        )
+    _make_room_for_invitation(meta)
+
+    # Same generator as an artifact id: 18 random bytes, urlsafe — unguessable,
+    # and free of the "." that separates the two halves of the credential.
+    secret = new_artifact_id()
+    invitation_id = new_artifact_id()
+    meta.invitations = list(meta.invitations) + [
+        {
+            "id": invitation_id,
+            "name": name,
+            "secret": hash_password(secret),
+            "created_at": _now(),
+            "revoked": False,
+        }
+    ]
+    meta.updated_at = _now()
+    store.save_meta(meta)
+
+    base = base_url(request).rstrip("/")
+    logger.info(
+        "Artifact %s invited a guest (%s, owner project %s)",
+        artifact_id,
+        invitation_id,
+        owner.project_id,
+    )
+    return JSONResponse(
+        status_code=201,
+        content={
+            "invitation_id": invitation_id,
+            "name": name,
+            "review_url": (
+                f"{base}/a/{meta.share_id}/review#invite={invitation_id}.{secret}"
+            ),
+            "warning": (
+                "This link is shown once and cannot be recovered — the secret "
+                "is stored hashed. Send it to the person it names; anyone "
+                "holding it can comment as them until you revoke it."
+            ),
+        },
+    )
+
+
+@app.get(
+    "/api/artifacts/{artifact_id}/invitations",
+    tags=["artifacts"],
+    summary="List guest invitations",
+    description=(
+        "Owner-only. Lists this artifact's guest invitations: id, the name "
+        "the owner gave, when it was minted and whether it has been revoked.\n\n"
+        "The secrets are **not** here and cannot be recovered from anywhere — "
+        "they are stored hashed and were shown once, when each invitation was "
+        "created. To give somebody a working link again, revoke theirs and "
+        "mint a new one."
+    ),
+    responses={
+        200: {
+            "description": (
+                "JSON with 'id' and the 'invitations' array (possibly empty); "
+                "no secrets."
+            )
+        },
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: RESP_OWNER_403,
+        404: RESP_NOT_FOUND,
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable."
+            )
+        },
+    },
+)
+def list_invitations(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Every invitation of one artifact, secrets omitted."""
+    owner, _token = auth
+    ensure_hydrated(request.app)
+
+    meta = request.app.state.store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    _owner_only(meta, owner)
+
+    return JSONResponse(
+        {
+            "id": artifact_id,
+            "invitations": [
+                _public_invitation(invitation) for invitation in meta.invitations
+            ],
+        }
+    )
+
+
+@app.delete(
+    "/api/artifacts/{artifact_id}/invitations/{invitation_id}",
+    tags=["artifacts"],
+    summary="Revoke a guest invitation",
+    description=(
+        "Owner-only, and per person: the named invitation stops working "
+        "immediately while every other guest's link keeps working. Comments "
+        "the guest already wrote stay — revoking withdraws the capability, "
+        "not the contribution.\n\n"
+        "Revoking is idempotent: revoking an already-revoked invitation is a "
+        "successful no-op."
+    ),
+    responses={
+        200: {"description": "Revoked; JSON with 'revoked': true."},
+        400: RESP_STACK_400,
+        401: RESP_TOKEN_401,
+        403: RESP_OWNER_403,
+        404: {
+            "description": (
+                "No artifact with this id, or it has no such invitation."
+            )
+        },
+        502: {
+            "description": (
+                "The caller's Keboola stack could not be reached to verify "
+                "the token, or the hub's own Storage is unavailable so the "
+                "meta record could not be rewritten."
+            )
+        },
+    },
+)
+def revoke_invitation(
+    request: Request,
+    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    invitation_id: str = PathParam(..., description=INVITATION_ID_DESC),
+    auth: tuple[Owner, str] = Depends(require_owner),
+) -> Response:
+    """Turn off one person's invitation without touching anybody else's."""
+    owner, _token = auth
+    ensure_hydrated(request.app)
+    store = request.app.state.store
+
+    meta = store.get_meta(artifact_id)
+    if meta is None:
+        return _not_found(artifact_id)
+    _owner_only(meta, owner)
+
+    target = None
+    for invitation in meta.invitations:
+        if invitation.get("id") == invitation_id:
+            target = invitation
+            break
+    if target is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "invitation not found",
+                "id": artifact_id,
+                "invitation_id": invitation_id,
+            },
+        )
+
+    if not target.get("revoked"):
+        target["revoked"] = True
+        meta.updated_at = _now()
+        store.save_meta(meta)
+        logger.info(
+            "Artifact %s revoked guest invitation %s (owner project %s)",
+            artifact_id,
+            invitation_id,
+            owner.project_id,
+        )
+    return JSONResponse(
+        {
+            "revoked": True,
+            "id": artifact_id,
+            "invitation_id": invitation_id,
+            "name": str(target.get("name") or ""),
         }
     )
 
@@ -3802,10 +5455,11 @@ def submit_version(
     if meta is None:
         return _not_found(artifact_id)
 
-    # "final" freezes the artifact for everyone, so it gets its own, clearer
-    # answer instead of the generic "you may not contribute" 403.
-    if meta.is_final():
-        return _document_is_final(artifact_id, "new versions")
+    # A frozen artifact ("final", or in the trash) takes nothing from anybody,
+    # so it gets its own, clearer answer instead of the generic "you may not
+    # contribute" 403 that ``allows_versions_from`` would otherwise produce.
+    if meta.is_frozen():
+        return _document_frozen(meta, "new versions")
 
     is_owner = meta.owner_key == caller.key
     if not meta.allows_versions_from(caller.key):
@@ -3823,7 +5477,20 @@ def submit_version(
     _check_git_credentials(body)
     _require_exactly_one_content(body)
 
-    if not _claim_submission_slot(artifact_id, caller.key):
+    # A base_version that names nothing would render the "outdated" flag
+    # meaningless (and quietly mislead a reviewer), so it is a 422 rather than
+    # a value we store and hope about.
+    if body.base_version is not None:
+        if store.get_version(artifact_id, body.base_version) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"artifact {artifact_id} has no version "
+                    f"{body.base_version}, so it cannot be a base_version"
+                ),
+            )
+
+    if not _claim_submission_slot(request.app, artifact_id, caller.key):
         return _version_rate_limited()
 
     built, source = _build(body)
@@ -3843,10 +5510,38 @@ def submit_version(
         author=_identity(caller),
         status=status,
         note=body.note or None,
+        base_version=body.base_version,
         canonical_file_id=canonical_file_id,
         created_at=_now(),
     )
     envelope.version = store.add_version_next(envelope)
+    # A proposal is news for the owner; an owner's own live version is news for
+    # everybody watching, except the v1 that publishing already produced.
+    if status == STATUS_PROPOSED:
+        _emit_webhook(
+            request,
+            meta,
+            "version.proposed",
+            {
+                "title": envelope.title,
+                "version": envelope.version,
+                "note": envelope.note,
+                "base_version": envelope.base_version,
+            },
+            actor=caller,
+        )
+    elif envelope.version > 1:
+        _emit_webhook(
+            request,
+            meta,
+            "version.published",
+            {
+                "title": envelope.title,
+                "version": envelope.version,
+                "note": envelope.note,
+            },
+            actor=caller,
+        )
     logger.info(
         "Artifact %s got version %d (%s) from project %s",
         artifact_id,
@@ -3861,7 +5556,13 @@ def submit_version(
             "version": envelope.version,
             "status": envelope.status,
             "note": envelope.note,
-            "url": f"{base_url(request).rstrip('/')}/a/{artifact_id}/v/{envelope.version}",
+            "base_version": envelope.base_version,
+            # Built from the share id: the version has to be readable at the
+            # artifact's *public* address, not its internal handle.
+            "url": (
+                f"{base_url(request).rstrip('/')}/a/{meta.share_id}"
+                f"/v/{envelope.version}"
+            ),
         },
     )
 
@@ -3925,6 +5626,17 @@ def promote_version(
         return _version_not_found(artifact_id, version)
 
     head_version = _head_version_of(request, artifact_id)
+    _emit_webhook(
+        request,
+        meta,
+        "version.promoted",
+        {
+            "title": envelope.title,
+            "version": version,
+            "head_version": head_version,
+        },
+        actor=owner,
+    )
     logger.info(
         "Promoted version %d of artifact %s (head is now v%s)",
         version,
@@ -3938,7 +5650,9 @@ def promote_version(
             "status": STATUS_LIVE,
             "head_mode": meta.head_mode,
             "head_version": head_version,
-            "url": f"{base_url(request).rstrip('/')}/a/{artifact_id}/v/{version}",
+            "url": (
+                f"{base_url(request).rstrip('/')}/a/{meta.share_id}/v/{version}"
+            ),
         }
     )
 
@@ -4180,18 +5894,83 @@ def _thread_response(thread: CommentThread, status_code: int) -> JSONResponse:
     )
 
 
-def _comment_rate_limited() -> JSONResponse:
+def _comment_rate_limited(guest: bool = False) -> JSONResponse:
+    who = "Your invitation" if guest else "Your project"
     return JSONResponse(
         status_code=429,
         content={
             "error": "too many comments today",
             "detail": (
-                f"Your project may write {settings.max_comments_per_day} "
-                "comments and replies on one artifact per UTC day."
+                f"{who} may write {settings.max_comments_per_day} comments "
+                "and replies on one artifact per UTC day."
             ),
             "limit": settings.max_comments_per_day,
         },
     )
+
+
+def _comment_writer(request: Request) -> tuple[Owner | None, tuple[str, str] | None]:
+    """Authenticate whoever is about to write a comment.
+
+    Two credentials are accepted, and exactly one is used per request:
+
+    * a Keboola Storage token (the usual two management headers), which
+      identifies a verified *project*, or
+    * an ``X-Artifact-Guest`` invitation credential, which identifies one
+      invited *person* who has no Keboola account at all.
+
+    When both arrive, the guest header wins: sending it is an unambiguous
+    "act as this invitation", and a caller who wants their project's identity
+    simply does not send it. (The review UI never sends both — it prefers the
+    token it holds and drops the invitation for that request.)
+
+    Returns ``(owner, None)`` or ``(None, credential)``. The guest credential
+    comes back unverified on purpose: proving it needs the artifact's meta
+    record, and that lookup belongs after this function so a bad *token* still
+    answers 401 before the artifact is even looked up — the ordering every
+    existing caller of these routes already depends on.
+    """
+    credential = _guest_credential(request)
+    if credential is not None:
+        return None, credential
+    owner, _token = require_owner(request)
+    return owner, None
+
+
+def _comment_author(
+    caller: Owner | None, invitation: dict | None
+) -> tuple[dict, str]:
+    """``(author record, rate-limit key)`` for a verified comment writer.
+
+    The key is what the daily budget is counted against: an owner key for a
+    project, ``guest:{invitation_id}`` for a guest. The two namespaces cannot
+    collide, so one person's invitation can never spend a project's budget or
+    vice versa.
+    """
+    if caller is not None:
+        return _identity(caller), caller.key
+    author = _guest_identity(invitation or {})
+    return author, author_key_of(author)
+
+
+def _may_moderate_thread(
+    meta: ArtifactMeta,
+    thread: CommentThread,
+    caller: Owner | None,
+    invitation: dict | None,
+) -> bool:
+    """May this writer resolve, reopen or delete ``thread``?
+
+    The artifact owner may moderate anything on their own artifact, and any
+    author may act on their own thread. A guest is only ever the second of
+    those: an invitation grants a voice in the discussion, never authority over
+    somebody else's part of it.
+    """
+    if caller is not None:
+        return caller.key in (meta.owner_key, thread.author_key)
+    author, key = _comment_author(None, invitation)
+    del author
+    return bool(key) and key == thread.author_key
 
 
 @app.post(
@@ -4210,17 +5989,18 @@ def _comment_rate_limited() -> JSONResponse:
         "Any verified Keboola project may comment while 'comments_mode' is "
         "'anyone' (the default); 'allowlist' restricts it to the artifact's "
         "contributors and 'off' closes it. The owner may always comment "
-        "unless the artifact is final."
+        "unless the artifact is final.\n\n" + GUEST_WRITE_NOTE + "\n\n"
+        + COMMENT_TARGET_NOTE
     ),
     responses={
         201: {
             "description": (
                 "Thread created; returns the whole thread (selector, body, "
-                "author project, timestamps) plus 'thread_id'."
+                "author project or guest name, timestamps) plus 'thread_id'."
             )
         },
         400: RESP_STACK_400,
-        401: RESP_TOKEN_401,
+        401: RESP_COMMENT_401,
         403: {
             "description": (
                 "Commenting is closed on this artifact, or the caller's "
@@ -4235,12 +6015,7 @@ def _comment_rate_limited() -> JSONResponse:
                 "too long, or the comment body is empty or too long."
             )
         },
-        429: {
-            "description": (
-                "This project reached HUB_MAX_COMMENTS_PER_DAY comments and "
-                "replies on this artifact today."
-            )
-        },
+        429: RESP_COMMENTS_429,
         502: {
             "description": (
                 "The caller's Keboola stack could not be reached to verify "
@@ -4252,40 +6027,42 @@ def _comment_rate_limited() -> JSONResponse:
 def create_comment(
     body: CommentBody,
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
-    auth: tuple[Owner, str] = Depends(require_owner),
+    artifact_id: str = PathParam(..., description=COMMENT_TARGET_ID_DESC),
 ) -> Response:
     """Open a thread anchored to a quoted passage of one version."""
-    caller, _token = auth
-    ensure_hydrated(request.app)
-    store = request.app.state.store
-
-    meta = store.get_meta(artifact_id)
+    caller, credential = _comment_writer(request)
+    meta = _comment_target_of(request, artifact_id)
     if meta is None:
         return _not_found(artifact_id)
-    if meta.is_final():
-        return _document_is_final(artifact_id, "new comments")
-    if not meta.allows_comments_from(caller.key):
+    invitation = _verify_guest(meta, credential) if credential else None
+
+    if meta.is_frozen():
+        return _document_frozen(meta, "new comments")
+    # A guest is not subject to comments_mode: their invitation *is* the grant,
+    # and it was issued by the very owner that mode belongs to.
+    if caller is not None and not meta.allows_comments_from(caller.key):
         return _comments_closed(meta)
 
-    if store.get_version(artifact_id, body.version) is None:
+    store = request.app.state.store
+    if store.get_version(meta.id, body.version) is None:
         raise HTTPException(
             status_code=422,
             detail=f"artifact {artifact_id} has no version {body.version}",
         )
 
-    if not _claim_comment_slot(artifact_id, caller.key):
-        return _comment_rate_limited()
+    author, writer_key = _comment_author(caller, invitation)
+    if not _claim_comment_slot(request.app, meta.id, writer_key):
+        return _comment_rate_limited(guest=caller is None)
 
     thread = CommentThread(
         id=new_artifact_id(),
-        artifact_id=artifact_id,
+        artifact_id=meta.id,
         version=body.version,
         selector=Selector(
             exact=body.exact, prefix=body.prefix, suffix=body.suffix
         ),
         body=body.body,
-        author=_identity(caller),
+        author=author,
         created_at=_now(),
     )
     try:
@@ -4293,12 +6070,20 @@ def create_comment(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    _emit_webhook(
+        request,
+        meta,
+        "comment.created",
+        {"thread_id": thread.id, "version": thread.version, "quote": body.exact},
+        actor=caller,
+        actor_name=None if caller is not None else _guest_actor(invitation or {}),
+    )
     logger.info(
-        "Artifact %s got comment thread %s on v%d from project %s",
-        artifact_id,
+        "Artifact %s got comment thread %s on v%d from %s",
+        meta.id,
         thread.id,
         thread.version,
-        caller.project_id,
+        f"project {caller.project_id}" if caller else f"guest {writer_key}",
     )
     return _thread_response(thread, 201)
 
@@ -4312,7 +6097,8 @@ def create_comment(
         "Appends a reply to an existing thread. The same policy as opening a "
         "thread applies: 'comments_mode' decides who may write, the owner may "
         "always reply unless the artifact is final, and replies count against "
-        "the same per-project daily cap."
+        "the same per-project daily cap.\n\n" + GUEST_WRITE_NOTE + "\n\n"
+        + COMMENT_TARGET_NOTE
     ),
     responses={
         201: {
@@ -4322,7 +6108,7 @@ def create_comment(
             )
         },
         400: RESP_STACK_400,
-        401: RESP_TOKEN_401,
+        401: RESP_COMMENT_401,
         403: {
             "description": (
                 "Commenting is closed on this artifact, or the caller's "
@@ -4332,12 +6118,7 @@ def create_comment(
         404: RESP_THREAD_404,
         409: RESP_FINAL_409,
         422: {"description": "The reply body is empty or too long."},
-        429: {
-            "description": (
-                "This project reached HUB_MAX_COMMENTS_PER_DAY comments and "
-                "replies on this artifact today."
-            )
-        },
+        429: RESP_COMMENTS_429,
         502: {
             "description": (
                 "The caller's Keboola stack could not be reached to verify "
@@ -4349,43 +6130,51 @@ def create_comment(
 def reply_to_comment(
     body: ReplyBody,
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=COMMENT_TARGET_ID_DESC),
     thread_id: str = PathParam(..., description=THREAD_ID_DESC),
-    auth: tuple[Owner, str] = Depends(require_owner),
 ) -> Response:
     """Append one reply to an existing thread."""
-    caller, _token = auth
-    ensure_hydrated(request.app)
-
-    meta = request.app.state.store.get_meta(artifact_id)
+    caller, credential = _comment_writer(request)
+    meta = _comment_target_of(request, artifact_id)
     if meta is None:
         return _not_found(artifact_id)
-    if meta.is_final():
-        return _document_is_final(artifact_id, "new comments")
-    if not meta.allows_comments_from(caller.key):
+    invitation = _verify_guest(meta, credential) if credential else None
+
+    if meta.is_frozen():
+        return _document_frozen(meta, "new comments")
+    if caller is not None and not meta.allows_comments_from(caller.key):
         return _comments_closed(meta)
 
     comments = request.app.state.comments
-    thread = comments.get(artifact_id, thread_id)
+    thread = comments.get(meta.id, thread_id)
     if thread is None:
         return _thread_not_found(artifact_id, thread_id)
 
-    if not _claim_comment_slot(artifact_id, caller.key):
-        return _comment_rate_limited()
+    author, writer_key = _comment_author(caller, invitation)
+    if not _claim_comment_slot(request.app, meta.id, writer_key):
+        return _comment_rate_limited(guest=caller is None)
 
     thread.replies.append(
-        Reply(author=_identity(caller), body=body.body, created_at=_now())
+        Reply(author=author, body=body.body, created_at=_now())
     )
     try:
         comments.update(thread)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    _emit_webhook(
+        request,
+        meta,
+        "comment.replied",
+        {"thread_id": thread_id, "version": thread.version},
+        actor=caller,
+        actor_name=None if caller is not None else _guest_actor(invitation or {}),
+    )
     logger.info(
-        "Comment thread %s of artifact %s got a reply from project %s",
+        "Comment thread %s of artifact %s got a reply from %s",
         thread_id,
-        artifact_id,
-        caller.project_id,
+        meta.id,
+        f"project {caller.project_id}" if caller else f"guest {writer_key}",
     )
     return _thread_response(thread, 201)
 
@@ -4401,7 +6190,11 @@ def reply_to_comment(
         "The body is optional: sending nothing (or {\"resolved\": true}) "
         "resolves the thread, and {\"resolved\": false} reopens a resolved "
         "one — the same two principals may do either. Asking for the state "
-        "the thread is already in is a 409."
+        "the thread is already in is a 409.\n\n"
+        "A guest (X-Artifact-Guest) may resolve and reopen the threads they "
+        "opened themselves, and only those — an invitation never carries "
+        "moderation authority over anybody else's thread.\n\n"
+        + COMMENT_TARGET_NOTE
     ),
     responses={
         200: {
@@ -4411,11 +6204,11 @@ def reply_to_comment(
             )
         },
         400: RESP_STACK_400,
-        401: RESP_TOKEN_401,
+        401: RESP_COMMENT_401,
         403: {
             "description": (
                 "Only the artifact owner and the thread's author may resolve "
-                "or reopen it."
+                "or reopen it; a guest only their own threads."
             )
         },
         404: RESP_THREAD_404,
@@ -4435,25 +6228,23 @@ def reply_to_comment(
 )
 def resolve_comment(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=COMMENT_TARGET_ID_DESC),
     thread_id: str = PathParam(..., description=THREAD_ID_DESC),
     body: ResolveBody | None = None,
-    auth: tuple[Owner, str] = Depends(require_owner),
 ) -> Response:
     """Owner or thread author closes a thread — or reopens it."""
-    caller, _token = auth
-    ensure_hydrated(request.app)
-
-    meta = request.app.state.store.get_meta(artifact_id)
+    caller, credential = _comment_writer(request)
+    meta = _comment_target_of(request, artifact_id)
     if meta is None:
         return _not_found(artifact_id)
+    invitation = _verify_guest(meta, credential) if credential else None
 
     comments = request.app.state.comments
-    thread = comments.get(artifact_id, thread_id)
+    thread = comments.get(meta.id, thread_id)
     if thread is None:
         return _thread_not_found(artifact_id, thread_id)
 
-    if caller.key not in (meta.owner_key, thread.author_key):
+    if not _may_moderate_thread(meta, thread, caller, invitation):
         raise HTTPException(
             status_code=403,
             detail=(
@@ -4475,16 +6266,17 @@ def resolve_comment(
             },
         )
 
+    author, writer_key = _comment_author(caller, invitation)
     thread.resolved = wanted
-    thread.resolved_by = _identity(caller) if wanted else None
+    thread.resolved_by = author if wanted else None
     comments.update(thread)
 
     logger.info(
-        "Comment thread %s of artifact %s %s by project %s",
+        "Comment thread %s of artifact %s %s by %s",
         thread_id,
-        artifact_id,
+        meta.id,
         "resolved" if wanted else "reopened",
-        caller.project_id,
+        f"project {caller.project_id}" if caller else f"guest {writer_key}",
     )
     return _thread_response(thread, 200)
 
@@ -4496,15 +6288,18 @@ def resolve_comment(
     description=(
         "Removes a thread and all its replies from Storage. Available to the "
         "artifact owner (moderation) and to the thread's own author "
-        "(withdrawing a comment); anyone else gets a 403. Irreversible."
+        "(withdrawing a comment); anyone else gets a 403. Irreversible.\n\n"
+        "A guest (X-Artifact-Guest) may withdraw the threads they opened "
+        "themselves, and only those.\n\n" + COMMENT_TARGET_NOTE
     ),
     responses={
         200: {"description": "Thread deleted."},
         400: RESP_STACK_400,
-        401: RESP_TOKEN_401,
+        401: RESP_COMMENT_401,
         403: {
             "description": (
-                "Only the artifact owner or the thread's author may delete it."
+                "Only the artifact owner or the thread's author may delete "
+                "it; a guest only their own threads."
             )
         },
         404: RESP_THREAD_404,
@@ -4518,24 +6313,22 @@ def resolve_comment(
 )
 def delete_comment(
     request: Request,
-    artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
+    artifact_id: str = PathParam(..., description=COMMENT_TARGET_ID_DESC),
     thread_id: str = PathParam(..., description=THREAD_ID_DESC),
-    auth: tuple[Owner, str] = Depends(require_owner),
 ) -> Response:
     """Owner moderates, or an author withdraws their own thread."""
-    caller, _token = auth
-    ensure_hydrated(request.app)
-
-    meta = request.app.state.store.get_meta(artifact_id)
+    caller, credential = _comment_writer(request)
+    meta = _comment_target_of(request, artifact_id)
     if meta is None:
         return _not_found(artifact_id)
+    invitation = _verify_guest(meta, credential) if credential else None
 
     comments = request.app.state.comments
-    thread = comments.get(artifact_id, thread_id)
+    thread = comments.get(meta.id, thread_id)
     if thread is None:
         return _thread_not_found(artifact_id, thread_id)
 
-    if caller.key not in (meta.owner_key, thread.author_key):
+    if not _may_moderate_thread(meta, thread, caller, invitation):
         raise HTTPException(
             status_code=403,
             detail=(
@@ -4544,12 +6337,13 @@ def delete_comment(
             ),
         )
 
-    comments.delete(artifact_id, thread_id)
+    comments.delete(meta.id, thread_id)
+    _, writer_key = _comment_author(caller, invitation)
     logger.info(
-        "Deleted comment thread %s of artifact %s (by project %s)",
+        "Deleted comment thread %s of artifact %s (by %s)",
         thread_id,
-        artifact_id,
-        caller.project_id,
+        meta.id,
+        f"project {caller.project_id}" if caller else f"guest {writer_key}",
     )
     return JSONResponse(
         {"deleted": True, "id": artifact_id, "thread_id": thread_id}

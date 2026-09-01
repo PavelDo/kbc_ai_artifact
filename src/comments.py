@@ -39,6 +39,7 @@ from src.kbc import BackendError, FilesBackend
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "AUTHOR_GUEST",
     "MAX_BODY_CHARS",
     "MAX_QUOTE_CHARS",
     "SCHEMA_VERSION",
@@ -48,9 +49,20 @@ __all__ = [
     "CommentThread",
     "Reply",
     "Selector",
+    "author_key_of",
+    "guest_author",
     "tag_cmt_artifact",
     "tag_cmt_id",
 ]
+
+#: ``author["kind"]`` marking a comment written by an invited guest — a human
+#: without a Keboola account, holding a per-person invitation URL — rather than
+#: by a verified project. Any other author is a project identity.
+AUTHOR_GUEST = "guest"
+
+#: Prefix of the author key of a guest, so guest and project keys can never
+#: collide (a project key is ``"{project_id}@{stack host}"``).
+_GUEST_KEY_PREFIX = "guest:"
 
 #: Tag on every comment file; drives :meth:`CommentStore.hydrate`.
 TAG_CMT_ALL = "artifact-hub-cmt"
@@ -105,13 +117,54 @@ def _stack_host(stack_url: str) -> str:
     return urlsplit(stack_url).hostname or ""
 
 
+def _is_guest(identity: dict | None) -> bool:
+    """True when this author record describes an invited guest."""
+    return isinstance(identity, dict) and identity.get("kind") == AUTHOR_GUEST
+
+
+def guest_author(invitation_id: str, name: str) -> dict:
+    """The author record stored for a comment written by an invited guest.
+
+    Deliberately tiny: the guest has no project, no stack and no token, and the
+    invitation *secret* is never part of it — only the invitation id, which is
+    what revocation and rate limiting key off.
+    """
+    return {
+        "kind": AUTHOR_GUEST,
+        "name": str(name or ""),
+        "invitation_id": str(invitation_id or ""),
+    }
+
+
+def author_key_of(identity: dict | None) -> str:
+    """Stable key identifying whoever wrote something, or "" when unknown.
+
+    Two disjoint namespaces meet here: a verified project is keyed by its owner
+    key (``"{project_id}@{stack host}"``, put there by the API layer) and a
+    guest by ``"guest:{invitation_id}"``. Ownership checks — may this caller
+    resolve or delete this thread? — compare these keys, so the prefix is what
+    keeps an invitation id from ever matching a project.
+    """
+    if not isinstance(identity, dict):
+        return ""
+    if _is_guest(identity):
+        invitation_id = str(identity.get("invitation_id") or "")
+        return f"{_GUEST_KEY_PREFIX}{invitation_id}" if invitation_id else ""
+    return str(identity.get("key") or "")
+
+
 def _identity_summary(identity: dict | None) -> dict:
-    """Public projection of a verified identity: project + stack *host* only.
+    """Public projection of an author: project + stack *host*, or a guest name.
 
     The full ``stack_url`` and the owner ``key`` stay internal; a reader holding
-    the capability URL learns which project spoke, not how to address it.
+    the capability URL learns which project spoke, not how to address it. A
+    guest is reduced even harder — to the name their inviter gave them and
+    nothing else, so neither the invitation id nor anything derived from the
+    invitation URL is ever published beside their comment.
     """
     identity = identity if isinstance(identity, dict) else {}
+    if _is_guest(identity):
+        return {"kind": AUTHOR_GUEST, "name": str(identity.get("name") or "")}
     return {
         "project_id": identity.get("project_id"),
         "project_name": identity.get("project_name"),
@@ -165,8 +218,8 @@ class Reply:
 
     @property
     def author_key(self) -> str:
-        """Author key (stack + project), or "" when the record has no author."""
-        return str(self.author.get("key") or "")
+        """Author key: the project's, ``guest:{id}``, or "" when unknown."""
+        return author_key_of(self.author)
 
     def to_dict(self) -> dict:
         return {
@@ -219,8 +272,8 @@ class CommentThread:
 
     @property
     def author_key(self) -> str:
-        """Author key (stack + project), or "" when the record has no author."""
-        return str(self.author.get("key") or "")
+        """Author key: the project's, ``guest:{id}``, or "" when unknown."""
+        return author_key_of(self.author)
 
     def to_json(self) -> bytes:
         """Serialize the thread to UTF-8 JSON bytes."""
@@ -288,9 +341,10 @@ class CommentThread:
     def public_dict(self) -> dict:
         """The whole thread, safe to hand to any capability-URL holder.
 
-        Identities are reduced to ``project_id`` / ``project_name`` /
+        Project identities are reduced to ``project_id`` / ``project_name`` /
         ``stack_host``: neither the full ``stack_url`` nor the internal owner
-        ``key`` ever leaves this method.
+        ``key`` ever leaves this method. A guest is reduced to
+        ``{"kind": "guest", "name": ...}`` — their invitation id stays internal.
         """
         return {
             "id": self.id,

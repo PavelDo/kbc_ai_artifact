@@ -274,6 +274,20 @@ def _artifact_status(meta: ArtifactMeta) -> str:
     return status if status in _ARTIFACT_STATUSES else _STATUS_DRAFT
 
 
+def _public_id(meta: ArtifactMeta) -> str:
+    """The artifact's **public** identity, for anything the vault publishes.
+
+    A vault is a download: it leaves the hub and lands in someone's Obsidian
+    folder. The identifier it carries therefore has to be the share id — the
+    half of the identity pair that ``/a/{...}`` URLs use — and never the
+    internal artifact id, which is the owner's handle for every authenticated
+    ``/api/*`` operation and is not the reader's to keep. Falls back to ``id``
+    for a meta record written before share ids existed, where the two were the
+    same string anyway.
+    """
+    return str(getattr(meta, "share_id", "") or meta.id)
+
+
 # ---------------------------------------------------------------------------
 # Vault
 # ---------------------------------------------------------------------------
@@ -326,7 +340,7 @@ def _render_index(
     parts: list[str] = [
         _frontmatter(
             [
-                ("artifact_id", meta.id),
+                ("artifact_id", _public_id(meta)),
                 ("title", title),
                 ("status", _artifact_status(meta)),
                 ("owner_project", _display_name(owner)),
@@ -342,7 +356,7 @@ def _render_index(
         )
     ]
 
-    heading = _snippet(title, _SLUG_MAX_CHARS) or meta.id
+    heading = _snippet(title, _SLUG_MAX_CHARS) or _public_id(meta)
     parts.append(f"\n# {heading}\n")
 
     if head is not None:
@@ -574,7 +588,9 @@ def _render_reasoning(
     events.sort(key=lambda event: (event[0], event[1], event[2]))
 
     parts: list[str] = [
-        _frontmatter([("artifact_id", meta.id), ("note_kind", "reasoning")]),
+        _frontmatter(
+            [("artifact_id", _public_id(meta)), ("note_kind", "reasoning")]
+        ),
         "\n# How this document got here\n\n",
     ]
     if events:
@@ -621,7 +637,7 @@ def build_vault(
     """
     ordered = sorted(envelopes or [], key=lambda env: env.version)
     head = _pick_head(meta, ordered)
-    root = slugify(head.title if head is not None else "", fallback=meta.id)
+    root = slugify(head.title if head is not None else "", fallback=_public_id(meta))
     thread_pairs = _thread_names(list(threads or []))
 
     document_md, document_html = _render_document(head)

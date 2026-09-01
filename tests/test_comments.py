@@ -12,6 +12,8 @@ from src.comments import (
     CommentThread,
     Reply,
     Selector,
+    author_key_of,
+    guest_author,
     tag_cmt_artifact,
     tag_cmt_id,
 )
@@ -196,6 +198,23 @@ class TestPublicDict:
         assert public["resolved_by"] is None
         assert public["replies"] == []
 
+    def test_guest_authors_are_reduced_to_kind_and_name(self):
+        """A guest has no project — and their invitation id stays internal."""
+        thread = _make_thread(
+            author=guest_author("inv-secret-id", "Jana"),
+            replies=[
+                Reply(
+                    author=guest_author("inv-secret-id", "Jana"),
+                    body="Following up.",
+                    created_at="2026-01-02T00:00:00+00:00",
+                )
+            ],
+        )
+        public = thread.public_dict()
+        assert public["author"] == {"kind": "guest", "name": "Jana"}
+        assert public["replies"][0]["author"] == {"kind": "guest", "name": "Jana"}
+        assert "inv-secret-id" not in json.dumps(public)
+
     def test_reply_identities_are_summarized_too(self):
         thread = _make_thread(
             replies=[
@@ -213,6 +232,46 @@ class TestPublicDict:
             "stack_host": "connection.keboola.com",
         }
         assert reply["body"] == "Agreed."
+
+
+class TestAuthorKey:
+    """Project keys and guest keys share one namespace and must not collide."""
+
+    def test_project_author_keeps_its_owner_key(self):
+        assert author_key_of(_identity(key=AUTHOR_A)) == AUTHOR_A
+        assert _make_thread().author_key == AUTHOR_A
+
+    def test_guest_author_is_prefixed_with_its_invitation(self):
+        author = guest_author("inv1", "Jana")
+        assert author == {"kind": "guest", "name": "Jana", "invitation_id": "inv1"}
+        assert author_key_of(author) == "guest:inv1"
+        assert _make_thread(author=author).author_key == "guest:inv1"
+
+    def test_a_guest_key_can_never_look_like_a_project_key(self):
+        """The prefix is what keeps one namespace from answering for the other."""
+        assert author_key_of(guest_author(AUTHOR_A, "impostor")) != AUTHOR_A
+
+    def test_unusable_authors_have_no_key(self):
+        assert author_key_of(None) == ""
+        assert author_key_of({}) == ""
+        assert author_key_of("not a dict") == ""
+        # A guest record with no invitation id could never be matched to one.
+        assert author_key_of({"kind": "guest", "name": "Jana"}) == ""
+
+    def test_guest_authors_survive_a_json_round_trip(self):
+        thread = _make_thread(
+            author=guest_author("inv1", "Jana"),
+            replies=[
+                Reply(
+                    author=guest_author("inv2", "Petr"),
+                    body="Agreed.",
+                    created_at="2026-01-02T00:00:00+00:00",
+                )
+            ],
+        )
+        restored = CommentThread.from_json(thread.to_json())
+        assert restored.author_key == "guest:inv1"
+        assert restored.replies[0].author_key == "guest:inv2"
 
 
 # --------------------------------------------------------------------------

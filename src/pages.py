@@ -1,6 +1,6 @@
 """Human-facing HTML shell pages and their shared mini design system.
 
-Five pages are rendered by the service itself:
+Seven pages are rendered by the service itself:
 
 - the landing page at ``/`` — what the hub is, what it does, and how to drive
   it from a terminal,
@@ -11,7 +11,11 @@ Five pages are rendered by the service itself:
   vanilla JS talks to the same public API a terminal would, and
 - the review UI at ``/a/{id}/review``, a two-pane reader that renders the
   artifact inside a sandboxed ``srcdoc`` iframe and keeps inline comment
-  threads beside it.
+  threads beside it,
+- the changelog at ``/changelog``, this repository's ``CHANGELOG.md`` rendered
+  into the same shell rather than into an artifact page, and
+- the visual diff at ``/a/{id}/diff/{a}..{b}?format=visual``, two versions of
+  one document side by side in their own sandboxed iframes, scrolling in step.
 
 Artifact content itself is never templated here — it is served verbatim from
 the version envelope.
@@ -32,6 +36,7 @@ markup.
 from __future__ import annotations
 
 import html
+import re
 
 #: Google Fonts, linked with ``display=swap``. Both families have full local
 #: fallback stacks in ``--font-*`` below, so a blocked CDN costs nothing but
@@ -505,6 +510,43 @@ main { max-width: 68rem; }
 .apanel .vnote { color: var(--muted); font-size: .8rem;
   overflow-wrap: anywhere; }
 
+/* -------- panel sub-sections (stats, webhooks, invitations) --------------- */
+.asec { border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel); padding: .7rem .8rem; margin-bottom: .7rem; }
+.asec h4 { font-family: var(--font-mono); font-size: .7rem; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--muted); margin: 0 0 .5rem;
+  font-weight: 500; }
+.asec .hint { margin: .5rem 0 0; font-size: .78rem; }
+.asec-row { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; }
+.asec-row input { flex: 1 1 16rem; min-width: 0; padding: .35rem .55rem;
+  font-family: var(--font-mono); font-size: .78rem; color: var(--ink);
+  background: var(--paper); border: 1px solid var(--line); border-radius: 8px; }
+
+.chips { list-style: none; margin: 0 0 .5rem; padding: 0; display: flex;
+  flex-direction: column; gap: .3rem; }
+.chip { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 8px;
+  padding: .3rem .5rem; }
+.chip .chip-main { flex: 1 1 12rem; min-width: 0; font-family: var(--font-mono);
+  font-size: .76rem; color: var(--ink); overflow-wrap: anywhere; }
+.chip.is-off .chip-main { color: var(--muted); text-decoration: line-through; }
+
+.spark { display: flex; align-items: flex-end; gap: 2px; height: 2.2rem;
+  margin: .4rem 0 .2rem; }
+.spark i { flex: 1; min-width: 2px; background: var(--accent-soft);
+  border-top: 2px solid var(--accent); border-radius: 2px 2px 0 0; }
+.stat-total { font-family: var(--font-mono); font-size: 1.15rem;
+  font-weight: 700; color: var(--ink); }
+
+/* -------- one-time secret ------------------------------------------------- */
+.once { font-family: var(--font-mono); font-size: .76rem;
+  background: var(--term-bg); color: var(--term-fg);
+  border: 1px solid var(--term-line); border-radius: 8px;
+  padding: .6rem .7rem; margin: .5rem 0; overflow-wrap: anywhere;
+  user-select: all; }
+.once-warn { color: var(--proposed); font-family: var(--font-mono);
+  font-size: .76rem; margin: 0 0 .3rem; }
+
 /* -------- preview modal --------------------------------------------------- */
 .modal { position: fixed; inset: 0; background: rgba(6, 11, 18, .62);
   display: flex; align-items: center; justify-content: center; padding: 1.5rem;
@@ -660,6 +702,22 @@ _ADMIN_JS = """
     $("modal-frame").srcdoc = "";
   }
 
+  /* A second, content-only modal. The preview modal above hands untrusted
+     artifact HTML to a sandboxed iframe; this one shows nodes this script
+     built itself, which is what a copy button needs to live in. */
+  function openNote(title, nodes) {
+    $("note-title").textContent = title;
+    var body = $("note-body");
+    body.textContent = "";
+    nodes.forEach(function (node) { body.appendChild(node); });
+    show($("note-modal"), true);
+  }
+
+  function closeNote() {
+    show($("note-modal"), false);
+    $("note-body").textContent = "";
+  }
+
   /* ------------------------------------------------------------ clipboard */
 
   function copy(text, node, restore) {
@@ -710,6 +768,13 @@ _ADMIN_JS = """
     top.appendChild(idBtn);
 
     var badges = el("span", "arow-badges");
+    /* Status first: a trashed artifact's public link is dead, and that is the
+       single most important thing about the row. */
+    if (row.status === "trashed") {
+      badges.appendChild(badge("trashed \\u00b7 link dead", "proposed"));
+    } else if (row.status === "final") {
+      badges.appendChild(badge("final"));
+    }
     if (row.proposed_count) {
       badges.appendChild(badge(
         row.proposed_count + (row.proposed_count === 1 ? " proposal" : " proposals"),
@@ -718,6 +783,11 @@ _ADMIN_JS = """
     }
     if (row.accept_versions) { badges.appendChild(badge("accepting versions")); }
     if (row.protected) { badges.appendChild(badge("protected")); }
+    if (row.webhooks_count) {
+      badges.appendChild(badge(
+        row.webhooks_count + (row.webhooks_count === 1 ? " webhook" : " webhooks")
+      ));
+    }
     if (row.head_version) { badges.appendChild(badge("head v" + row.head_version, "head")); }
     top.appendChild(badges);
     top.appendChild(el("span", "arow-date", String(row.updated_at || "").replace("T", " ")));
@@ -753,9 +823,30 @@ _ADMIN_JS = """
     panel.appendChild(el("div", "loading", "loading versions\\u2026"));
     try {
       /* The JSON history (not ?format=html) carries the proposal metadata,
-         and the auth headers make proposals visible to the owner. */
-      var data = await request("/a/" + encodeURIComponent(row.id) + "/versions");
-      renderPanel(row, panel, data);
+         and the auth headers make proposals visible to the owner. Every /a/
+         path is addressed by share_id, which is what the public URL carries
+         once the owner has rotated the link; older listings without the field
+         fall back to the id, where the two are still the same thing.
+
+         A trashed artifact has no public link at all — /a/{id}/versions is a
+         404 by design — so its history is skipped and the panel opens on the
+         restore/purge controls, which is all there is to do with it. */
+      var data = row.status === "trashed"
+        ? { versions: [], head_version: null }
+        : await request(
+            "/a/" + encodeURIComponent(row.share_id || row.id) + "/versions"
+          );
+      var invitations = [];
+      try {
+        var invited = await request(
+          "/api/artifacts/" + encodeURIComponent(row.id) + "/invitations"
+        );
+        invitations = (invited && invited.invitations) || [];
+      } catch (err) {
+        /* Guests are a side panel, not the point of this view: an artifact
+           whose invitations cannot be read still opens for moderation. */
+      }
+      renderPanel(row, panel, data, invitations);
     } catch (err) {
       panel.textContent = "";
       var box = el("p", "err", err.message);
@@ -763,12 +854,18 @@ _ADMIN_JS = """
     }
   }
 
-  function renderPanel(row, panel, data) {
+  function renderPanel(row, panel, data, invitations) {
     panel.textContent = "";
 
+    /* Two identifiers, two jobs: `id` is the internal handle every /api/*
+       call addresses, `pubId` is the share id every /a/ URL carries. They are
+       equal until the owner rotates the link. */
     var id = encodeURIComponent(row.id);
+    var share = row.share_id || row.id;
+    var pubId = encodeURIComponent(share);
     var head = data.head_version;
-    var publicUrl = BASE + "/a/" + row.id;
+    var publicUrl = BASE + "/a/" + share;
+    var trashed = row.status === "trashed";
 
     var errBox = el("p", "err");
     errBox.hidden = true;
@@ -847,13 +944,64 @@ _ADMIN_JS = """
       refresh();
     }));
 
+    /* Rotating mints a new share id, so every URL on this page — and every
+       link anybody was ever sent — changes. The whole listing is reloaded
+       afterwards rather than this one panel. */
+    controls.appendChild(action("Rotate link", "danger", async function () {
+      if (!window.confirm(
+        "Rotate the public link of this artifact?\\n\\n" +
+        "The current URL stops working immediately and there is no way back. " +
+        "Everyone who should still have access needs the new link."
+      )) { return; }
+      var result = await request("/api/artifacts/" + id + "/rotate-link",
+        { method: "POST" });
+      showNewLink(result);
+      reload();
+    }));
+
+    if (trashed) {
+      controls.appendChild(action("Restore", "primary", async function () {
+        await request("/api/artifacts/" + id + "/restore", { method: "POST" });
+        reload();
+      }));
+    } else {
+      controls.appendChild(action("Trash", "danger", async function () {
+        if (!window.confirm(
+          "Move this artifact to the trash?\\n\\n" +
+          "Its public link stops resolving and new versions and comments are " +
+          "frozen. You can restore it later on the same URL."
+        )) { return; }
+        await request("/api/artifacts/" + id, { method: "DELETE" });
+        reload();
+      }));
+    }
+
+    /* Purge is the one irreversible button in the studio, so it asks for the
+       word rather than for a click: a mis-aimed Enter cannot trigger it. */
+    controls.appendChild(action("Purge", "danger", async function () {
+      var typed = window.prompt(
+        "This permanently erases every version, comment thread and view " +
+        "statistic of this artifact. It cannot be undone.\\n\\n" +
+        "Type PURGE to confirm:"
+      );
+      if (String(typed || "").trim().toUpperCase() !== "PURGE") { return; }
+      await request("/api/artifacts/" + id + "/purge", { method: "DELETE" });
+      reload();
+    }));
+
     panel.appendChild(controls);
     panel.appendChild(errBox);
+
+    panel.appendChild(statsSection(id, action));
+    panel.appendChild(webhookSection(row, id, action));
+    panel.appendChild(invitationSection(row, id, action, invitations || []));
 
     /* ---- version table ---- */
     var versions = data.versions || [];
     if (!versions.length) {
-      panel.appendChild(el("p", "empty", "no versions"));
+      panel.appendChild(el("p", "empty",
+        trashed ? "in the trash \\u2014 restore it to see its versions"
+                : "no versions"));
       return;
     }
 
@@ -889,17 +1037,17 @@ _ADMIN_JS = """
 
       actions.appendChild(action("View", "", async function () {
         if (proposed) {
-          var body = await requestHtml("/a/" + id + "/v/" + n);
+          var body = await requestHtml("/a/" + pubId + "/v/" + n);
           openModal("proposed v" + n + " \\u2014 " + row.id, body);
         } else {
-          window.open(BASE + "/a/" + row.id + "/v/" + n, "_blank", "noopener");
+          window.open(publicUrl + "/v/" + n, "_blank", "noopener");
         }
       }));
 
       if (head !== null && head !== undefined && n !== head) {
         actions.appendChild(action("Diff vs head", "", async function () {
           var body = await requestHtml(
-            "/a/" + id + "/diff/" + head + ".." + n + "?format=html"
+            "/a/" + pubId + "/diff/" + head + ".." + n + "?format=html"
           );
           openModal("diff v" + head + "..v" + n + " \\u2014 " + row.id, body);
         }));
@@ -948,6 +1096,252 @@ _ADMIN_JS = """
 
     wrap.appendChild(table);
     panel.appendChild(wrap);
+  }
+
+  /* ------------------------------------------------- panel sub-sections */
+
+  function section(heading) {
+    var box = el("div", "asec");
+    box.appendChild(el("h4", null, heading));
+    return box;
+  }
+
+  /* A copyable block for something the server will never show again. */
+  function onceBlock(label, value) {
+    var wrap = el("div", null);
+    wrap.appendChild(el("p", "once-warn", label));
+    wrap.appendChild(el("div", "once", value));
+    var btn = el("button", "btn btn-sm btn-primary", "Copy link");
+    btn.type = "button";
+    btn.addEventListener("click", function () { copy(value, btn, "Copy link"); });
+    wrap.appendChild(btn);
+    return wrap;
+  }
+
+  function showNewLink(result) {
+    var url = result.url || (BASE + "/a/" + result.share_id);
+    openNote("new public link", [
+      onceBlock("The previous link is dead as of now. The new one:", url),
+      el("p", "hint", result.warning ||
+        "Reshare this URL with everyone who should still have access.")
+    ]);
+  }
+
+  /* ---- view statistics ---- */
+
+  function statsSection(id, action) {
+    var box = section("views");
+    var out = el("div", null);
+    out.appendChild(el("p", "hint",
+      "Read counts per surface and per day. Numbers only \\u2014 no reader " +
+      "identity, address or referrer is recorded."));
+
+    box.appendChild(action("Load stats", "", async function () {
+      var data = await request("/api/artifacts/" + id + "/stats");
+      renderStats(out, data);
+    }));
+    box.appendChild(out);
+    return box;
+  }
+
+  function renderStats(out, data) {
+    out.textContent = "";
+    var total = Number(data.total || 0);
+    out.appendChild(el("div", "stat-total", total + (total === 1 ? " view" : " views")));
+
+    var days = data.by_day || [];
+    if (days.length) {
+      var peak = days.reduce(function (top, day) {
+        return Math.max(top, Number(day.count || 0));
+      }, 1);
+      var spark = el("div", "spark");
+      days.forEach(function (day) {
+        var bar = document.createElement("i");
+        bar.style.height =
+          Math.max(6, Math.round((Number(day.count || 0) / peak) * 100)) + "%";
+        bar.title = day.day + ": " + day.count;
+        spark.appendChild(bar);
+      });
+      out.appendChild(spark);
+
+      /* The bars carry the shape; the list carries the numbers, newest first
+         and short enough to read at a glance. */
+      var recent = days.slice(-7).reverse().map(function (day) {
+        return day.day + "  " + day.count;
+      });
+      out.appendChild(el("p", "mono hint", recent.join("   \\u00b7   ")));
+    } else {
+      out.appendChild(el("p", "hint", "nobody has opened this artifact yet"));
+    }
+
+    var kinds = data.by_kind || {};
+    var names = Object.keys(kinds);
+    if (names.length) {
+      out.appendChild(el("p", "mono hint", names.map(function (kind) {
+        return kind + " " + kinds[kind];
+      }).join("   \\u00b7   ")));
+    }
+  }
+
+  /* ---- webhooks ---- */
+
+  function webhookSection(row, id, action) {
+    var box = section("webhooks");
+    var body = el("div", null);
+    /* A webhook URL is a capability (a Slack hook's path *is* its
+       credential), so the hub returns the list only in the PUT that sets it —
+       GET /api/artifacts reports a count. That is why an artifact with hooks
+       already configured starts out unknown here: the only honest edit is a
+       replacement, until a save teaches this tab what the set is. */
+    var hooks = row.webhooks_count ? null : [];
+
+    function save(next) {
+      return async function () {
+        var result = await request("/api/artifacts/" + id, {
+          method: "PUT",
+          body: { webhooks: next }
+        });
+        hooks = result.webhooks || [];
+        row.webhooks_count = hooks.length;
+        render();
+      };
+    }
+
+    function render() {
+      body.textContent = "";
+
+      if (hooks === null) {
+        body.appendChild(el("p", "hint",
+          "This artifact has " + row.webhooks_count + " webhook URL(s). The " +
+          "hub never lists them again after they are set, so they cannot be " +
+          "removed one by one here \\u2014 saving below replaces the whole set."));
+      } else if (hooks.length) {
+        var list = el("ul", "chips");
+        hooks.forEach(function (url) {
+          var chip = el("li", "chip");
+          chip.appendChild(el("span", "chip-main", url));
+          chip.appendChild(action("Remove", "danger", save(
+            hooks.filter(function (other) { return other !== url; })
+          )));
+          list.appendChild(chip);
+        });
+        body.appendChild(list);
+      } else {
+        body.appendChild(el("p", "hint",
+          "No webhooks. Add an https URL to be notified about new versions, " +
+          "proposals and comments; a hooks.slack.com URL gets Slack's own " +
+          "message shape."));
+      }
+
+      var line = el("div", "asec-row");
+      var input = document.createElement("input");
+      input.type = "url";
+      input.placeholder = "https://hooks.slack.com/services/...";
+      input.spellcheck = false;
+      line.appendChild(input);
+      line.appendChild(action(
+        hooks === null ? "Replace all" : "Add",
+        "",
+        async function () {
+          var url = input.value.trim();
+          if (!url) { return; }
+          if (hooks === null && !window.confirm(
+            "Replace all " + row.webhooks_count + " existing webhook URL(s) " +
+            "with this one?"
+          )) { return; }
+          await save((hooks || []).concat([url]))();
+        }
+      ));
+      body.appendChild(line);
+    }
+
+    render();
+    box.appendChild(body);
+    return box;
+  }
+
+  /* ---- guest invitations ---- */
+
+  function invitationSection(row, id, action, invitations) {
+    var box = section("guests");
+    var body = el("div", null);
+    var list = invitations.slice();
+
+    function render() {
+      body.textContent = "";
+      var live = list.filter(function (inv) { return !inv.revoked; });
+
+      if (list.length) {
+        var chips = el("ul", "chips");
+        list.forEach(function (inv) {
+          var chip = el("li", "chip" + (inv.revoked ? " is-off" : ""));
+          chip.appendChild(el("span", "chip-main",
+            inv.name + (inv.revoked ? "  (revoked)" : "")));
+          chip.appendChild(el("span", "arow-date",
+            String(inv.created_at || "").replace("T", " ")));
+          if (!inv.revoked) {
+            chip.appendChild(action("Revoke", "danger", async function () {
+              if (!window.confirm(
+                "Revoke the invitation for " + inv.name + "?\\n\\n" +
+                "Their link stops working immediately. Comments they already " +
+                "left stay, and every other guest keeps their access."
+              )) { return; }
+              await request("/api/artifacts/" + id + "/invitations/" +
+                encodeURIComponent(inv.id), { method: "DELETE" });
+              inv.revoked = true;
+              render();
+            }));
+          }
+          chips.appendChild(chip);
+        });
+        body.appendChild(chips);
+      }
+
+      body.appendChild(el("p", "hint",
+        live.length
+          ? live.length + " active invitation(s). A guest can comment, reply " +
+            "and resolve their own threads \\u2014 nothing else."
+          : "Invite someone without a Keboola account to comment. They get a " +
+            "review link that works only for them and only for this artifact."));
+
+      var line = el("div", "asec-row");
+      var input = document.createElement("input");
+      input.type = "text";
+      input.maxLength = 80;
+      input.placeholder = "who is this for? e.g. Jana (legal)";
+      line.appendChild(input);
+      line.appendChild(action("Invite", "primary", async function () {
+        var name = input.value.trim();
+        if (!name) { return; }
+        var result = await request("/api/artifacts/" + id + "/invitations", {
+          method: "POST",
+          body: { name: name }
+        });
+        input.value = "";
+        list.push({
+          id: result.invitation_id,
+          name: result.name,
+          created_at: "",
+          revoked: false
+        });
+        render();
+        openNote("invitation for " + result.name, [
+          onceBlock(
+            "This link is shown once and cannot be recovered \\u2014 copy it " +
+            "now and send it to " + result.name + ".",
+            result.review_url
+          ),
+          el("p", "hint", result.warning ||
+            "Anyone holding this link can comment as " + result.name +
+            " until you revoke it.")
+        ]);
+      }));
+      body.appendChild(line);
+    }
+
+    render();
+    box.appendChild(body);
+    return box;
   }
 
   /* ------------------------------------------------------------ sessions */
@@ -1024,8 +1418,14 @@ _ADMIN_JS = """
   $("modal").addEventListener("click", function (event) {
     if (event.target === $("modal")) { closeModal(); }
   });
+  $("note-close").addEventListener("click", closeNote);
+  $("note-modal").addEventListener("click", function (event) {
+    if (event.target === $("note-modal")) { closeNote(); }
+  });
   document.addEventListener("keydown", function (event) {
-    if (event.key === "Escape" && !$("modal").hidden) { closeModal(); }
+    if (event.key !== "Escape") { return; }
+    if (!$("modal").hidden) { closeModal(); }
+    if (!$("note-modal").hidden) { closeNote(); }
   });
 
   /* --------------------------------------------------------------- start */
@@ -1376,8 +1776,10 @@ def admin_page(base_url: str, service_version: str, github_url: str) -> str:
 <div>
 <h1>Artifact Hub · Admin studio</h1>
 <p class="lead">Review, diff, promote and prune the versions of the artifacts
-your Keboola project owns — in the browser, over the same API you can drive
-with curl.</p>
+your Keboola project owns — then watch their traffic, rotate a link that went
+to the wrong person, invite a guest who has no Keboola account, wire up
+webhooks, and trash or purge what is done. In the browser, over the same API
+you can drive with curl.</p>
 </div>
 <div class="ahead-right">
 <span class="badge badge--version" id="project-badge" hidden></span>
@@ -1435,6 +1837,17 @@ reload keeps you signed in and closing the tab forgets the token.
 </div>
 <iframe id="modal-frame" title="artifact preview"
   sandbox="allow-scripts allow-popups"></iframe>
+</div>
+</div>
+
+<div class="modal" id="note-modal" hidden>
+<div class="modal-box" style="height:auto;max-width:38rem">
+<div class="modal-bar">
+<span class="modal-title mono" id="note-title"></span>
+<span class="spacer"></span>
+<button type="button" class="btn" id="note-close">Close</button>
+</div>
+<div class="apanel" id="note-body"></div>
 </div>
 </div>
 
@@ -1960,6 +2373,13 @@ _REVIEW_JS = """
   var AUTH_KEY = "hub_admin_auth";
   var auth = null;
 
+  /* An invited guest's credential, taken from the URL *fragment*
+     (#invite={invitation_id}.{secret}). The fragment is never sent to a
+     server by the browser, and this script never puts it in a URL either: it
+     only ever travels in the X-Artifact-Guest request header, so it stays out
+     of access logs, Referer headers and the hub's own routing. */
+  var guest = null;
+
   var threads = [];
   var headVersion = null;
   var commentsMode = "anyone";
@@ -1993,11 +2413,68 @@ _REVIEW_JS = """
 
   function who(identity) {
     var data = identity || {};
+    /* A guest is published as {kind: "guest", name}: no project, no stack. */
+    if (data.kind === "guest") {
+      return (data.name ? String(data.name) : "guest") + " (guest)";
+    }
     if (data.project_name) { return String(data.project_name); }
     if (data.project_id !== undefined && data.project_id !== null) {
       return "project " + data.project_id;
     }
     return "unknown project";
+  }
+
+  /* ---------------------------------------------------------------- guest */
+
+  /* Read #invite={invitation_id}.{secret} once, then clear the fragment from
+     the address bar so the secret does not sit in a shared screen, a
+     screenshot or the next person's history entry. The credential lives on in
+     this closure for as long as the tab does. */
+  function readInvite() {
+    var hash = String(window.location.hash || "");
+    var at = hash.indexOf("invite=");
+    if (at < 0) { return null; }
+    var value = hash.slice(at + 7).split("&")[0];
+    if (!value || value.indexOf(".") < 1) { return null; }
+    try {
+      window.history.replaceState(null, "",
+        window.location.pathname + window.location.search);
+    } catch (err) {
+      /* Non-fatal: the fragment simply stays visible. */
+    }
+    return { credential: decodeURIComponent(value), name: "" };
+  }
+
+  async function checkInvite() {
+    if (!guest) { return; }
+    try {
+      /* Header only — the credential must never become part of a URL. This
+         doubles as the validation step: a revoked or malformed invitation
+         answers 401 here, before anybody writes a comment that would fail. */
+      var data = JSON.parse(await read("/guest", true));
+      guest.name = data.name || "";
+    } catch (err) {
+      guest = null;
+      setError($("rv-signin-error"),
+        "That invitation link is not valid any more: " + err.message);
+    }
+    renderIdentity();
+    renderThreads();
+  }
+
+  /* Exactly one of the three identity blocks is on screen. A Storage token
+     wins over an invitation, because it names a verified project and the
+     header code prefers it — the banner must never claim otherwise. */
+  function renderIdentity() {
+    var asProject = !!auth;
+    var asGuest = !asProject && !!guest;
+    show($("rv-account"), asProject);
+    show($("rv-guest"), asGuest);
+    show($("rv-signin"), !asProject && !asGuest);
+    if (asGuest) {
+      $("rv-guest-name").textContent =
+        "Commenting as " + (guest.name || "a guest") + " (guest)";
+    }
   }
 
   /* ---------------------------------------------------------------- auth */
@@ -2025,14 +2502,23 @@ _REVIEW_JS = """
     try { window.sessionStorage.removeItem(AUTH_KEY); } catch (err) {}
   }
 
+  /* Whichever credential this visitor has. A guest never has a token and a
+     signed-in project never needs the invitation, so the two are mutually
+     exclusive; the token wins when somebody has both, because it identifies a
+     verified project and the guest header does not. */
   function headers(withBody) {
-    var out = {
-      "X-StorageApi-Token": auth.token,
-      "X-Storage-Stack": auth.stack
-    };
+    var out = {};
+    if (auth) {
+      out["X-StorageApi-Token"] = auth.token;
+      out["X-Storage-Stack"] = auth.stack;
+    } else if (guest) {
+      out["X-Artifact-Guest"] = guest.credential;
+    }
     if (withBody) { out["Content-Type"] = "application/json"; }
     return out;
   }
+
+  function canWrite() { return !!(auth || guest); }
 
   function apiMessage(status, data, text) {
     if (data && typeof data.detail === "string") { return data.detail; }
@@ -2060,9 +2546,15 @@ _REVIEW_JS = """
   }
 
   /* Public reads. credentials:"same-origin" carries the unlock cookie of a
-     password-protected artifact, which is scoped to /a/{id}. */
-  async function read(path) {
-    var resp = await fetch(PATH + path, { credentials: "same-origin" });
+     password-protected artifact, which is scoped to /a/{id}. ``withGuest``
+     adds the invitation header for the one read that needs it (/guest); the
+     credential is never appended to the path or the query string. */
+  async function read(path, withGuest) {
+    var init = { credentials: "same-origin" };
+    if (withGuest && guest) {
+      init.headers = { "X-Artifact-Guest": guest.credential };
+    }
+    var resp = await fetch(PATH + path, init);
     var text = await resp.text();
     if (!resp.ok) {
       var data = null;
@@ -2178,7 +2670,9 @@ _REVIEW_JS = """
       item.appendChild(replyList);
     }
 
-    if (auth) { item.appendChild(threadActions(thread)); }
+    /* Guests get the same buttons; the server decides what they may actually
+       do with them (their own threads only) and says so in the error line. */
+    if (canWrite()) { item.appendChild(threadActions(thread)); }
     item.addEventListener("click", function () {
       activeId = thread.id;
       renderThreads();
@@ -2287,8 +2781,10 @@ _REVIEW_JS = """
 
   async function submitComment() {
     if (!selection) { return; }
-    if (!auth) {
-      setError($("rv-composer-error"), "Sign in first to leave a comment.");
+    if (!canWrite()) {
+      setError($("rv-composer-error"),
+        "Sign in first to leave a comment \\u2014 or open this document " +
+        "through an invitation link.");
       return;
     }
     var text = $("rv-comment").value.trim();
@@ -2322,18 +2818,18 @@ _REVIEW_JS = """
   /* --------------------------------------------------------------- signin */
 
   function signedIn(projectId) {
-    show($("rv-signin"), false);
-    show($("rv-account"), true);
     $("rv-project").textContent = "project " + (projectId || "?") +
       " \\u00b7 " + auth.stack;
+    renderIdentity();
   }
 
   function signedOut() {
     auth = null;
     clearAuth();
-    show($("rv-account"), false);
-    show($("rv-signin"), true);
     $("rv-token").value = "";
+    /* Falls back to the guest banner when this visitor arrived through an
+       invitation and signed in on top of it. */
+    renderIdentity();
     renderThreads();
   }
 
@@ -2411,6 +2907,9 @@ _REVIEW_JS = """
 
   /* ---------------------------------------------------------------- start */
 
+  guest = readInvite();
+  if (guest) { checkInvite(); }
+
   auth = loadAuth();
   if (auth) {
     var stacks = Array.prototype.map.call($("rv-stack").options,
@@ -2428,6 +2927,7 @@ _REVIEW_JS = """
     }, function (err) {
       auth = null;
       clearAuth();
+      renderIdentity();
       setError($("rv-signin-error"),
         "That session is no longer valid: " + err.message);
     });
@@ -2455,6 +2955,14 @@ def review_page(base_url: str, artifact_id: str, service_version: str) -> str:
     visitor may keep in ``sessionStorage`` (the same ``hub_admin_auth`` entry
     ``/admin`` uses, so one sign-in serves both pages). The two sides exchange
     nothing but ``postMessage`` envelopes.
+
+    **Guest mode.** Opened through an invitation link — the URL the owner got
+    from ``POST /api/artifacts/{id}/invitations``, whose ``#invite=`` fragment
+    carries ``{invitation_id}.{secret}`` — the page reads that fragment, clears
+    it from the address bar, validates it against ``GET /a/{id}/guest`` and
+    then comments with an ``X-Artifact-Guest`` header instead of a token. The
+    fragment never reaches the server as part of a URL, and the credential
+    never leaves this tab.
     """
     base = html.escape(base_url.rstrip("/"))
     safe_id = html.escape(artifact_id)
@@ -2502,12 +3010,24 @@ def review_page(base_url: str, artifact_id: str, service_version: str) -> str:
 API token. The token stays in this browser tab (<code>sessionStorage</code>,
 shared with <a href="{base}/admin">/admin</a>) and is never sent anywhere but
 this hub's own API.</p>
+<p class="rv-hint">No Keboola account? The artifact's owner can send you a
+guest invitation link, which lets you comment here without one.</p>
 </div>
 <div id="rv-account" hidden>
 <div class="rv-thread-top">
 <span class="badge badge--version" id="rv-project"></span>
 <button type="button" class="btn btn-sm" id="rv-logout">Log out</button>
 </div>
+</div>
+<div id="rv-guest" hidden>
+<div class="rv-thread-top">
+<span class="badge badge--version" id="rv-guest-name"></span>
+</div>
+<p class="rv-hint">You are here on an invitation, so no Keboola account is
+needed. You can open threads, reply, and resolve or delete the threads you
+opened. The invitation lives in this tab only — keep the link if you want to
+come back, and expect it to stop working once whoever invited you revokes
+it.</p>
 </div>
 
 <h2>comment</h2>
@@ -2547,4 +3067,397 @@ document.</p>
         f"Review — {artifact_id}",
         _CONTROLS_CSS + _REVIEW_CSS,
         body + _ANNOTATION_JS + "</script>\n<script>" + _REVIEW_JS + "</script>",
+    )
+
+
+# --------------------------------------------------------------------------
+# Changelog
+# --------------------------------------------------------------------------
+
+#: Prose styles for the changelog body. The shell's own rules already size h1
+#: and h2; what a long Markdown document adds is list, table and release-heading
+#: rhythm. Each ``h2`` (one release) is dressed as the shell's ``//`` section
+#: label — same monospace, same rule running to the right margin — so a rendered
+#: changelog reads as a page of this service rather than as a pasted document.
+_CHANGELOG_CSS = """
+.changelog { max-width: 48rem; }
+.changelog h2 {
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  font-size: 1rem;
+  margin: 2.75rem 0 .85rem;
+  padding-top: .2rem;
+}
+.changelog h2::before { content: "//"; color: var(--accent); font-weight: 700; }
+.changelog h2::after { content: ""; flex: 1; height: 1px;
+  background: var(--line); }
+.changelog h3 { font-size: .82rem; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--muted); margin: 1.5rem 0 .4rem; }
+.changelog ul, .changelog ol { padding-left: 1.15rem; margin: .5rem 0 1rem; }
+.changelog li { margin: .3rem 0; color: var(--ink-2); }
+.changelog li::marker { color: var(--accent); }
+.changelog a { overflow-wrap: anywhere; }
+.changelog table { margin: .5rem 0 1.25rem; }
+.changelog pre {
+  overflow-x: auto;
+  background: var(--term-bg);
+  color: var(--term-fg);
+  border: 1px solid var(--term-line);
+  border-radius: var(--radius);
+  padding: .9rem 1rem;
+  font-size: .8rem;
+  line-height: 1.7;
+}
+.changelog pre code { background: none; color: inherit; padding: 0; }
+.changelog blockquote { margin: 1rem 0; padding: .1rem 0 .1rem 1rem;
+  border-left: 2px solid var(--accent); color: var(--muted); }
+.changelog hr { border: 0; border-top: 1px solid var(--line); margin: 2rem 0; }
+"""
+
+
+#: Pulls the document's own leading ``<h1>`` out of the rendered fragment, so
+#: it can become the page's hero instead of appearing a second time under one.
+_LEADING_H1_RE = re.compile(r"\A\s*<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
+
+
+def _hoist_heading(body_html: str, fallback: str) -> tuple[str, str]:
+    """Split a leading ``<h1>`` off a rendered fragment: ``(heading, rest)``.
+
+    A Markdown document titles itself, and the shell wants that title in its
+    hero rather than repeated below one. Anything else — a document that opens
+    on a paragraph, or on an ``h2`` — keeps its shape and gets ``fallback``.
+    """
+    match = _LEADING_H1_RE.match(body_html)
+    if match is None:
+        return fallback, body_html
+    heading = match.group(1).strip()
+    return (heading or fallback), body_html[match.end():].lstrip()
+
+
+def changelog_page(body_html: str, service_version: str, github_url: str) -> str:
+    """Wrap pre-rendered changelog Markdown in the service's own shell.
+
+    ``body_html`` is an HTML *fragment* — the caller renders it (``src.main``
+    uses the builder's configured markdown-it, so the dialect matches what a
+    published artifact gets) and this function supplies the chrome: the
+    graph-paper grid, the monospace hero, the ``//`` label treatment adapted so
+    each release heading reads like a section rule, and the same footer the
+    landing page carries. The document's own leading ``h1`` becomes that hero,
+    so the page is titled by the file rather than by this function.
+
+    The fragment is trusted markup, not user input: it comes from a file in
+    this repository, rendered by this process. Everything else on the page is
+    escaped as usual.
+    """
+    version = html.escape(service_version)
+    repo = html.escape(github_url.rstrip("/"))
+    heading, body_html = _hoist_heading(body_html, "Changelog")
+
+    body = f"""<main>
+<header class="hero">
+<h1>{heading}</h1>
+<p class="lead">Every released change to the Artifact Hub, newest first. The
+same file is served verbatim at <a href="/changelog.md">/changelog.md</a> for
+machines.</p>
+<div class="hero-meta">
+<span class="badge badge--version">v{version}</span>
+<span class="badge">running now</span>
+</div>
+</header>
+
+<article class="changelog">
+{body_html}
+</article>
+
+<footer>
+<span>kbc-artifact-hub v{version}</span>
+<span class="spacer"></span>
+<a href="/">hub home</a>
+<a href="/changelog.md">/changelog.md</a>
+<a href="/docs">/docs</a>
+<a href="{repo}">source</a>
+</footer>
+</main>"""
+
+    return _page("Changelog · Artifact Hub", _CHANGELOG_CSS, body)
+
+
+# --------------------------------------------------------------------------
+# Visual diff
+# --------------------------------------------------------------------------
+
+_VISUAL_DIFF_CSS = """
+html, body { height: 100%; }
+html { background-image: none; }
+
+.vd { display: flex; flex-direction: column; height: 100vh; }
+
+.vd-top { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem;
+  padding: .5rem .85rem; border-bottom: 1px solid var(--line);
+  background: var(--panel); }
+.vd-brand { font-family: var(--font-mono); font-weight: 700; font-size: .88rem;
+  letter-spacing: -.01em; }
+.vd-top .spacer { flex: 1; }
+.vd-added { color: var(--live); font-weight: 700; }
+.vd-removed { color: var(--danger); font-weight: 700; }
+.vd-stat { font-family: var(--font-mono); font-size: .76rem;
+  color: var(--muted); }
+
+.vd-body { flex: 1; display: flex; min-height: 0; }
+.vd-pane { flex: 1 1 50%; min-width: 0; display: flex; flex-direction: column;
+  background: #ffffff; }
+.vd-pane + .vd-pane { border-left: 1px solid var(--line); }
+.vd-head { display: flex; align-items: center; gap: .45rem;
+  padding: .35rem .7rem; border-bottom: 1px solid var(--line);
+  background: var(--panel); }
+.vd-title { font-size: .78rem; color: var(--muted); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.vd-pane iframe { flex: 1; width: 100%; border: 0; background: #ffffff; }
+
+@media (max-width: 45rem) {
+  .vd-body { flex-direction: column; }
+  .vd-pane + .vd-pane { border-left: 0; border-top: 1px solid var(--line); }
+}
+"""
+
+#: Injected into each side's document before it goes into its ``srcdoc``.
+#:
+#: It runs in an **opaque origin** (both frames are sandboxed without
+#: ``allow-same-origin``), so its only channel to the shell is ``postMessage``:
+#: it reports its own scroll position as a *ratio* of scrollable height, and
+#: applies a ratio the shell relays from the other side. Ratios rather than
+#: pixels, because the two versions are different documents of different
+#: heights — matching absolute offsets would drift immediately.
+#:
+#: Everything here is best effort by design. An artifact whose own scripts throw
+#: still renders; it just stops driving the other pane.
+_VISUAL_SYNC_JS = """
+(function () {
+  "use strict";
+
+  var SIDE = window.name || "";
+
+  /* The ratio this frame was last *told* to scroll to, or -1 when its position
+     is its own doing. It is how an echo is recognised without a timer: the
+     scroll event caused by applying a relayed position looks exactly like this
+     value, so it is swallowed once and the pair settles instead of chasing
+     each other. Deliberately no setTimeout anywhere — a background tab
+     throttles timers hard, and scroll sync that only works in a foreground tab
+     would be worse than none. */
+  var applied = -1;
+
+  function scroller() {
+    return document.scrollingElement || document.documentElement ||
+      document.body;
+  }
+
+  function span() {
+    var node = scroller();
+    if (!node) { return 0; }
+    return node.scrollHeight - node.clientHeight;
+  }
+
+  function ratio() {
+    var node = scroller();
+    var height = span();
+    if (!node || height <= 0) { return 0; }
+    return node.scrollTop / height;
+  }
+
+  /* Two positions count as the same when they are within a pixel or two of
+     each other: scrollTop is an integer, so a ratio can never be reproduced
+     exactly, and an off-by-one pixel must not read as a fresh scroll. */
+  function same(a, b) {
+    var height = span();
+    if (height <= 0) { return true; }
+    return Math.abs(a - b) * height < 2;
+  }
+
+  function post(message) {
+    try { parent.postMessage(message, "*"); } catch (err) { /* detached */ }
+  }
+
+  window.addEventListener("scroll", function () {
+    var now = ratio();
+    if (applied >= 0 && same(now, applied)) {
+      /* This is the scroll we were asked to make. Report nothing, and go back
+         to treating our own movement as news. */
+      applied = -1;
+      return;
+    }
+    applied = -1;
+    post({ type: "ahd-scroll", side: SIDE, ratio: now });
+  }, { passive: true });
+
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    if (!data || typeof data !== "object") { return; }
+    if (data.type !== "ahd-scroll-to") { return; }
+    var value = Number(data.ratio);
+    if (!isFinite(value)) { return; }
+    value = Math.max(0, Math.min(1, value));
+    var node = scroller();
+    var height = span();
+    if (!node || height <= 0) { return; }
+    /* Already there: moving nothing also emits nothing, which is what stops a
+       relay from bouncing back and forth. */
+    if (same(ratio(), value)) { return; }
+    applied = value;
+    try {
+      node.scrollTop = value * height;
+    } catch (err) {
+      applied = -1;
+    }
+  });
+
+  post({ type: "ahd-ready", side: SIDE });
+})();
+"""
+
+#: The shell half of the scroll sync: relay each side's reported ratio to the
+#: other, and never back to the sender.
+_VISUAL_DIFF_JS = """
+(function () {
+  "use strict";
+
+  var frames = {
+    older: document.getElementById("vd-older"),
+    newer: document.getElementById("vd-newer")
+  };
+
+  function other(side) {
+    return side === "older" ? frames.newer : frames.older;
+  }
+
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    if (!data || typeof data !== "object") { return; }
+    if (data.type !== "ahd-scroll") { return; }
+    /* Only our own two frames may drive this page. */
+    if (event.source !== frames.older.contentWindow &&
+        event.source !== frames.newer.contentWindow) { return; }
+    var side = event.source === frames.older.contentWindow ? "older" : "newer";
+    var target = other(side);
+    if (!target || !target.contentWindow) { return; }
+    try {
+      target.contentWindow.postMessage(
+        { type: "ahd-scroll-to", ratio: data.ratio }, "*"
+      );
+    } catch (err) {
+      /* One pane failing to follow must never break the other. */
+    }
+  });
+})();
+"""
+
+
+def _inject_sync(document_html: str) -> str:
+    """Append the scroll-sync script to one side's document.
+
+    Inserted before the last ``</body>`` when there is one so the artifact's own
+    ``DOMContentLoaded`` handlers still see the document they expect, and simply
+    appended otherwise — a published artifact is not guaranteed to be a
+    well-formed document.
+    """
+    snippet = f"<script>{_VISUAL_SYNC_JS}</script>"
+    lower = document_html.lower()
+    at = lower.rfind("</body>")
+    if at < 0:
+        return document_html + snippet
+    return document_html[:at] + snippet + document_html[at:]
+
+
+def _visual_pane(side: str, label: str, title: str, document_html: str) -> str:
+    """One half of the visual diff: a header plus its sandboxed iframe.
+
+    The document goes into ``srcdoc`` — escaped with ``quote=True``, since it is
+    an attribute *value* — inside a frame sandboxed **without**
+    ``allow-same-origin``. Both versions therefore run in their own opaque
+    origins: they can neither read this page nor each other, which matters
+    doubly here, where two mutually distrusting versions of a document are on
+    screen at once.
+    """
+    safe_side = html.escape(side, quote=True)
+    frame_title = html.escape(f"{label} — {title}", quote=True)
+    return (
+        f'<section class="vd-pane">'
+        f'<div class="vd-head">'
+        f'<span class="badge badge--version">{html.escape(label)}</span>'
+        f'<span class="vd-title">{html.escape(title or "untitled")}</span>'
+        "</div>"
+        f'<iframe id="vd-{safe_side}" name="{safe_side}" title="{frame_title}" '
+        'sandbox="allow-scripts allow-popups" '
+        f'srcdoc="{html.escape(_inject_sync(document_html), quote=True)}">'
+        "</iframe></section>"
+    )
+
+
+def visual_diff_page(
+    older: object,
+    newer: object,
+    *,
+    added: int | None = None,
+    removed: int | None = None,
+) -> str:
+    """Render two versions of one artifact side by side, as they look.
+
+    ``older`` and ``newer`` are version envelopes (anything carrying
+    ``version``, ``title`` and ``html``). Each is loaded into its own sandboxed
+    ``srcdoc`` iframe and the two panes scroll in step, so a reviewer compares
+    the *rendered* documents rather than the source that produced them — which
+    is what ``?format=html`` already does well.
+
+    Scroll sync is best effort and says so: an artifact whose own scripts break,
+    or one that scrolls an inner element rather than the document, simply stops
+    driving the other pane. Nothing else on the page depends on it.
+
+    ``added``/``removed`` are the line counts from the ordinary diff; pass
+    ``None`` when they could not be computed and the header quietly omits them.
+    """
+    older_version = getattr(older, "version", "?")
+    newer_version = getattr(newer, "version", "?")
+    older_label = f"v{older_version}"
+    newer_label = f"v{newer_version}"
+
+    if added is None or removed is None:
+        stats = '<span class="vd-stat">line counts unavailable</span>'
+    else:
+        stats = (
+            '<span class="vd-stat">'
+            f'<span class="vd-added">+{int(added)}</span> '
+            f'<span class="vd-removed">-{int(removed)}</span></span>'
+        )
+
+    heading = html.escape(f"{older_label} → {newer_label}")
+    panes = _visual_pane(
+        "older",
+        older_label,
+        str(getattr(older, "title", "") or ""),
+        str(getattr(older, "html", "") or ""),
+    ) + _visual_pane(
+        "newer",
+        newer_label,
+        str(getattr(newer, "title", "") or ""),
+        str(getattr(newer, "html", "") or ""),
+    )
+
+    body = f"""<div class="vd">
+<header class="vd-top">
+<span class="vd-brand">Artifact Hub · Visual diff</span>
+<span class="badge">{heading}</span>
+{stats}
+<span class="spacer"></span>
+<span class="vd-stat">scrolling is synchronized</span>
+</header>
+<div class="vd-body">
+{panes}
+</div>
+</div>
+<script>{_VISUAL_DIFF_JS}</script>"""
+
+    return _page(
+        f"Visual diff — {older_label} vs {newer_label}",
+        _CONTROLS_CSS + _VISUAL_DIFF_CSS,
+        body,
     )

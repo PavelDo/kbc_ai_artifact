@@ -31,10 +31,26 @@ Because the app container has no permanent disk, the process keeps only:
   objects keyed by ``(artifact_id, file_id)``, and
 - a disk cache of raw JSON under ``cache_dir`` (pure cache — safe to wipe).
 
-This module is deliberately pure: it never reads the clock, never generates IDs
-and never touches the network directly. Timestamps and IDs are produced by the
-caller; all Storage access goes through the injected
-:class:`~src.kbc.FilesBackend`.
+This module is deliberately pure: it never reads the clock and never touches the
+network directly. Timestamps are produced by the caller; all Storage access goes
+through the injected :class:`~src.kbc.FilesBackend`. The single ID-generating
+exception is :meth:`ArtifactStore.rotate_share`, whose default generator is
+:func:`src.security.new_artifact_id` (imported lazily, and overridable by the
+caller for deterministic tests).
+
+**Public share IDs (0.7.0).** ``/a/{...}`` URLs address an artifact by its
+*share ID*, not by its internal artifact ID. A fresh artifact's share ID equals
+its artifact ID (so every pre-0.7.0 URL keeps working), but
+:meth:`ArtifactStore.rotate_share` mints a new one — after which the previous
+share ID *and* the bare artifact ID both stop resolving publicly
+(:meth:`ArtifactStore.resolve_share`). The internal artifact ID stays the handle
+for owner ``/api/*`` operations.
+
+**Trash (0.7.0).** :meth:`ArtifactStore.trash` is a reversible soft delete: the
+meta record moves to status ``trashed`` (remembering the status to come back to
+in ``restore_status``), the public link stops resolving, and
+:meth:`ArtifactStore.restore` puts it back. :meth:`ArtifactStore.delete` remains
+the irreversible purge.
 """
 
 from __future__ import annotations
@@ -45,6 +61,7 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlsplit
 
 from src.kbc import BackendError, FileInfo, FilesBackend
@@ -93,10 +110,19 @@ COMMENTS_MODES = (COMMENTS_ANYONE, COMMENTS_ALLOWLIST, COMMENTS_OFF)
 
 #: Artifact lifecycle status. "final" freezes new versions and new comments for
 #: *everyone*, the owner included; reopening is an owner action in the API layer
-#: (set the status back to "draft").
+#: (set the status back to "draft"). "trashed" is the soft-deleted state: the
+#: artifact is frozen *and* its public link stops resolving, until the owner
+#: either restores it (back to :attr:`ArtifactMeta.restore_status`) or purges it
+#: for good with :meth:`ArtifactStore.delete`.
 ARTIFACT_DRAFT = "draft"
 ARTIFACT_FINAL = "final"
-ARTIFACT_STATUSES = (ARTIFACT_DRAFT, ARTIFACT_FINAL)
+ARTIFACT_TRASHED = "trashed"
+ARTIFACT_STATUSES = (ARTIFACT_DRAFT, ARTIFACT_FINAL, ARTIFACT_TRASHED)
+#: Statuses an API caller may set directly. "trashed" is deliberately excluded:
+#: it is reached only through :meth:`ArtifactStore.trash`, which also records
+#: ``trashed_at`` and the status to restore to, and left only through
+#: :meth:`ArtifactStore.restore`.
+ARTIFACT_SETTABLE_STATUSES = (ARTIFACT_DRAFT, ARTIFACT_FINAL)
 
 #: Schema version written by this module.
 SCHEMA_VERSION = 2
@@ -143,6 +169,44 @@ def _stack_host(stack_url: str) -> str:
     return urlsplit(stack_url).hostname or ""
 
 
+def _clean_invitations(raw: object) -> list[dict]:
+    """Normalize a guest-invitation list read from an untrusted meta record.
+
+    An entry survives only when it carries a non-empty string ``id`` and a
+    ``secret`` that is at least shaped like a hash record (a dict) — anything
+    else could never authenticate a guest, so keeping it would only grow the
+    meta file. The remaining fields are coerced rather than dropped, so a
+    half-written entry degrades to an unnamed, non-revoked invitation instead
+    of taking the whole artifact down.
+    """
+    if not isinstance(raw, list):
+        return []
+    cleaned: list[dict] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        invitation_id = entry.get("id")
+        if not isinstance(invitation_id, str) or not invitation_id:
+            continue
+        if invitation_id in seen:
+            continue
+        secret = entry.get("secret")
+        if not isinstance(secret, dict):
+            continue
+        seen.add(invitation_id)
+        cleaned.append(
+            {
+                "id": invitation_id,
+                "name": str(entry.get("name") or ""),
+                "secret": secret,
+                "created_at": str(entry.get("created_at") or ""),
+                "revoked": bool(entry.get("revoked")),
+            }
+        )
+    return cleaned
+
+
 @dataclass
 class ArtifactMeta:
     """Artifact-level state: who owns it, who may contribute, where head points.
@@ -175,6 +239,17 @@ class ArtifactMeta:
     declared *after* ``accept_versions_mode`` so the generated ``__init__``
     assigns the mode first and the setter then sees the real mode; its default
     is ``None``, meaning "the caller said nothing, leave the mode alone".
+
+    **``share_id`` vs ``id``.** ``id`` is the internal handle used by every
+    ``/api/*`` owner operation and by every Storage tag; :attr:`share_id` is the
+    *public* identifier that appears in ``/a/{...}`` URLs. They start out equal
+    (and :meth:`from_json` fills an empty/missing ``share_id`` with ``id``, so
+    every artifact written before 0.7.0 keeps its URL), and diverge the moment
+    the owner rotates the link — see :meth:`ArtifactStore.rotate_share`.
+
+    **Trash.** ``status == "trashed"`` is a soft delete: :attr:`trashed_at`
+    records when, :attr:`restore_status` records the status to return to, and
+    the public link is dead until :meth:`ArtifactStore.restore` runs.
     """
 
     id: str
@@ -191,8 +266,23 @@ class ArtifactMeta:
     contributors: list[str] = field(default_factory=list)
     # One of COMMENTS_MODES; comments are open by default.
     comments_mode: str = COMMENTS_ANYONE
-    # ARTIFACT_DRAFT or ARTIFACT_FINAL; "final" freezes versions and comments.
+    # One of ARTIFACT_STATUSES. "final" freezes versions and comments;
+    # "trashed" additionally kills the public link (soft delete).
     status: str = ARTIFACT_DRAFT
+    # Public identifier used in /a/{...} URLs. Empty means "same as id" and is
+    # normalized to ``id`` in __post_init__, so it is never empty in practice.
+    share_id: str = ""
+    # ISO 8601 UTC of the soft delete; "" whenever the artifact is not trashed.
+    trashed_at: str = ""
+    # The status ``restore()`` returns to; one of ARTIFACT_SETTABLE_STATUSES.
+    restore_status: str = ARTIFACT_DRAFT
+    # Outbound webhook URLs the owner registered for this artifact. Semi-secret
+    # (a Slack incoming-hook path *is* its credential), so the API layer never
+    # echoes them outside the owner response that set them. Validation —
+    # https-only, no SSRF targets, per-artifact cap — is the API layer's job
+    # (:func:`src.webhooks.validate_webhook_url`); this module only stores the
+    # list and normalizes obviously unusable entries away.
+    webhooks: list[str] = field(default_factory=list)
     # HEAD_LATEST -> serve the newest live version; HEAD_PINNED -> head_version.
     head_mode: str = HEAD_LATEST
     head_version: int | None = None
@@ -200,6 +290,17 @@ class ArtifactMeta:
     created_at: str = ""
     updated_at: str = ""
     schema: int = SCHEMA_VERSION
+    # Guest invitations: named capabilities that let a human without a Keboola
+    # account comment on this artifact. One entry per invited person, shaped
+    #   {"id": str, "name": str, "secret": <security.hash_password record>,
+    #    "created_at": str, "revoked": bool}
+    # The *secret itself* is never here — only its PBKDF2 record, exactly like
+    # ``password`` — so a leaked meta file cannot be replayed as an invitation.
+    # Minting, verifying, capping and revoking are the API layer's job; this
+    # module only stores the list and drops entries it could never use.
+    # Declared last so every positional argument keeps the meaning it had
+    # before 0.7.0.
+    invitations: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Normalize the enum-ish fields so an unknown value can never leak in."""
@@ -209,10 +310,31 @@ class ArtifactMeta:
             self.comments_mode = COMMENTS_ANYONE
         if self.status not in ARTIFACT_STATUSES:
             self.status = ARTIFACT_DRAFT
+        if self.restore_status not in ARTIFACT_SETTABLE_STATUSES:
+            self.restore_status = ARTIFACT_DRAFT
+        # An empty share_id means "the artifact has never been rotated", which
+        # is exactly the pre-0.7.0 world where the public URL carried the
+        # artifact id. Normalizing here keeps every reader (and to_json) free of
+        # the empty case.
+        if not isinstance(self.share_id, str) or not self.share_id:
+            self.share_id = self.id
+        if not isinstance(self.trashed_at, str):
+            self.trashed_at = ""
+        if self.status != ARTIFACT_TRASHED:
+            self.trashed_at = ""
         if isinstance(self.contributors, list):
             self.contributors = [str(key) for key in self.contributors if key]
         else:
             self.contributors = []
+        # Same tolerance as ``contributors``: anything that is not a non-empty
+        # string is dropped rather than kept as an entry no delivery can use.
+        if isinstance(self.webhooks, list):
+            self.webhooks = [
+                url for url in self.webhooks if isinstance(url, str) and url
+            ]
+        else:
+            self.webhooks = []
+        self.invitations = _clean_invitations(self.invitations)
 
     @property
     def owner_key(self) -> str:
@@ -223,15 +345,24 @@ class ArtifactMeta:
         """True when the artifact is frozen: no new versions, no new comments."""
         return self.status == ARTIFACT_FINAL
 
+    def is_trashed(self) -> bool:
+        """True when the artifact is in the trash (soft-deleted, link dead)."""
+        return self.status == ARTIFACT_TRASHED
+
+    def is_frozen(self) -> bool:
+        """True when no new versions or comments are accepted, for any reason."""
+        return self.is_final() or self.is_trashed()
+
     def allows_versions_from(self, key: str) -> bool:
         """May the project identified by ``key`` submit a version?
 
         A "final" artifact is frozen for everyone, the owner included — the API
-        layer offers the owner a reopen path instead. Otherwise the owner may
+        layer offers the owner a reopen path instead. A "trashed" artifact is
+        frozen the same way, until it is restored. Otherwise the owner may
         always contribute, ``anyone`` opens it up to every verified project and
         ``allowlist`` restricts it to :attr:`contributors`.
         """
-        if self.is_final():
+        if self.is_frozen():
             return False
         if key and key == self.owner_key:
             return True
@@ -243,7 +374,7 @@ class ArtifactMeta:
 
     def allows_comments_from(self, key: str) -> bool:
         """May the project identified by ``key`` comment? Same shape as versions."""
-        if self.is_final():
+        if self.is_frozen():
             return False
         if key and key == self.owner_key:
             return True
@@ -268,11 +399,16 @@ class ArtifactMeta:
             "contributors": self.contributors,
             "comments_mode": self.comments_mode,
             "status": self.status,
+            "share_id": self.share_id,
+            "trashed_at": self.trashed_at,
+            "restore_status": self.restore_status,
+            "webhooks": self.webhooks,
             "head_mode": self.head_mode,
             "head_version": self.head_version,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "schema": self.schema,
+            "invitations": self.invitations,
         }
         return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -309,6 +445,23 @@ class ArtifactMeta:
         comments_mode = data.get("comments_mode")
         status = data.get("status")
 
+        # A meta file written before 0.7.0 has no share_id at all; its public
+        # URL was the artifact id, so that is what it keeps. __post_init__
+        # applies the same fallback for an empty or non-string value.
+        share_id = data.get("share_id")
+        if not isinstance(share_id, str) or not share_id:
+            share_id = artifact_id
+        trashed_at = data.get("trashed_at")
+        restore_status = data.get("restore_status")
+        # Missing (every meta file written before 0.7.0) or non-list values
+        # become an empty list; non-string entries inside a list are dropped by
+        # __post_init__.
+        webhooks = data.get("webhooks")
+        # Same tolerance again: missing (every meta file written before guest
+        # invitations existed) or unusable becomes an empty list, and
+        # __post_init__ drops individual entries it cannot make sense of.
+        invitations = data.get("invitations")
+
         return cls(
             id=artifact_id,
             owner=owner if isinstance(owner, dict) else {},
@@ -323,6 +476,14 @@ class ArtifactMeta:
                 comments_mode if comments_mode in COMMENTS_MODES else COMMENTS_ANYONE
             ),
             status=status if status in ARTIFACT_STATUSES else ARTIFACT_DRAFT,
+            share_id=share_id,
+            trashed_at=trashed_at if isinstance(trashed_at, str) else "",
+            restore_status=(
+                restore_status
+                if restore_status in ARTIFACT_SETTABLE_STATUSES
+                else ARTIFACT_DRAFT
+            ),
+            webhooks=webhooks if isinstance(webhooks, list) else [],
             head_mode=head_mode if head_mode in _HEAD_MODES else HEAD_LATEST,
             head_version=(
                 head_version
@@ -332,6 +493,7 @@ class ArtifactMeta:
             created_at=data.get("created_at") or "",
             updated_at=data.get("updated_at") or "",
             schema=schema if isinstance(schema, int) else SCHEMA_VERSION,
+            invitations=invitations if isinstance(invitations, list) else [],
         )
 
 
@@ -382,6 +544,11 @@ class Envelope:
     status: str = STATUS_LIVE
     # Free-form contributor note ("what changed").
     note: str | None = None
+    # The version this submission was written against, as reported by the
+    # submitter. Purely informational at the storage layer: deciding whether a
+    # proposal is "outdated" (head moved on since ``base_version``) is the API
+    # layer's job. ``None`` means the submitter did not say.
+    base_version: int | None = None
     # File ID of the canonical copy in the *author's* project (may be absent).
     canonical_file_id: int | None = None
     # ISO 8601 UTC; produced by the caller, never by this module.
@@ -405,6 +572,7 @@ class Envelope:
             "author": self.author,
             "status": self.status,
             "note": self.note,
+            "base_version": self.base_version,
             "canonical_file_id": self.canonical_file_id,
             "created_at": self.created_at,
             "schema": self.schema,
@@ -460,6 +628,7 @@ class Envelope:
             source_type = "html"
         status = data.get("status")
         note = data.get("note")
+        base_version = data.get("base_version")
         canonical_file_id = data.get("canonical_file_id")
         version = data.get("version")
         schema = data.get("schema")
@@ -480,6 +649,13 @@ class Envelope:
             author=author,
             status=status if status in _STATUSES else STATUS_LIVE,
             note=note if isinstance(note, str) and note else None,
+            base_version=(
+                base_version
+                if isinstance(base_version, int)
+                and not isinstance(base_version, bool)
+                and base_version > 0
+                else None
+            ),
             canonical_file_id=(
                 canonical_file_id
                 if isinstance(canonical_file_id, int)
@@ -502,6 +678,7 @@ class Envelope:
             "title": self.title,
             "status": self.status,
             "note": self.note,
+            "base_version": self.base_version,
             "created_at": self.created_at,
             "is_head": bool(is_head),
             "size_bytes": len(self.html.encode("utf-8")),
@@ -630,6 +807,13 @@ class ArtifactStore:
         # <= 0 means "no cap".
         self._max_proposed_versions = max(0, int(max_proposed_versions))
         self._index: dict[str, _ArtEntry] = {}
+        # Public share id -> artifact id, and its inverse. Share ids live inside
+        # the meta *payload*, not in a Storage tag, so hydrate() cannot fill
+        # these; they are learned lazily (every meta this store loads teaches it
+        # one mapping) and are authoritative only as a cache — every hit is
+        # re-checked against the meta record before it is trusted.
+        self._share_index: dict[str, str] = {}
+        self._share_of: dict[str, str] = {}
         self._memory: OrderedDict[tuple[str, int], Envelope] = OrderedDict()
         self._meta_memory: OrderedDict[tuple[str, int], ArtifactMeta] = OrderedDict()
         self._lock = threading.Lock()
@@ -663,6 +847,10 @@ class ArtifactStore:
 
         with self._lock:
             self._index = index
+            # Share ids are not derivable from tags, so a full rebuild starts
+            # from an empty share cache and re-learns lazily (resolve_share).
+            self._share_index = {}
+            self._share_of = {}
         logger.info("Hydrated index with %d artifact(s)", len(index))
         return len(index)
 
@@ -716,6 +904,7 @@ class ArtifactStore:
                 self._index.pop(artifact_id, None)
                 self._forget_memory_locked(artifact_id)
                 self._forget_meta_locked(artifact_id)
+                self._forget_share_locked(artifact_id)
             return False
         rebuilt = _ArtEntry()
         for info in files:
@@ -724,6 +913,9 @@ class ArtifactStore:
             self._index[artifact_id] = rebuilt
             self._forget_memory_locked(artifact_id)
             self._forget_meta_locked(artifact_id)
+            # The refreshed meta file may carry a share id rotated by another
+            # replica; drop what we knew and re-learn it on the next resolve.
+            self._forget_share_locked(artifact_id)
         return True
 
     # ----------------------------------------------------------------- meta
@@ -768,6 +960,10 @@ class ArtifactStore:
             entry.meta_file_id = file_id
             self._forget_meta_locked(artifact_id)
             self._remember_meta_locked(artifact_id, file_id, meta)
+            # Keep the share index in step with what we just persisted; a
+            # rotation drops the previous share id here (that revocation is the
+            # whole point of rotating).
+            self._learn_share_locked(artifact_id, meta.share_id)
         self._write_disk_cache(artifact_id, file_id, raw)
         if previous is not None and previous != file_id:
             self._delete_disk_cache(artifact_id, previous)
@@ -777,6 +973,190 @@ class ArtifactStore:
         """Owner key of an artifact, or None when the artifact is unknown."""
         meta = self.get_meta(artifact_id)
         return meta.owner_key if meta is not None else None
+
+    # ------------------------------------------------------------ share ids
+
+    def _learn_share_locked(self, artifact_id: str, share_id: str) -> None:
+        """Record ``share_id`` as this artifact's public id. Caller holds lock."""
+        if not share_id:
+            share_id = artifact_id
+        previous = self._share_of.get(artifact_id)
+        if previous is not None and previous != share_id:
+            if self._share_index.get(previous) == artifact_id:
+                self._share_index.pop(previous, None)
+        self._share_of[artifact_id] = share_id
+        self._share_index[share_id] = artifact_id
+
+    def _forget_share_locked(self, artifact_id: str) -> None:
+        """Drop everything we know about an artifact's share id. Holds lock."""
+        previous = self._share_of.pop(artifact_id, None)
+        if previous is not None and self._share_index.get(previous) == artifact_id:
+            self._share_index.pop(previous, None)
+
+    def _learn_share(self, artifact_id: str, share_id: str) -> None:
+        with self._lock:
+            self._learn_share_locked(artifact_id, share_id)
+
+    def _share_hit(self, artifact_id: str, wanted: str) -> str | None:
+        """Confirm ``wanted`` is still ``artifact_id``'s live public share id.
+
+        Returns the artifact id on a confirmed, servable hit and ``None``
+        otherwise — the mapping was stale (rotated elsewhere) or the artifact is
+        in the trash, in which case its public link is dead by definition. Every
+        meta actually loaded here also refreshes the share cache.
+        """
+        meta = self.get_meta(artifact_id)
+        if meta is None:
+            with self._lock:
+                self._forget_share_locked(artifact_id)
+            return None
+        self._learn_share(artifact_id, meta.share_id)
+        if meta.share_id != wanted or meta.is_trashed():
+            return None
+        return artifact_id
+
+    def resolve_share(self, share_or_artifact_id: str) -> str | None:
+        """Map a public ``/a/{...}`` identifier to an internal artifact id.
+
+        Accepts the share id an artifact currently publishes — which, until the
+        owner rotates the link, *is* its artifact id. Returns ``None`` for
+        anything that must not resolve publicly:
+
+        * a share id that has been rotated away (revoked),
+        * the bare artifact id of an artifact whose share id has moved on — the
+          internal id stops working as a public handle the moment they differ,
+          and stays valid only for owner ``/api/*`` calls,
+        * an artifact currently in the trash, and
+        * an identifier that names nothing at all.
+
+        Lookup order, cheapest first: the share cache, then the in-memory index
+        (is this an artifact id?), then a scan of indexed artifacts whose share
+        id we have not learned yet (their metas are loaded once and cached), and
+        finally a Storage tag search for an artifact this replica has never
+        seen. Every share id learned along the way is cached, so a warm index
+        answers in O(1).
+        """
+        wanted = share_or_artifact_id
+        if not wanted:
+            return None
+
+        with self._lock:
+            cached = self._share_index.get(wanted)
+        if cached is not None:
+            meta = self.get_meta(cached)
+            if meta is None:
+                with self._lock:
+                    self._forget_share_locked(cached)
+            else:
+                self._learn_share(cached, meta.share_id)
+                if meta.share_id == wanted:
+                    # The mapping still holds, so this is the final answer:
+                    # servable, unless the artifact sits in the trash.
+                    return None if meta.is_trashed() else cached
+                # Rotated away by another replica. ``wanted`` is revoked for
+                # this artifact; keep looking on the slower paths in case it
+                # now belongs to a different one.
+
+        with self._lock:
+            known_artifact = wanted in self._index
+        if known_artifact:
+            # An artifact id whose meta names a *different* share id has been
+            # rotated away: it is no longer a public handle. It cannot be some
+            # other artifact's share id either — share ids are minted from the
+            # same unguessable alphabet, so collisions do not happen.
+            return self._share_hit(wanted, wanted)
+
+        found = self._scan_for_share(wanted)
+        if found is not None:
+            return found
+
+        # Never seen by this replica: fall back to a Storage tag search, which
+        # is what every other read path does on an index miss.
+        if self._resolve(wanted) is None:
+            return None
+        return self._share_hit(wanted, wanted)
+
+    def _scan_for_share(self, wanted: str) -> str | None:
+        """Load the metas whose share id we do not know yet, looking for one.
+
+        Every meta loaded teaches the share cache its mapping, so the scan pays
+        for itself: a later lookup of any share id it saw is a dict hit. Metas
+        are loaded outside the lock; only the cache updates take it. Returns
+        ``None`` both when nothing matches and when the match is trashed (a
+        trashed artifact has no live public link).
+        """
+        with self._lock:
+            candidates = [
+                artifact_id
+                for artifact_id in self._index
+                if artifact_id not in self._share_of
+            ]
+        for artifact_id in candidates:
+            try:
+                meta = self.get_meta(artifact_id)
+            except BackendError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one bad record must not
+                # break share resolution for everybody else.
+                logger.warning(
+                    "Cannot load meta of artifact %s while resolving a share "
+                    "id: %s",
+                    artifact_id,
+                    exc,
+                )
+                continue
+            if meta is None:
+                continue
+            self._learn_share(artifact_id, meta.share_id)
+            if meta.share_id == wanted:
+                return None if meta.is_trashed() else artifact_id
+        return None
+
+    def rotate_share(
+        self,
+        artifact_id: str,
+        generate: Callable[[], str] | None = None,
+        when_iso: str = "",
+    ) -> str | None:
+        """Mint a new public share id for an artifact and revoke the old link.
+
+        After this, the previous share id stops resolving — and so does the bare
+        artifact id, once it differs from the share id. That revocation is the
+        entire point: a link handed to the wrong person can be taken back.
+
+        ``generate`` defaults to :func:`src.security.new_artifact_id` (imported
+        lazily so this module keeps no import-time dependency on it); tests pass
+        their own to make rotation deterministic. ``when_iso``, when given,
+        becomes the meta record's new ``updated_at``.
+
+        Returns the new share id, or ``None`` when the artifact is unknown.
+        """
+        meta = self.get_meta(artifact_id)
+        if meta is None:
+            return None
+        if generate is None:
+            from src.security import new_artifact_id
+
+            generate = new_artifact_id
+        new_share = str(generate())
+        if not new_share:
+            raise ValueError("share id generator produced an empty id")
+
+        previous = meta.share_id
+        with self._lock:
+            if previous and self._share_index.get(previous) == artifact_id:
+                self._share_index.pop(previous, None)
+            self._share_of.pop(artifact_id, None)
+        # save_meta records the new mapping (and drops any residual old one).
+        self.save_meta(
+            replace(
+                meta,
+                share_id=new_share,
+                updated_at=when_iso or meta.updated_at,
+            )
+        )
+        logger.info("Rotated the share link of artifact %s", artifact_id)
+        return new_share
 
     # ------------------------------------------------------------- versions
 
@@ -1084,6 +1464,69 @@ class ArtifactStore:
                 self._memory.pop((artifact_id, legacy_file_id), None)
         return True
 
+    # ---------------------------------------------------------------- trash
+
+    def trash(self, artifact_id: str, when_iso: str) -> bool:
+        """Soft-delete an artifact: freeze it and kill its public link.
+
+        Nothing is removed from Storage — only the meta record changes, moving
+        to :data:`ARTIFACT_TRASHED` and remembering the status to come back to
+        in ``restore_status``. While trashed, :meth:`resolve_share` refuses the
+        artifact's public identifier and no version or comment is accepted;
+        :meth:`restore` undoes all of it and :meth:`delete` is still the
+        irreversible purge.
+
+        ``when_iso`` is the caller's timestamp (this module never reads the
+        clock); it lands in ``trashed_at`` and, when non-empty, in
+        ``updated_at``. Returns ``False`` only when the artifact is unknown;
+        trashing an already-trashed artifact is a successful no-op that
+        deliberately does not overwrite the remembered ``restore_status``.
+        """
+        meta = self.get_meta(artifact_id)
+        if meta is None:
+            return False
+        if meta.is_trashed():
+            return True
+        self.save_meta(
+            replace(
+                meta,
+                status=ARTIFACT_TRASHED,
+                restore_status=(
+                    meta.status
+                    if meta.status in ARTIFACT_SETTABLE_STATUSES
+                    else ARTIFACT_DRAFT
+                ),
+                trashed_at=when_iso,
+                updated_at=when_iso or meta.updated_at,
+            )
+        )
+        logger.info("Artifact %s moved to the trash", artifact_id)
+        return True
+
+    def restore(self, artifact_id: str, when_iso: str = "") -> bool:
+        """Bring a trashed artifact back to the status it was trashed from.
+
+        Returns ``False`` when the artifact is unknown or was not in the trash.
+        ``when_iso``, when given, becomes the new ``updated_at``.
+        """
+        meta = self.get_meta(artifact_id)
+        if meta is None or not meta.is_trashed():
+            return False
+        self.save_meta(
+            replace(
+                meta,
+                status=meta.restore_status,
+                trashed_at="",
+                updated_at=when_iso or meta.updated_at,
+            )
+        )
+        logger.info(
+            "Artifact %s restored from the trash to %s",
+            artifact_id,
+            meta.restore_status,
+        )
+        return True
+
     # --------------------------------------------------------------- delete
 
     def delete(self, artifact_id: str) -> bool:
@@ -1123,6 +1566,7 @@ class ArtifactStore:
             self._index.pop(artifact_id, None)
             self._forget_memory_locked(artifact_id)
             self._forget_meta_locked(artifact_id)
+            self._forget_share_locked(artifact_id)
         self._purge_disk_cache(artifact_id)
         return True
 
@@ -1183,6 +1627,9 @@ class ArtifactStore:
 
         return {
             "id": artifact_id,
+            # The public identifier: equal to ``id`` until the link is rotated,
+            # and what every /a/{...} URL for this row must be built from.
+            "share_id": meta.share_id,
             "title": head.title if head is not None else "",
             "created_at": meta.created_at,
             "updated_at": meta.updated_at,
@@ -1190,6 +1637,7 @@ class ArtifactStore:
             "accept_versions_mode": meta.accept_versions_mode,
             "comments_mode": meta.comments_mode,
             "status": meta.status,
+            "trashed_at": meta.trashed_at,
             "protected": bool(meta.password),
             "head_version": head.version if head is not None else None,
             "versions_count": versions_count,

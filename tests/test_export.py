@@ -285,6 +285,36 @@ def test_index_wikilinks_resolve_to_real_files(meta, envelopes, threads):
         assert f"{ROOT}/{target}.md" in names
 
 
+def test_vault_publishes_the_share_id_not_the_internal_id(envelopes, threads):
+    """A vault is a download, so the identity it carries is the public one.
+
+    The internal artifact id is the owner's handle for every authenticated
+    /api/* call. After a link rotation the two differ, and only the share id is
+    the reader's to keep.
+    """
+    rotated = ArtifactMeta(
+        id=ARTIFACT_ID,
+        owner=dict(OWNER),
+        share_id="RotatedShareId9",
+        created_at="2026-01-01T08:00:00+00:00",
+        updated_at="2026-01-05T10:00:00+00:00",
+    )
+    _, _, archive = _open(rotated, envelopes, threads)
+
+    for note in (f"{ROOT}/INDEX.md", f"{ROOT}/reasoning.md"):
+        lines = _frontmatter_lines(_read(archive, note))
+        assert 'artifact_id: "RotatedShareId9"' in lines
+        assert f'artifact_id: "{ARTIFACT_ID}"' not in lines
+
+
+def test_vault_falls_back_to_the_id_when_there_is_no_share_id(envelopes, threads):
+    """A meta record written before share ids existed still exports cleanly."""
+    legacy = ArtifactMeta(id=ARTIFACT_ID, owner=dict(OWNER))
+    _, _, archive = _open(legacy, envelopes, threads)
+    lines = _frontmatter_lines(_read(archive, f"{ROOT}/INDEX.md"))
+    assert f'artifact_id: "{ARTIFACT_ID}"' in lines
+
+
 def test_index_frontmatter_and_sections(meta, envelopes, threads):
     _, _, archive = _open(meta, envelopes, threads)
     index = _read(archive, f"{ROOT}/INDEX.md")
