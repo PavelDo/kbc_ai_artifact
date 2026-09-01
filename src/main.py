@@ -797,6 +797,7 @@ async def lifespan(app: FastAPI):
         settings.max_versions,
         settings.max_envelope_bytes,
         settings.max_proposed_versions,
+        reap_aborted_after_s=settings.reap_aborted_publish_after_s,
     )
     app.state.comments = CommentStore(
         backend,
@@ -2544,6 +2545,27 @@ def _store_canonical(owner: Owner, token: str, artifact_id: str, html: str) -> i
             status_code=502,
             detail="could not store canonical copy in your project",
         ) from exc
+
+
+def _discard_canonical(owner: Owner, token: str, artifact_id: str, file_id: int) -> None:
+    """Best-effort delete of a canonical copy whose version never landed.
+
+    The copy lives in the *author's* project, which the hub can only reach
+    with the caller's token during this request -- there is no later cleanup
+    handle, no tag search across projects, no reconciler that could ever find
+    it. So it is removed here, on the failure path, while the token is still
+    in hand. A failure to remove it is logged with everything an operator
+    needs to reap it by hand; it never masks the error that got us here.
+    """
+    try:
+        KbcFilesBackend(owner.stack_url, token).delete(file_id)
+    except Exception as exc:  # noqa: BLE001 - the original failure must win
+        logger.error(
+            "Could not discard canonical file %s of artifact %s in project %s "
+            "after its version write failed; it is an orphan in that project "
+            "and needs reaping by hand: %s",
+            file_id, artifact_id, owner.project_id, exc,
+        )
 
 
 def _identity(owner: Owner) -> dict[str, Any]:
@@ -5018,7 +5040,26 @@ def publish_artifact(
         canonical_file_id=canonical_file_id,
         created_at=now,
     )
-    store.add_version(envelope)
+    try:
+        store.add_version(envelope)
+    except Exception:
+        # Step 3 failed after steps 1 and 2 succeeded: undo both, in the
+        # order that matters -- the canonical copy first, while the caller's
+        # token is still usable, then the meta record. Either undo failing is
+        # logged and the original failure still propagates as the 502.
+        _discard_canonical(owner, token, artifact_id, canonical_file_id)
+        try:
+            rolled_back = store.delete(artifact_id)
+        except Exception:  # noqa: BLE001 - the original failure must win
+            rolled_back = False
+        if not rolled_back:
+            logger.error(
+                "Rollback of artifact %s failed after its version write "
+                "failed; a meta record with no version may remain and will "
+                "be reaped at the next hydrate once old enough",
+                artifact_id,
+            )
+        raise
     logger.info(
         "Published artifact %s (owner project %s, source %s, %d bytes, "
         "protected=%s, accept_versions=%s, canonical file %s)",
@@ -5150,20 +5191,24 @@ def update_artifact(
     if present:
         built, source = _build(body)
 
+    # Content first, settings last. The settings used to be saved before the
+    # content, so a failed canonical upload or version write answered 502
+    # with a new password, policy or status already in force -- the caller
+    # was told nothing happened while the security-relevant half had. Now
+    # the version lands (or fails, with nothing changed) before any setting
+    # is written. The settings are applied to a *copy*: store.get_meta
+    # answers from cache, so mutating ``meta`` in place would let a failed
+    # save_meta leave every later read on this process showing settings
+    # Storage never received.
+    candidate = dataclasses.replace(meta)
     if body.clear_password:
-        meta.password = None
+        candidate.password = None
     elif body.password:
-        meta.password = hash_password(body.password)
-    _apply_policy(meta, body)
-    meta.updated_at = now
-    store.save_meta(meta)
+        candidate.password = hash_password(body.password)
+    _apply_policy(candidate, body)
+    candidate.updated_at = now
 
     if built is not None:
-        # Residual risk (documented, not fixed here): the settings above are
-        # already committed, so a failure in the canonical upload or the
-        # version write leaves them applied while the content update did not
-        # land. The call answers 502, and the artifact stays readable at its
-        # previous version — no half-written version is ever served.
         canonical_file_id = _store_canonical(owner, token, artifact_id, built.html)
         envelope = Envelope(
             id=artifact_id,
@@ -5178,7 +5223,14 @@ def update_artifact(
             canonical_file_id=canonical_file_id,
             created_at=now,
         )
-        envelope.version = store.add_version_next(envelope)
+        try:
+            envelope.version = store.add_version_next(envelope)
+        except Exception:
+            # The copy in the caller's project has no version pointing at it
+            # and no other way to ever be found; discard it now, while the
+            # caller's token still works. The failure itself still propagates.
+            _discard_canonical(owner, token, artifact_id, canonical_file_id)
+            raise
         # v1 is the publish itself, which the owner just did by hand and does
         # not need a notification about; every later live version is news.
         if envelope.version > 1:
@@ -5193,6 +5245,9 @@ def update_artifact(
         envelope = store.get_head(artifact_id)
         if envelope is None:
             return _not_found(artifact_id)
+
+    store.save_meta(candidate)
+    meta = candidate
 
     if meta.status == ARTIFACT_FINAL and not was_final:
         _emit_webhook(

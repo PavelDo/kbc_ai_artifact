@@ -223,53 +223,54 @@ HMAC-signed JSON, keyed per receiver, or Slack's `{"text": ...}` shape for a
 
 ## Quick start (curl)
 
-Set `$HUB` to the deployed base URL, `your-token` to a real Keboola Storage
-API token, and pick the `X-Storage-Stack` alias for your stack (`us`, `gcp-us`,
-`eu`, `azure-eu`, `gcp-eu`, or any full `https://*.keboola.com` URL).
+Set `$HUB` to the deployed base URL, put your Keboola Storage API token and
+your stack alias (`us`, `gcp-us`, `eu`, `azure-eu`, `gcp-eu`, or any full
+`https://*.keboola.com` URL) in the environment, and define `hub` — a
+one-line wrapper that hands curl the two auth headers through a process
+substitution, so the token is never a command-line argument visible in `ps`:
+
+```bash
+export KBC_TOKEN="…"
+export KBC_STACK=eu
+hub() {
+  curl -s -K <(printf 'header = "X-StorageApi-Token: %s"\nheader = "X-Storage-Stack: %s"\n' "$KBC_TOKEN" "$KBC_STACK") "$@"
+}
+```
+
+A second identity (a contributing project) is just a different token for one
+call: `KBC_TOKEN="$CONTRIBUTOR_TOKEN" hub …`.
 
 ```bash
 # Publish HTML
-curl -s -X POST "$HUB/api/artifacts" \
-  -H "X-StorageApi-Token: your-token" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{"html": "<!doctype html><html><body><h1>Hello</h1></body></html>", "title": "My report"}'
 
 # Publish Markdown
-curl -s -X POST "$HUB/api/artifacts" \
-  -H "X-StorageApi-Token: your-token" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{"markdown": "# Title\n\nSome content."}'
 
 # Publish from a public git repo
-curl -s -X POST "$HUB/api/artifacts" \
-  -H "X-StorageApi-Token: your-token" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{"git_url": "https://github.com/org/repo", "git_ref": "main", "git_path": "docs/report.md"}'
 
 # Publish from a private git repo (git_token is transient — see below)
-curl -s -X POST "$HUB/api/artifacts" \
-  -H "X-StorageApi-Token: your-token" \
-  -H "X-Storage-Stack: eu" \
+hub -X POST "$HUB/api/artifacts" \
   -H "Content-Type: application/json" \
   -d '{"git_url": "https://github.com/org/private-repo", "git_path": "docs/report.md", "git_token": "your-github-pat"}'
 
 # Read (public, no token)
-curl -s "$HUB/a/<id>/raw"
+hub "$HUB/a/<id>/raw"
 
 # Update (owner project only)
-curl -s -X PUT "$HUB/api/artifacts/<id>" \
-  -H "X-StorageApi-Token: your-token" \
-  -H "X-Storage-Stack: eu" \
+hub -X PUT "$HUB/api/artifacts/<id>" \
   -H "Content-Type: application/json" \
   -d '{"markdown": "# Updated"}'
 
 # Delete (owner project only)
-curl -s -X DELETE "$HUB/api/artifacts/<id>" \
-  -H "X-StorageApi-Token: your-token" \
-  -H "X-Storage-Stack: eu"
+hub -X DELETE "$HUB/api/artifacts/<id>"
 ```
 
 Add `"password": "secret"` to any publish/update body to protect the
@@ -280,35 +281,30 @@ web unlock form (browsers).
 
 ```bash
 # Open an artifact to submissions from other projects
-curl -s -X PUT "$HUB/api/artifacts/<id>" \
-  -H "X-StorageApi-Token: your-token" -H "X-Storage-Stack: eu" \
+hub -X PUT "$HUB/api/artifacts/<id>" \
   -H "Content-Type: application/json" \
   -d '{"accept_versions": true}'
 
 # Submit a version (any project; live for the owner, proposed for others)
-curl -s -X POST "$HUB/api/artifacts/<id>/versions" \
-  -H "X-StorageApi-Token: contributor-token" -H "X-Storage-Stack: eu" \
+KBC_TOKEN="$CONTRIBUTOR_TOKEN" hub -X POST "$HUB/api/artifacts/<id>/versions" \
   -H "Content-Type: application/json" \
   -d '{"markdown": "# Updated", "note": "fix the totals table"}'
 
 # Review: history, one version, and the diff
-curl -s "$HUB/a/<id>/versions"
-curl -s "$HUB/a/<id>/v/2" -H "X-StorageApi-Token: your-token" -H "X-Storage-Stack: eu"
-curl -s "$HUB/a/<id>/diff/1..2?format=unified"
+hub "$HUB/a/<id>/versions"
+hub "$HUB/a/<id>/v/2"
+hub "$HUB/a/<id>/diff/1..2?format=unified"
 
 # Promote a proposal (owner project only)
-curl -s -X POST "$HUB/api/artifacts/<id>/versions/2/promote" \
-  -H "X-StorageApi-Token: your-token" -H "X-Storage-Stack: eu"
+hub -X POST "$HUB/api/artifacts/<id>/versions/2/promote"
 
 # Pin the head to one live version, or go back to "latest"
-curl -s -X PUT "$HUB/api/artifacts/<id>/head" \
-  -H "X-StorageApi-Token: your-token" -H "X-Storage-Stack: eu" \
+hub -X PUT "$HUB/api/artifacts/<id>/head" \
   -H "Content-Type: application/json" \
   -d '{"mode": "pinned", "version": 1}'
 
 # Withdraw your own proposal (contributor project)
-curl -s -X DELETE "$HUB/api/artifacts/<id>/versions/2" \
-  -H "X-StorageApi-Token: contributor-token" -H "X-Storage-Stack: eu"
+KBC_TOKEN="$CONTRIBUTOR_TOKEN" hub -X DELETE "$HUB/api/artifacts/<id>/versions/2"
 ```
 
 `GET /a/{id}/versions?format=html` renders the same history as a styled page
@@ -402,6 +398,7 @@ are missing. Everything else has a documented default, overridable via env.
 | `HUB_DIFF_MAX_BYTES` | `2097152` (2 MB) | Largest per-side payload the diff renderer (including `format=visual`'s rendered HTML) will process (413 above it) |
 | `HUB_EXTRA_STACKS` | empty | Comma-separated extra stack URLs allowed beyond the `*.keboola.com` rule |
 | `HUB_MAX_ENVELOPE_BYTES` | `20971520` (20 MB) | Largest persisted envelope/meta record the store will download or read from cache before refusing it as a DoS guard; `0` disables the bound |
+| `HUB_REAP_ABORTED_PUBLISH_AFTER_S` | `3600` | A meta record with no version is a publish that died between its two writes; startup deletes such records once older than this, so they cannot be a publish still in flight (`0` disables) |
 | `HUB_MAX_PROPOSED_VERSIONS` | `50` | Per-artifact cap on retained proposed versions; the oldest proposals above this are pruned (proposals are never served as head, so this is always safe) |
 | `HUB_TRUST_FORWARDED_HEADERS` | `false` | Trust `X-Forwarded-Host`/`X-Forwarded-Proto` to name the public origin when `HUB_PUBLIC_BASE_URL` is unset — only for local development behind a proxy; a direct client can forge these headers |
 | `HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR` | `30` | Failed password-unlock attempts allowed per (artifact, client IP) per UTC hour before the gate answers 429 (each attempt costs a full PBKDF2 verification) |

@@ -1963,3 +1963,64 @@ class TestInvitationRevokedIsStrictlyBoolean:
         del entry["revoked"]
         restored = ArtifactMeta.from_json(_make_meta(invitations=[entry]).to_json())
         assert restored.invitations[0]["revoked"] is False
+
+
+
+class TestHydrateReapsAbortedPublishes:
+    """REL-075-009: a meta record with no version is an aborted publish.
+
+    Publish writes the meta record first so a failed canonical upload can be
+    rolled back; if the process dies between that write and the version
+    write, the record stays. It is inert -- every read answers 404 -- but it
+    accumulates, and nothing reaped it. Hydrate now does, for records old
+    enough that they cannot be a publish still in flight.
+    """
+
+    @staticmethod
+    def _orphan_meta(backend, artifact_id: str, age_s: int) -> int:
+        import dataclasses
+        from datetime import datetime, timedelta, timezone
+        from src.store import TAG_ALL, TAG_META, tag_for_id, tag_for_owner
+        meta = _make_meta(artifact_id)
+        file_id = backend.upload(
+            f"artifact-{artifact_id}-meta.json", meta.to_json(),
+            [TAG_ALL, tag_for_id(artifact_id), TAG_META, tag_for_owner(meta.owner_key)],
+        )
+        info, content = backend.files[file_id]
+        created = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat()
+        backend.files[file_id] = (dataclasses.replace(info, created=created), content)
+        return file_id
+
+    @staticmethod
+    def _store(backend, tmp_path, settings, reap_after: int) -> ArtifactStore:
+        return ArtifactStore(
+            backend=backend, cache_dir=tmp_path / "c",
+            cache_max_entries=settings.cache_max_entries, max_versions=settings.max_versions,
+            reap_aborted_after_s=reap_after,
+        )
+
+    def test_an_old_meta_without_any_version_is_reaped(self, backend, tmp_path, settings):
+        file_id = self._orphan_meta(backend, "orphan", age_s=7200)
+        store = self._store(backend, tmp_path, settings, reap_after=3600)
+        store.hydrate()
+        assert file_id not in backend.files
+        assert store.get_meta("orphan") is None
+
+    def test_a_fresh_meta_without_versions_is_left_alone(self, backend, tmp_path, settings):
+        """Young enough to be a publish between its two writes -- never touched."""
+        file_id = self._orphan_meta(backend, "inflight", age_s=5)
+        self._store(backend, tmp_path, settings, reap_after=3600).hydrate()
+        assert file_id in backend.files
+
+    def test_a_meta_with_a_version_is_never_reaped(self, backend, tmp_path, settings):
+        file_id = self._orphan_meta(backend, "real", age_s=7200)
+        store = self._store(backend, tmp_path, settings, reap_after=3600)
+        store.add_version(_make_envelope("real", version=1))
+        store.hydrate()
+        assert file_id in backend.files
+        assert store.get_meta("real") is not None
+
+    def test_zero_disables_reaping(self, backend, tmp_path, settings):
+        file_id = self._orphan_meta(backend, "kept", age_s=7200)
+        self._store(backend, tmp_path, settings, reap_after=0).hydrate()
+        assert file_id in backend.files

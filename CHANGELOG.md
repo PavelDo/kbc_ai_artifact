@@ -47,6 +47,24 @@ your side.**
   pending notifications without limit; past a configurable ceiling
   (`HUB_WEBHOOK_QUEUE_MAX`) the newest is dropped, and publishing is never held
   up waiting for one.
+- An update that fails no longer leaves its settings behind. Changing a
+  password, policy or status together with new content used to apply the
+  settings first, so a failed upload answered with an error while the
+  security-relevant half had already taken effect. Content lands first now
+  and settings are written last, or not at all.
+- A failed publish or update no longer strands a copy of the document in the
+  author's own Keboola project. That copy could only ever be reached with the
+  caller's token during the request, so it is removed right there when the
+  version it was for fails to land; a publish that fails at its last step now
+  cleans up its own record as well.
+- A publish interrupted between its two writes used to leave an invisible,
+  unreachable record behind forever. Startup now reaps such records once they
+  are old enough that they cannot be a publish still in progress
+  (`HUB_REAP_ABORTED_PUBLISH_AFTER_S`).
+- Every documented API example now calls the service through a small shell
+  function instead of passing the token as a command-line argument, where it
+  was visible to anyone who could list processes on the machine for as long
+  as the call ran.
 - Two requests changing the same document at the same moment can no longer
   act on a state that has just stopped being true. Every change to a document
   now waits for the previous one to finish: two promotions of one proposal

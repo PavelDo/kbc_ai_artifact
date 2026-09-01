@@ -56,6 +56,7 @@ the irreversible purge.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 import logging
 import os
 import threading
@@ -883,6 +884,7 @@ class ArtifactStore:
         max_versions: int,
         max_envelope_bytes: int = 20 * 1024 * 1024,
         max_proposed_versions: int = 50,
+        reap_aborted_after_s: int = 0,
     ) -> None:
         self._backend = backend
         self._cache_dir = Path(cache_dir)
@@ -893,6 +895,9 @@ class ArtifactStore:
         self._max_envelope_bytes = int(max_envelope_bytes)
         # <= 0 means "no cap".
         self._max_proposed_versions = max(0, int(max_proposed_versions))
+        # Seconds a meta record with no version may exist before hydrate
+        # treats it as an aborted publish and deletes it; 0 disables.
+        self._reap_aborted_after_s = max(0, int(reap_aborted_after_s))
         self._index: dict[str, _ArtEntry] = {}
         # Public share id -> artifact id, and its inverse. Share ids live inside
         # the meta *payload*, not in a Storage tag, so hydrate() cannot fill
@@ -932,6 +937,8 @@ class ArtifactStore:
             entry = index.setdefault(artifact_id, _ArtEntry())
             _absorb_file(entry, info)
 
+        self._reap_aborted_publishes(index, {info.id: info for info in files})
+
         with self._lock:
             self._index = index
             # Share ids are not derivable from tags, so a full rebuild starts
@@ -940,6 +947,54 @@ class ArtifactStore:
             self._share_of = {}
         logger.info("Hydrated index with %d artifact(s)", len(index))
         return len(index)
+
+    def _reap_aborted_publishes(
+        self, index: dict[str, _ArtEntry], files: dict[int, FileInfo]
+    ) -> None:
+        """Delete meta records that have no version and are too old to be in flight.
+
+        Publish writes the meta record first, so that a failed canonical
+        upload can be rolled back by deleting it; if the process dies between
+        that write and the version write, the record stays. It is inert --
+        every read answers 404 for it, because there is no head -- but it is
+        also invisible to every API and accumulates forever. Nothing else can
+        have this shape: a purge removes everything, the last live version
+        cannot be deleted, and a legacy envelope counts as a version.
+
+        Age is the whole safety argument. Right after a restart this very
+        shape is also what a publish looks like between its two writes, so
+        only a record older than ``reap_aborted_after_s`` is touched -- an
+        hour by default, against a request that takes seconds. A timestamp
+        that cannot be read is treated as young. Runs only from
+        :meth:`hydrate`, never from the lazy per-artifact fallback.
+        """
+        if self._reap_aborted_after_s <= 0:
+            return
+        for artifact_id, entry in list(index.items()):
+            if entry.meta_file_id is None or entry.versions or entry.legacy_file_id is not None:
+                continue
+            info = files.get(entry.meta_file_id)
+            age = _age_seconds(info.created) if info is not None else None
+            if age is None or age < self._reap_aborted_after_s:
+                logger.info(
+                    "Artifact %s has a meta record but no version; leaving it "
+                    "(age %s s, reaped after %d s)",
+                    artifact_id, "unknown" if age is None else int(age), self._reap_aborted_after_s,
+                )
+                continue
+            try:
+                self._backend.delete(entry.meta_file_id)
+            except Exception as exc:  # noqa: BLE001 - reaping is best effort
+                logger.warning(
+                    "Could not reap the aborted publish %s (meta file %s): %s",
+                    artifact_id, entry.meta_file_id, exc,
+                )
+                continue
+            del index[artifact_id]
+            logger.warning(
+                "Reaped aborted publish %s: meta file %s had no version for %d s",
+                artifact_id, entry.meta_file_id, int(age),
+            )
 
     def count(self) -> int:
         """Number of artifacts currently indexed."""
@@ -2234,6 +2289,21 @@ class ArtifactStore:
                 path.unlink(missing_ok=True)
             except OSError as exc:
                 logger.warning("Cannot prune disk cache %s: %s", path, exc)
+
+
+def _age_seconds(created: str) -> float | None:
+    """Seconds since an ISO timestamp as Storage reports it; None if unreadable.
+
+    Storage answers with an offset; a naive value is read as UTC. Unreadable
+    means "do not know", which the reaper treats as "too young to touch".
+    """
+    try:
+        stamp = datetime.fromisoformat((created or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - stamp).total_seconds()
 
 
 def _absorb_file(entry: _ArtEntry, info: FileInfo) -> None:

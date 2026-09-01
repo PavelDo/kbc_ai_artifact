@@ -72,6 +72,11 @@ class Settings:
     # read from disk cache before serving. Records above this are skipped as a
     # denial-of-service guard (env HUB_MAX_ENVELOPE_BYTES). 0 disables the bound.
     max_envelope_bytes: int = 20 * 1024 * 1024
+    # A meta record with no version file is a publish that died between its
+    # two writes. Hydrate deletes such records once they are older than this
+    # (HUB_REAP_ABORTED_PUBLISH_AFTER_S), which is what makes them safely
+    # distinguishable from a publish still in flight; 0 disables reaping.
+    reap_aborted_publish_after_s: int = 3600
     # Per-artifact cap on retained "proposed" versions; the oldest proposals
     # above this are pruned (env HUB_MAX_PROPOSED_VERSIONS). Proposals are never
     # served as head, so pruning the oldest is always safe.
@@ -164,6 +169,7 @@ def load_settings() -> Settings:
         max_comments_per_day=_int_env("HUB_MAX_COMMENTS_PER_DAY", 100),
         extra_stacks=extra,
         max_envelope_bytes=_int_env("HUB_MAX_ENVELOPE_BYTES", 20 * 1024 * 1024),
+        reap_aborted_publish_after_s=_int_env("HUB_REAP_ABORTED_PUBLISH_AFTER_S", 3600),
         max_proposed_versions=_int_env("HUB_MAX_PROPOSED_VERSIONS", 50),
         trust_forwarded_headers=_bool_env("HUB_TRUST_FORWARDED_HEADERS", False),
         max_unlock_attempts_per_hour=_int_env(

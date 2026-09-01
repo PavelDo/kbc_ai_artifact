@@ -114,6 +114,11 @@ def api(tmp_path, settings, monkeypatch):
             )
             return file_id
 
+        def delete(self, file_id: int) -> None:
+            canonical_calls.append(
+                {"stack_url": self.stack_url, "token": self.token, "deleted": file_id}
+            )
+
     def fake_kbc_files_backend(stack_url: str, token: str):
         """Route hub-project calls to the shared in-memory backend, else fake."""
         if (
@@ -6281,3 +6286,89 @@ def test_a_deleted_newest_version_number_is_never_reused(api: Api) -> None:
     assert api.client.delete(f"/api/artifacts/{artifact_id}/versions/3", headers=AUTH_HEADERS).status_code == 200
     fresh.hydrate()
     assert fresh.next_version(artifact_id) == 4
+
+
+# --------------------------------------------------------------------------
+# Write ordering: settings last, and no orphan in the caller's project
+# --------------------------------------------------------------------------
+
+
+def _break_version_writes(monkeypatch, method: str) -> None:
+    def boom(_envelope):
+        raise BackendError("version write failed")
+    monkeypatch.setattr(main.app.state.store, method, boom)
+
+
+def test_a_failed_content_update_does_not_apply_the_settings(api: Api, monkeypatch) -> None:
+    """REL-075-004: the password landed while the caller was told the update failed."""
+    artifact_id = _publish_markdown(api, "# One")
+    _break_version_writes(monkeypatch, "add_version_next")
+
+    resp = _policy(api, artifact_id, password="hunter2", markdown="# Two")
+    assert resp.status_code == 502, resp.text
+
+    meta = main.app.state.store.get_meta(artifact_id)
+    assert meta.password is None, "a password was applied by an update that failed"
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+
+
+def test_a_failed_content_update_discards_its_canonical_copy(api: Api, monkeypatch) -> None:
+    """REL-075-008: the copy in the author's project outlived the version it was for."""
+    artifact_id = _publish_markdown(api, "# One")
+    _break_version_writes(monkeypatch, "add_version_next")
+    before = len([c for c in api.canonical_calls if "file_id" in c])
+
+    assert _policy(api, artifact_id, markdown="# Two").status_code == 502
+
+    uploads = [c["file_id"] for c in api.canonical_calls if "file_id" in c]
+    deletes = [c["deleted"] for c in api.canonical_calls if "deleted" in c]
+    assert len(uploads) == before + 1
+    assert uploads[-1] in deletes, "the orphaned canonical copy was not discarded"
+
+
+def test_a_failed_version_write_on_publish_leaves_nothing_behind(api: Api, monkeypatch) -> None:
+    """REL-075-008 on publish: the canonical copy and the meta record both go."""
+    monkeypatch.setattr(main, "new_artifact_id", lambda: "doomed-publish-id")
+    _break_version_writes(monkeypatch, "add_version")
+
+    resp = api.client.post("/api/artifacts", json={"markdown": "# Doomed"}, headers=AUTH_HEADERS)
+    assert resp.status_code == 502, resp.text
+
+    assert main.app.state.store.get_meta("doomed-publish-id") is None
+    assert api.backend.search_by_tag("artifact-id-doomed-publish-id") == []
+    uploads = [c["file_id"] for c in api.canonical_calls if "file_id" in c]
+    deletes = [c["deleted"] for c in api.canonical_calls if "deleted" in c]
+    assert uploads and uploads[-1] in deletes
+
+
+def _code_lines(text: str) -> list[str]:
+    """Lines inside fenced code blocks only -- prose may name an anti-pattern."""
+    inside, out = False, []
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            inside = not inside
+            continue
+        if inside:
+            out.append(line)
+    return out
+
+
+def test_no_documented_curl_example_puts_the_token_in_argv(api: Api) -> None:
+    """SEC-075-004: every example passed the token as a curl argument.
+
+    The shell expands -H "X-StorageApi-Token: $KBC_TOKEN" before curl runs,
+    so for that process's lifetime the token is visible to anyone who can
+    list processes on the host. The documented pattern is a shell function
+    that feeds curl a config from a process substitution instead.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    served = {
+        "/agent": api.client.get("/agent").text,
+        "/skill": api.client.get("/skill").text,
+        "README.md": (root / "README.md").read_text(encoding="utf-8"),
+    }
+    for name, text in served.items():
+        code = _code_lines(text)
+        offenders = [l for l in code if re.search(r"""-H\s+["']X-StorageApi-Token""", l)]
+        assert offenders == [], (name, offenders)
+        assert any(l.startswith("hub()") for l in code), f"{name} does not define hub()"
