@@ -203,8 +203,17 @@ def _identity(who: Any) -> dict:
 
 
 def _display_name(who: Any) -> str:
-    """Human label for a project identity, never empty."""
+    """Human label for an identity, never empty.
+
+    Handles both verified project identities and guest identities, which
+    carry a human name instead of a project (see comments.CommentThread).
+    """
     data = _identity(who)
+    if data.get("kind") == "guest":
+        guest_name = data.get("name")
+        if isinstance(guest_name, str) and guest_name.strip():
+            return f"{guest_name.strip()} (guest)"
+        return "a guest"
     name = data.get("project_name")
     if isinstance(name, str) and name.strip():
         return name.strip()

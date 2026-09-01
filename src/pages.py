@@ -2216,8 +2216,11 @@ _ANNOTATION_JS = """
   }
 
   /* Offset of the best occurrence of spec.exact, or -1. Ties between repeated
-     quotes are broken by how much of the recorded prefix/suffix matches. */
-  function locate(text, spec) {
+     quotes are broken by how much of the recorded prefix/suffix matches.
+
+     This is the preferred path: a quote captured from a real browser selection
+     is a slice of the very string searched here, so it always lands exactly. */
+  function locateExact(text, spec) {
     var exact = String(spec.exact || "");
     if (!exact) { return -1; }
     var best = -1;
@@ -2234,6 +2237,94 @@ _ANNOTATION_JS = """
       from = at + 1;
     }
     return best;
+  }
+
+  /* Every run of whitespace — spaces, tabs, newlines and the non-breaking
+     space \\u00a0 — counts as one ASCII space. The flattened document keeps the
+     source HTML's own line breaks and indentation inside a paragraph, so a
+     quote written by an agent through the API ("... 11% of signups") never
+     matches the raw text ("... 11%\\n      of signups") without this. */
+  var WS = /[\\s\\u00a0]/;
+
+  function collapseText(value) {
+    return String(value === undefined || value === null ? "" : value)
+      .replace(/[\\s\\u00a0]+/g, " ");
+  }
+
+  /* The whitespace-collapsed projection of `text`, plus the index map back to
+     raw offsets: normalized character i came from the raw span
+     [starts[i], ends[i]). A normalized match [i, j) is therefore the raw span
+     [starts[i], ends[j - 1]) — which is what rangeFor() needs, and which is
+     generally *not* i + needle.length characters long. */
+  function collapseFlat(text) {
+    var out = "";
+    var starts = [];
+    var ends = [];
+    var len = text.length;
+    var i = 0;
+    while (i < len) {
+      var ch = text.charAt(i);
+      if (WS.test(ch)) {
+        var run = i;
+        while (i < len && WS.test(text.charAt(i))) { i += 1; }
+        out += " ";
+        starts.push(run);
+        ends.push(i);
+        continue;
+      }
+      out += ch;
+      starts.push(i);
+      ends.push(i + 1);
+      i += 1;
+    }
+    return { text: out, starts: starts, ends: ends };
+  }
+
+  /* Fallback for quotes whose whitespace does not match the document's:
+     same prefix/suffix scoring, run over the normalized projection, with the
+     winning normalized span mapped back to raw offsets. Returns null when the
+     quote is empty once trimmed, when it is longer than we ever anchor, or
+     when nothing matches — never a guess. */
+  function locateNormalized(text, spec) {
+    var needle = collapseText(spec.exact).replace(/^ +/, "").replace(/ +$/, "");
+    if (!needle || needle.length > MAX_EXACT) { return null; }
+    var flat = collapseFlat(text);
+    var hay = flat.text;
+    var prefix = collapseText(spec.prefix);
+    var suffix = collapseText(spec.suffix);
+    var best = -1;
+    var bestScore = -1;
+    var from = 0;
+    for (;;) {
+      var at = hay.indexOf(needle, from);
+      if (at < 0) { break; }
+      var before = hay.slice(Math.max(0, at - CTX), at);
+      var after = hay.slice(at + needle.length, at + needle.length + CTX);
+      var score = overlap(before, prefix, true) + overlap(after, suffix, false);
+      if (score > bestScore) { bestScore = score; best = at; }
+      from = at + 1;
+    }
+    if (best < 0) { return null; }
+    var last = best + needle.length - 1;
+    if (best >= flat.starts.length || last < 0 || last >= flat.ends.length) {
+      return null;
+    }
+    return { start: flat.starts[best], end: flat.ends[last] };
+  }
+
+  /* The raw [start, end) span of the best occurrence of spec.exact, or null.
+     An exact match always wins, at the same offset it has always had; the
+     whitespace-tolerant pass only runs when the exact scan finds nothing. */
+  function locate(text, spec) {
+    var exact = String(spec.exact || "");
+    if (!exact) { return null; }
+    var at = locateExact(text, spec);
+    if (at >= 0) { return { start: at, end: at + exact.length }; }
+    try {
+      return locateNormalized(text, spec);
+    } catch (err) {
+      return null;
+    }
   }
 
   function rangeFor(flat, start, end) {
@@ -2293,9 +2384,9 @@ _ANNOTATION_JS = """
       var spec = list[i];
       if (!spec || !spec.tid || !spec.exact) { continue; }
       var flat = flatten();
-      var at = locate(flat.text, spec);
-      if (at < 0) { continue; }
-      var range = rangeFor(flat, at, at + String(spec.exact).length);
+      var span = locate(flat.text, spec);
+      if (!span || span.end <= span.start) { continue; }
+      var range = rangeFor(flat, span.start, span.end);
       if (!range) { continue; }
       if (wrap(range, String(spec.tid))) { done.push(String(spec.tid)); }
     }

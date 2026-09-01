@@ -627,3 +627,24 @@ def test_markdown_body_with_fences_does_not_break_the_diff_fence(meta):
     # The diff contains ``` runs, so the surrounding fence must be longer.
     assert "````diff" in body
     assert body.rstrip().endswith("````")
+
+
+class TestGuestAttribution:
+    """Guest commenters carry a name, not a project identity."""
+
+    def test_display_name_labels_a_guest(self) -> None:
+        from src.export import _display_name
+
+        guest = {"kind": "guest", "name": "Board Observer", "invitation_id": "abc"}
+        assert _display_name(guest) == "Board Observer (guest)"
+
+    def test_display_name_falls_back_for_a_nameless_guest(self) -> None:
+        from src.export import _display_name
+
+        assert _display_name({"kind": "guest"}) == "a guest"
+
+    def test_display_name_still_prefers_a_project_name(self) -> None:
+        from src.export import _display_name
+
+        who = {"project_id": 10539, "project_name": "Padak 2.0"}
+        assert _display_name(who) == "Padak 2.0"

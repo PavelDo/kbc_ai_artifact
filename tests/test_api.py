@@ -2445,6 +2445,84 @@ def test_review_page_sandboxes_the_artifact_and_keeps_the_token_in_the_tab(
     assert "ah-anchored" in text
 
 
+def test_review_page_ships_a_whitespace_tolerant_anchor_fallback(api: Api) -> None:
+    """The injected annotation script must carry both anchoring passes.
+
+    The script runs in an opaque-origin iframe, so the only place the test can
+    observe it is the review page's HTML. Exact matching stays the first-tried
+    path (a browser-captured quote is a slice of the very string searched, and
+    must keep landing at the offset it always had); the normalized pass is the
+    fallback that makes an agent-written quote — one whose whitespace differs
+    from the document's line breaks, indentation or non-breaking spaces — still
+    anchor instead of silently reporting "quote not found on this version".
+    """
+    artifact_id = _publish_markdown(api, "# Reviewed\n\nBody text")
+    text = api.client.get(f"/a/{artifact_id}/review").text
+
+    # The exact scan, unchanged and tried first.
+    assert "function locateExact" in text
+    assert "text.indexOf(exact, from)" in text
+    assert "if (at >= 0) { return { start: at, end: at + exact.length }; }" in text
+
+    # The whitespace-tolerant fallback and its index map back to raw offsets.
+    assert "function locateNormalized" in text
+    assert "function collapseFlat" in text
+    assert "function collapseText" in text
+    # Non-breaking space is folded together with the ASCII whitespace class,
+    # as a JS escape (never a literal U+00A0 smuggled through the Python
+    # source, which would be invisible in both files).
+    assert r"var WS = /[\s\u00a0]/;" in text
+    assert r".replace(/[\s\u00a0]+/g" in text
+    assert "\u00a0" not in text
+
+    # A normalized match spans a different number of raw characters than the
+    # quote does, so the range must come from the returned end offset rather
+    # than from `at + spec.exact.length`.
+    assert "rangeFor(flat, span.start, span.end)" in text
+    assert "at + String(spec.exact).length" not in text
+
+
+def test_comment_round_trips_a_quote_whose_whitespace_differs(api: Api) -> None:
+    """An agent quoting across a source line break is stored and served as-is.
+
+    The rendered document keeps the Markdown's own newline inside the
+    paragraph, so the quote an agent naturally writes (one space) is not a
+    substring of it. Anchoring that quote is the browser's job; the server's
+    job — asserted here — is to accept it and hand it back byte-for-byte, so
+    the client-side normalized pass has the original selector to work with.
+    """
+    artifact_id = _publish_markdown(
+        api,
+        "# Growth\n\nConversion plateaued at roughly 11%\nof signups in Q3.\n",
+    )
+
+    document = api.client.get(f"/a/{artifact_id}").text
+    # Precondition: the rendered text really does break the phrase in two.
+    assert "roughly 11%\nof signups" in document
+    assert "roughly 11% of signups" not in document
+
+    created = _comment(
+        api,
+        artifact_id,
+        exact="plateaued at roughly 11% of signups",
+        prefix="Conversion ",
+        suffix=" in Q3.",
+        body="Is 11% still the number?",
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["selector"]["exact"] == (
+        "plateaued at roughly 11% of signups"
+    )
+
+    threads = api.client.get(f"/a/{artifact_id}/comments").json()["threads"]
+    assert len(threads) == 1
+    assert threads[0]["selector"] == {
+        "exact": "plateaued at roughly 11% of signups",
+        "prefix": "Conversion ",
+        "suffix": " in Q3.",
+    }
+
+
 def test_review_page_of_unknown_artifact_is_404(api: Api) -> None:
     assert api.client.get("/a/nope/review").status_code == 404
 
