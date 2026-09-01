@@ -10,7 +10,9 @@ require a network clone.
 """
 
 import base64
+import os
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
@@ -20,11 +22,17 @@ from src.builder import (
     BuildError,
     DEFAULT_GIT_USERNAME,
     DEFAULT_TITLE,
+    HLJS_VERSION,
+    MERMAID_VERSION,
     REDACTED,
     _authed_clone_url,
+    _check_git_host,
+    _clone,
     _default_entry,
     _inline_images,
+    _ip_is_blocked,
     _last_line,
+    _repo_size_bytes,
     _resolve_entry,
     _scrub,
     _validate_git_url,
@@ -296,7 +304,7 @@ class TestScrubbing:
         monkeypatch.setattr(
             builder_module,
             "_run_git",
-            lambda args, timeout_s: _FailedGit(
+            lambda args, timeout_s, **kwargs: _FailedGit(
                 "fatal: could not read Username for 'https://github.com': "
                 "terminal prompts disabled\n"
             ),
@@ -314,7 +322,7 @@ class TestScrubbing:
         monkeypatch.setattr(
             builder_module,
             "_run_git",
-            lambda args, timeout_s: _FailedGit(
+            lambda args, timeout_s, **kwargs: _FailedGit(
                 f"fatal: unable to access '{authed}/': "
                 "The requested URL returned error: 403\n"
             ),
@@ -483,3 +491,285 @@ class TestInlineImages:
             max_total_bytes=settings.max_inline_total_bytes,
         )
         assert result == html
+
+
+# --------------------------------------------------------------------------
+# Clone credential handling: token must stay OUT of argv, and git must not
+# inherit the whole process environment (sec-secrets / sec-crypto-data).
+# --------------------------------------------------------------------------
+
+
+class _CapturingRun:
+    """Drop-in for ``subprocess.run`` recording argv and the env kwarg."""
+
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = ""):
+        self.calls: list[dict] = []
+        self._rc = returncode
+        self._out = stdout
+        self._err = stderr
+
+    def __call__(self, args, **kwargs):
+        self.calls.append({"args": list(args), "kwargs": kwargs})
+        return types.SimpleNamespace(
+            returncode=self._rc, stdout=self._out, stderr=self._err
+        )
+
+
+class TestCloneCredentialHandling:
+    def test_token_never_appears_in_argv(self, monkeypatch, tmp_path):
+        cap = _CapturingRun()
+        monkeypatch.setattr(builder_module.subprocess, "run", cap)
+        token = "ghp_SuperSecretToken123"
+        _clone(
+            "https://github.com/o/private.git",
+            "main",
+            tmp_path / "repo",
+            5,
+            token=token,
+        )
+        assert cap.calls, "git clone was not invoked"
+        argv = cap.calls[0]["args"]
+        joined = " ".join(argv)
+        assert token not in joined
+        assert "x-access-token:" not in joined
+        # The clean, unauthenticated URL is what lands in argv.
+        assert "https://github.com/o/private.git" in argv
+
+    def test_username_and_token_not_in_argv(self, monkeypatch, tmp_path):
+        cap = _CapturingRun()
+        monkeypatch.setattr(builder_module.subprocess, "run", cap)
+        _clone(
+            "https://gitlab.com/g/p.git",
+            None,
+            tmp_path / "repo",
+            5,
+            username="deploy-bot",
+            token="s3cr3t-token",
+        )
+        joined = " ".join(cap.calls[0]["args"])
+        assert "deploy-bot" not in joined
+        assert "s3cr3t-token" not in joined
+
+    def test_git_env_is_curated_no_unrelated_secret(self, monkeypatch):
+        cap = _CapturingRun()
+        monkeypatch.setattr(builder_module.subprocess, "run", cap)
+        monkeypatch.setenv("HUB_SENTINEL_SECRET", "leak-me-not")
+        # NB: builder_module._run_git, not the local test helper of the same name.
+        builder_module._run_git(["git", "--version"], 5)
+        env = cap.calls[0]["kwargs"]["env"]
+        assert "HUB_SENTINEL_SECRET" not in env
+        assert "leak-me-not" not in env.values()
+        assert env.get("GIT_TERMINAL_PROMPT") == "0"
+        assert "PATH" in env  # git still resolvable
+
+    def test_clone_env_excludes_app_secret_but_carries_askpass(
+        self, monkeypatch, tmp_path
+    ):
+        cap = _CapturingRun()
+        monkeypatch.setattr(builder_module.subprocess, "run", cap)
+        monkeypatch.setenv("HUB_SENTINEL_SECRET", "leak-me-not")
+        _clone(
+            "https://github.com/o/p.git",
+            None,
+            tmp_path / "repo",
+            5,
+            token="ghp_x",
+        )
+        env = cap.calls[0]["kwargs"]["env"]
+        assert "leak-me-not" not in env.values()
+        assert "HUB_SENTINEL_SECRET" not in env
+        # The credential travels via a GIT_ASKPASS helper, never argv.
+        assert env.get("GIT_ASKPASS")
+
+    def test_partial_clone_blob_filter_is_added(self, monkeypatch, tmp_path):
+        cap = _CapturingRun()
+        monkeypatch.setattr(builder_module.subprocess, "run", cap)
+        _clone(
+            "https://github.com/o/p.git",
+            None,
+            tmp_path / "repo",
+            5,
+            blob_limit_bytes=1024,
+        )
+        argv = cap.calls[0]["args"]
+        assert "--filter=blob:limit=1024" in argv
+
+
+# --------------------------------------------------------------------------
+# SSRF guard on the git host (sec-ssrf)
+# --------------------------------------------------------------------------
+
+
+class TestGitHostSsrfGuard:
+    def test_metadata_ip_rejected(self):
+        with pytest.raises(BuildError):
+            _check_git_host(
+                "https://evil.example.com/r.git",
+                allow_private=False,
+                resolver=lambda h: ["169.254.169.254"],
+            )
+
+    def test_private_10_range_rejected(self):
+        with pytest.raises(BuildError):
+            _check_git_host(
+                "https://evil.example.com/r.git",
+                allow_private=False,
+                resolver=lambda h: ["10.1.2.3"],
+            )
+
+    def test_public_host_allowed(self):
+        # Must not raise.
+        _check_git_host(
+            "https://github.com/o/r.git",
+            allow_private=False,
+            resolver=lambda h: ["140.82.112.3"],
+        )
+
+    def test_literal_loopback_ip_short_circuits_dns(self):
+        called = {"n": 0}
+
+        def resolver(h):
+            called["n"] += 1
+            return ["9.9.9.9"]
+
+        with pytest.raises(BuildError):
+            _check_git_host(
+                "https://127.0.0.1/r.git", allow_private=False, resolver=resolver
+            )
+        assert called["n"] == 0  # a literal blocked IP is caught without DNS
+
+    def test_metadata_hostname_rejected(self):
+        with pytest.raises(BuildError):
+            _check_git_host(
+                "https://metadata.google.internal/r.git",
+                allow_private=False,
+                resolver=lambda h: ["8.8.8.8"],
+            )
+
+    def test_dot_internal_suffix_rejected(self):
+        with pytest.raises(BuildError):
+            _check_git_host(
+                "https://build.svc.internal/r.git",
+                allow_private=False,
+                resolver=lambda h: ["8.8.8.8"],
+            )
+
+    def test_allow_private_bypasses_guard(self):
+        # Even a loopback literal is allowed when explicitly opted in.
+        _check_git_host(
+            "https://127.0.0.1/r.git",
+            allow_private=True,
+            resolver=lambda h: ["10.0.0.1"],
+        )
+
+    def test_ipv4_mapped_ipv6_metadata_blocked(self):
+        assert _ip_is_blocked("::ffff:169.254.169.254")
+
+    def test_public_ip_not_blocked(self):
+        assert not _ip_is_blocked("140.82.112.3")
+
+    def test_build_from_git_blocks_private_resolution(self, monkeypatch, settings):
+        monkeypatch.setattr(
+            builder_module, "_resolve_host_ips", lambda h: ["10.0.0.9"]
+        )
+        with pytest.raises(BuildError):
+            build_from_git(
+                "https://sneaky.example.com/r.git", None, None, None, settings
+            )
+
+
+# --------------------------------------------------------------------------
+# Clone size bound now counts the .git directory (sec-abuse-limits / file-deser)
+# --------------------------------------------------------------------------
+
+
+class TestRepoSizeCountsGit:
+    def test_git_directory_is_counted(self, tmp_path):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "pack").write_bytes(b"x" * 5000)
+        (repo / "index.html").write_text("<html></html>", encoding="utf-8")
+        size = _repo_size_bytes(repo)
+        # A huge history in .git is now included in the hard-stop measurement.
+        assert size >= 5000 + len("<html></html>")
+
+    def test_symlink_not_followed_for_size(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        big = tmp_path / "big.bin"
+        big.write_bytes(b"y" * 10000)
+        (repo / "link.bin").symlink_to(big)
+        # Symlink target bytes are not counted (containment enforced elsewhere).
+        assert _repo_size_bytes(repo) == 0
+
+
+# --------------------------------------------------------------------------
+# Symlink escape in entry selection (sec-injection / sec-file-deser)
+# --------------------------------------------------------------------------
+
+
+class TestEntrySymlinkContainment:
+    def test_default_readme_symlink_escape_rejected(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        secret = tmp_path / "passwd_like"
+        secret.write_text("root:x:0:0:\n", encoding="utf-8")
+        (repo / "README.md").symlink_to(secret)
+        with pytest.raises(BuildError):
+            _resolve_entry(repo, None)
+
+    def test_explicit_index_symlink_escape_rejected(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        secret = tmp_path / "passwd_like"
+        secret.write_text("root:x:0:0:\n", encoding="utf-8")
+        (repo / "index.html").symlink_to(secret)
+        with pytest.raises(BuildError):
+            _resolve_entry(repo, "index.html")
+
+    def test_legit_entry_still_resolves(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "README.md").write_text("# hello\n", encoding="utf-8")
+        assert _resolve_entry(repo, None).name == "README.md"
+
+    def test_image_symlink_escape_left_as_link(self, tmp_path, settings):
+        repo = tmp_path / "repo"
+        (repo / "images").mkdir(parents=True)
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(_png_bytes())
+        (repo / "images" / "evil.png").symlink_to(outside)
+        html = '<img src="images/evil.png">'
+        result = _inline_images(
+            html,
+            base_dir=repo,
+            repo_root=repo,
+            max_image_bytes=settings.max_inline_image_bytes,
+            max_total_bytes=settings.max_inline_total_bytes,
+        )
+        assert result == html  # escaping symlink is never inlined
+
+
+# --------------------------------------------------------------------------
+# CDN pinning + intentional raw-HTML rendering (sec-web)
+# --------------------------------------------------------------------------
+
+
+class TestCdnPinningAndRawHtml:
+    def test_cdn_versions_are_exact_patch_pins(self):
+        assert HLJS_VERSION.count(".") == 2
+        assert MERMAID_VERSION.count(".") == 2
+
+    def test_rendered_page_uses_pinned_versions_not_floating_major(self):
+        page = build_from_markdown("# hi\n").html
+        assert f"mermaid@{MERMAID_VERSION}" in page
+        assert f"cdn-release@{HLJS_VERSION}" in page
+        assert "mermaid@11/" not in page
+        assert "cdn-release@11/" not in page
+
+    def test_raw_html_in_markdown_is_preserved_by_design(self):
+        # html:True is intentional; the sandbox iframe is the boundary, so raw
+        # HTML must pass through here rather than being stripped/escaped.
+        md = 'Before\n\n<div class="marker">raw</div>\n\nAfter\n'
+        page = build_from_markdown(md).html
+        assert '<div class="marker">raw</div>' in page

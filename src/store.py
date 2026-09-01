@@ -432,11 +432,32 @@ class Envelope:
         if not isinstance(artifact_id, str) or not artifact_id:
             raise ValueError("envelope has no usable 'id'")
 
+        # ``title`` and ``html`` must be strings. A truthy non-string (e.g.
+        # ``html={"x": 1}`` from a schema-drifting or tampered record) would
+        # otherwise survive into the typed Envelope and blow up later at
+        # ``html.encode()``; reject it here so callers quarantine the record as
+        # corrupt (same ``ValueError`` path as a bad ``id``).
+        title = data.get("title")
+        if title is None:
+            title = ""
+        elif not isinstance(title, str):
+            raise ValueError("envelope 'title' is not a string")
+        html = data.get("html")
+        if html is None:
+            html = ""
+        elif not isinstance(html, str):
+            raise ValueError("envelope 'html' is not a string")
+
         source = data.get("source")
         author = data.get("author")
         if not isinstance(author, dict):
             legacy_owner = data.get("owner")
             author = legacy_owner if isinstance(legacy_owner, dict) else {}
+        source_type = data.get("source_type")
+        # Normalize an unknown/non-string source_type to the neutral "html"
+        # (matches the status fallback below rather than raising).
+        if source_type not in _SOURCE_TYPES:
+            source_type = "html"
         status = data.get("status")
         note = data.get("note")
         canonical_file_id = data.get("canonical_file_id")
@@ -452,9 +473,9 @@ class Envelope:
                 and version > 0
                 else 1
             ),
-            title=data.get("title") or "",
-            html=data.get("html") or "",
-            source_type=data.get("source_type") or "html",
+            title=title,
+            html=html,
+            source_type=source_type,
             source=source if isinstance(source, dict) else {},
             author=author,
             status=status if status in _STATUSES else STATUS_LIVE,
@@ -537,10 +558,14 @@ class _VerEntry:
 
     ``status`` is not derivable from tags, so it stays ``None`` until the
     envelope has been read at least once (cheap thanks to the LRU).
+
+    ``size_bytes`` is the Storage-reported size (0 when unknown); it lets the
+    store skip an oversized record *before* downloading it.
     """
 
     file_id: int
     status: str | None = None
+    size_bytes: int = 0
 
 
 @dataclass
@@ -548,16 +573,34 @@ class _ArtEntry:
     """Every host-project file belonging to one artifact."""
 
     meta_file_id: int | None = None
+    meta_size_bytes: int = 0
     # A schema-1 ``artifact-{id}.json`` envelope, if the artifact predates v2.
     legacy_file_id: int | None = None
+    legacy_size_bytes: int = 0
     versions: dict[int, _VerEntry] = field(default_factory=dict)
+    # Version numbers currently reserved by an in-flight ``add_version_next``
+    # allocation. Kept out of ``versions`` (and out of reads) so a concurrent
+    # allocation picks a distinct number without a half-written slot ever being
+    # served. See :meth:`ArtifactStore.add_version_next`.
+    reserving: set[int] = field(default_factory=set)
 
     def version_numbers(self) -> list[int]:
-        """All known version numbers, ascending; a legacy file counts as v1."""
+        """All known version numbers, ascending; a legacy file counts as v1.
+
+        Reserved-but-not-yet-written numbers are deliberately excluded: reads
+        must never see an allocation that has not committed a file yet.
+        """
         numbers = set(self.versions)
         if self.legacy_file_id is not None:
             numbers.add(1)
         return sorted(numbers)
+
+    def next_free_number(self) -> int:
+        """Lowest unused version number, counting reservations and legacy v1."""
+        numbers = set(self.versions) | self.reserving
+        if self.legacy_file_id is not None:
+            numbers.add(1)
+        return (max(numbers) + 1) if numbers else 1
 
 
 class ArtifactStore:
@@ -574,11 +617,18 @@ class ArtifactStore:
         cache_dir: Path,
         cache_max_entries: int,
         max_versions: int,
+        max_envelope_bytes: int = 20 * 1024 * 1024,
+        max_proposed_versions: int = 50,
     ) -> None:
         self._backend = backend
         self._cache_dir = Path(cache_dir)
         self._cache_max_entries = max(0, int(cache_max_entries))
         self._max_versions = max(1, int(max_versions))
+        # <= 0 means "no bound". Guards against a single oversized persisted
+        # record exhausting worker memory on download/decode.
+        self._max_envelope_bytes = int(max_envelope_bytes)
+        # <= 0 means "no cap".
+        self._max_proposed_versions = max(0, int(max_proposed_versions))
         self._index: dict[str, _ArtEntry] = {}
         self._memory: OrderedDict[tuple[str, int], Envelope] = OrderedDict()
         self._meta_memory: OrderedDict[tuple[str, int], ArtifactMeta] = OrderedDict()
@@ -646,6 +696,36 @@ class ArtifactStore:
                 return fresh
             return current
 
+    def refresh(self, artifact_id: str) -> bool:
+        """Re-read one artifact's files from Storage, replacing its index entry.
+
+        The startup index is built once and never expires, so after another
+        replica writes a new version or rewrites the meta file, this replica's
+        cached entry is stale. ``refresh`` re-runs the artifact's tag search and
+        swaps in a fresh entry (dropping this artifact's in-memory LRU so the
+        next read reloads), letting a caller pick up cross-replica writes on
+        demand. Returns ``True`` when the artifact still exists in Storage.
+
+        Residual limitation: this is an explicit, per-artifact catch-up, not
+        continuous cross-replica consistency — full consistency needs shared
+        state (out of scope). Callers opt in via ``fresh=True`` on the readers.
+        """
+        files = self._backend.search_by_tag(tag_for_id(artifact_id))
+        if not files:
+            with self._lock:
+                self._index.pop(artifact_id, None)
+                self._forget_memory_locked(artifact_id)
+                self._forget_meta_locked(artifact_id)
+            return False
+        rebuilt = _ArtEntry()
+        for info in files:
+            _absorb_file(rebuilt, info)
+        with self._lock:
+            self._index[artifact_id] = rebuilt
+            self._forget_memory_locked(artifact_id)
+            self._forget_meta_locked(artifact_id)
+        return True
+
     # ----------------------------------------------------------------- meta
 
     def get_meta(self, artifact_id: str) -> ArtifactMeta | None:
@@ -654,11 +734,19 @@ class ArtifactStore:
         if entry is None:
             return None
         if entry.meta_file_id is not None:
-            meta = self._load_meta(artifact_id, entry.meta_file_id)
+            meta = self._load_meta(
+                artifact_id,
+                entry.meta_file_id,
+                size_hint=entry.meta_size_bytes or None,
+            )
             if meta is not None:
                 return meta
         if entry.legacy_file_id is not None:
-            migrated = self._load_legacy(artifact_id, entry.legacy_file_id)
+            migrated = self._load_legacy(
+                artifact_id,
+                entry.legacy_file_id,
+                size_hint=entry.legacy_size_bytes or None,
+            )
             if migrated is not None:
                 return migrated[1]
         return None
@@ -698,7 +786,13 @@ class ArtifactStore:
         self.add_version(first)
 
     def add_version(self, env: Envelope) -> None:
-        """Upload one version file, index it and apply the retention policy."""
+        """Upload one version file, index it and apply the retention policy.
+
+        The caller supplies ``env.version``; concurrent submissions that both
+        allocated the same number via :meth:`next_version` will collide (each
+        overwrites the other's file). Use :meth:`add_version_next` to allocate
+        and write atomically under the store lock instead.
+        """
         artifact_id = env.id
         version = env.version
         raw = env.to_json()
@@ -712,7 +806,9 @@ class ArtifactStore:
         with self._lock:
             entry = self._index.setdefault(artifact_id, _ArtEntry())
             previous = entry.versions.get(version)
-            entry.versions[version] = _VerEntry(file_id=file_id, status=env.status)
+            entry.versions[version] = _VerEntry(
+                file_id=file_id, status=env.status, size_bytes=len(raw)
+            )
             if previous is not None:
                 self._memory.pop((artifact_id, previous.file_id), None)
             self._remember_locked(artifact_id, file_id, env)
@@ -720,16 +816,84 @@ class ArtifactStore:
         if previous is not None and previous.file_id != file_id:
             self._delete_file(artifact_id, previous.file_id)
         self._prune_versions(artifact_id)
+        self._prune_proposals(artifact_id)
 
-    def get_version(self, artifact_id: str, version: int) -> Envelope | None:
-        """One version by number, regardless of its status; None when missing."""
+    def add_version_next(self, env: Envelope) -> int:
+        """Atomically allocate the next version number and write the version.
+
+        This closes the read-then-write race in the ``next_version()`` +
+        :meth:`add_version` pattern: two concurrent submissions in the *same
+        process* are each assigned a distinct number, because the chosen number
+        is reserved under the store lock before the (slow) upload runs, so the
+        second allocation sees it taken. ``env.version`` is ignored and
+        replaced; the assigned number is returned.
+
+        Residual limitation: this coordinates a single process only. Two
+        replicas can still pick the same number (no shared allocator); that
+        needs shared state and is out of scope here.
+        """
+        artifact_id = env.id
+        with self._lock:
+            entry = self._index.setdefault(artifact_id, _ArtEntry())
+            version = entry.next_free_number()
+            entry.reserving.add(version)
+
+        assigned = replace(env, version=version)
+        raw = assigned.to_json()
+        tags = [TAG_ALL, tag_for_id(artifact_id), tag_for_version(version)]
+        try:
+            file_id = self._backend.upload(
+                f"artifact-{artifact_id}-v{version}.json", raw, tags
+            )
+        except Exception:
+            with self._lock:
+                cur = self._index.get(artifact_id)
+                if cur is not None:
+                    cur.reserving.discard(version)
+            raise
+
+        with self._lock:
+            entry = self._index.setdefault(artifact_id, _ArtEntry())
+            entry.reserving.discard(version)
+            previous = entry.versions.get(version)
+            entry.versions[version] = _VerEntry(
+                file_id=file_id, status=assigned.status, size_bytes=len(raw)
+            )
+            if previous is not None:
+                self._memory.pop((artifact_id, previous.file_id), None)
+            self._remember_locked(artifact_id, file_id, assigned)
+        self._write_disk_cache(artifact_id, file_id, raw)
+        if previous is not None and previous.file_id != file_id:
+            self._delete_file(artifact_id, previous.file_id)
+        self._prune_versions(artifact_id)
+        self._prune_proposals(artifact_id)
+        return version
+
+    def get_version(
+        self, artifact_id: str, version: int, fresh: bool = False
+    ) -> Envelope | None:
+        """One version by number, regardless of its status; None when missing.
+
+        ``fresh=True`` re-reads the artifact's Storage tags first (see
+        :meth:`refresh`) so a version another replica added is picked up; the
+        default stays fast (index only, with the usual miss fallback).
+        """
+        if fresh:
+            self.refresh(artifact_id)
         entry = self._resolve(artifact_id)
         if entry is None:
             return None
         return self._load_version(artifact_id, entry, version)
 
-    def get_head(self, artifact_id: str) -> Envelope | None:
-        """The version ``/a/{id}`` serves: the pinned one, else the newest live."""
+    def get_head(self, artifact_id: str, fresh: bool = False) -> Envelope | None:
+        """The version ``/a/{id}`` serves: the pinned one, else the newest live.
+
+        ``fresh=True`` re-reads the artifact's Storage tags first (see
+        :meth:`refresh`) so a newer head written by another replica is served;
+        the default stays fast (index only, with the usual miss fallback).
+        """
+        if fresh:
+            self.refresh(artifact_id)
         entry = self._resolve(artifact_id)
         if entry is None:
             return None
@@ -756,8 +920,48 @@ class ArtifactStore:
                 return env
         return None
 
-    def list_versions(self, artifact_id: str) -> list[dict]:
-        """Public metadata of every version (live and proposed), newest first."""
+    def verify_single_head(self, artifact_id: str) -> bool:
+        """Assert the single-live-head invariant is unambiguous and honoured.
+
+        Best-effort pruning of superseded files can fail (Storage errors are
+        logged, not raised), so two "live head" candidates could linger. This
+        confirms :meth:`get_head` is still deterministic: the served head is the
+        valid pinned live version, else the highest-numbered live version. Used
+        by tests (and available to callers) to check the invariant after writes.
+
+        Returns ``False`` when there is no live version at all (nothing to
+        serve) or when the served head is not the deterministic choice.
+        """
+        entry = self._resolve(artifact_id)
+        if entry is None:
+            return False
+        head = self.get_head(artifact_id)
+        if head is None:
+            return False
+        live = [
+            number
+            for number in entry.version_numbers()
+            if self._is_live(artifact_id, entry, number)
+        ]
+        if not live:
+            return False
+        meta = self.get_meta(artifact_id)
+        if (
+            meta is not None
+            and meta.head_mode == HEAD_PINNED
+            and meta.head_version in live
+        ):
+            return head.version == meta.head_version
+        return head.version == max(live)
+
+    def list_versions(self, artifact_id: str, fresh: bool = False) -> list[dict]:
+        """Public metadata of every version (live and proposed), newest first.
+
+        ``fresh=True`` re-reads the artifact's Storage tags first (see
+        :meth:`refresh`) so versions added by another replica appear.
+        """
+        if fresh:
+            self.refresh(artifact_id)
         entry = self._resolve(artifact_id)
         if entry is None:
             return []
@@ -785,12 +989,18 @@ class ArtifactStore:
         return metas
 
     def next_version(self, artifact_id: str) -> int:
-        """The number the next submitted version gets (proposals included)."""
+        """The number the next submitted version gets (proposals included).
+
+        Read-only display helper. It accounts for in-flight reservations so it
+        never shows a number an :meth:`add_version_next` is about to claim, but
+        allocating with it and a separate :meth:`add_version` is still racy —
+        prefer :meth:`add_version_next` for the actual write.
+        """
         entry = self._resolve(artifact_id)
         if entry is None:
             return 1
-        numbers = entry.version_numbers()
-        return (max(numbers) + 1) if numbers else 1
+        with self._lock:
+            return entry.next_free_number()
 
     def set_status(self, artifact_id: str, version: int, status: str) -> bool:
         """Rewrite one version file with a new status. False when not found."""
@@ -813,7 +1023,14 @@ class ArtifactStore:
         return True
 
     def delete_version(self, artifact_id: str, version: int) -> bool:
-        """Delete one version. Refuses to remove the last live version."""
+        """Delete one version. Refuses to remove the last live version.
+
+        Deletes the authoritative Storage file(s) *first* and only drops the
+        index/cache entry when the backend confirms deletion. If the backend
+        delete fails the file still exists, so the index keeps pointing at it
+        and this returns ``False`` — never a success claim over a file that is
+        still there.
+        """
         entry = self._resolve(artifact_id)
         if entry is None:
             return False
@@ -839,33 +1056,54 @@ class ArtifactStore:
                 return False
 
         with self._lock:
-            ver_entry = entry.versions.pop(version, None)
-            legacy_file_id = None
-            if version == 1 and entry.legacy_file_id is not None:
-                legacy_file_id = entry.legacy_file_id
-                entry.legacy_file_id = None
-            if ver_entry is not None:
-                self._memory.pop((artifact_id, ver_entry.file_id), None)
-            if legacy_file_id is not None:
-                self._memory.pop((artifact_id, legacy_file_id), None)
+            ver_entry = entry.versions.get(version)
+            legacy_file_id = (
+                entry.legacy_file_id
+                if version == 1 and entry.legacy_file_id is not None
+                else None
+            )
 
+        # Delete the backend files first; only mutate the index on confirmed
+        # success so a failed delete never leaves us claiming the version is gone.
+        all_ok = True
         if ver_entry is not None:
-            self._delete_file(artifact_id, ver_entry.file_id)
+            all_ok = self._delete_file_confirmed(artifact_id, ver_entry.file_id) and all_ok
         if legacy_file_id is not None:
-            self._delete_file(artifact_id, legacy_file_id)
+            all_ok = (
+                self._delete_file_confirmed(artifact_id, legacy_file_id) and all_ok
+            )
+        if not all_ok:
+            return False
+
+        with self._lock:
+            popped = entry.versions.pop(version, None)
+            if popped is not None:
+                self._memory.pop((artifact_id, popped.file_id), None)
+            if legacy_file_id is not None and entry.legacy_file_id == legacy_file_id:
+                entry.legacy_file_id = None
+                self._memory.pop((artifact_id, legacy_file_id), None)
         return True
 
     # --------------------------------------------------------------- delete
 
     def delete(self, artifact_id: str) -> bool:
-        """Delete every Storage file of an artifact and purge the caches."""
+        """Delete every Storage file of an artifact and purge the caches.
+
+        Attempts every file and returns ``True`` only when *all* authoritative
+        files were confirmed deleted (and at least one existed). If any backend
+        delete fails, the residual files stay in Storage, so the index/cache are
+        left intact and this returns ``False`` — the caller must not report a
+        full deletion. An unknown artifact (no files) also returns ``False``.
+        """
         files: list[FileInfo] = self._backend.search_by_tag(tag_for_id(artifact_id))
-        deleted = False
+        if not files:
+            return False
+        all_ok = True
         for info in files:
             try:
                 self._backend.delete(info.id)
-                deleted = True
             except BackendError as exc:
+                all_ok = False
                 logger.warning(
                     "Cannot delete file %s of artifact %s: %s",
                     info.id,
@@ -873,12 +1111,20 @@ class ArtifactStore:
                     exc,
                 )
 
+        if not all_ok:
+            logger.warning(
+                "Partial delete of artifact %s: some Storage files remain; "
+                "keeping the index entry to avoid a false 'deleted' claim",
+                artifact_id,
+            )
+            return False
+
         with self._lock:
             self._index.pop(artifact_id, None)
             self._forget_memory_locked(artifact_id)
             self._forget_meta_locked(artifact_id)
         self._purge_disk_cache(artifact_id)
-        return deleted
+        return True
 
     # ----------------------------------------------------------------- list
 
@@ -998,6 +1244,51 @@ class ArtifactStore:
             logger.info("Pruned version %s of artifact %s", number, artifact_id)
             excess -= 1
 
+    def _prune_proposals(self, artifact_id: str) -> None:
+        """Drop the oldest proposed versions above ``max_proposed_versions``.
+
+        Retention (:meth:`_prune_versions`) only counts *live* versions, so
+        proposals could otherwise accumulate without bound as many projects
+        submit. Proposals are never served as head, so pruning the oldest is
+        safe; a proposal pinned as ``head_version`` (fallback target) is spared.
+        Best effort: Storage failures are logged, not raised.
+        """
+        if self._max_proposed_versions <= 0:
+            return
+        entry = self._resolve(artifact_id)
+        if entry is None:
+            return
+
+        meta = self.get_meta(artifact_id)
+        protected: set[int] = set()
+        if meta is not None and meta.head_version is not None:
+            protected.add(meta.head_version)
+
+        proposed: list[int] = []
+        for number in entry.version_numbers():
+            env = self._load_version(artifact_id, entry, number)
+            if env is not None and env.status == STATUS_PROPOSED:
+                proposed.append(number)
+
+        prunable = [number for number in proposed if number not in protected]
+        # version_numbers() is ascending, so ``prunable`` is oldest-first.
+        excess = len(proposed) - self._max_proposed_versions
+        for number in prunable:
+            if excess <= 0:
+                break
+            with self._lock:
+                ver_entry = entry.versions.pop(number, None)
+                if ver_entry is not None:
+                    self._memory.pop((artifact_id, ver_entry.file_id), None)
+            if ver_entry is not None:
+                self._delete_file(artifact_id, ver_entry.file_id)
+            logger.info(
+                "Pruned proposed version %s of artifact %s over the proposal cap",
+                number,
+                artifact_id,
+            )
+            excess -= 1
+
     def _retire_legacy_if_covered(self, artifact_id: str, version: int) -> None:
         """Delete the schema-1 envelope once a real v1 file supersedes it."""
         if version != 1:
@@ -1037,6 +1328,24 @@ class ArtifactStore:
             )
         self._delete_disk_cache(artifact_id, file_id)
 
+    def _delete_file_confirmed(self, artifact_id: str, file_id: int) -> bool:
+        """Delete one Storage file, returning whether the backend confirmed it.
+
+        Unlike :meth:`_delete_file` this reports failure so callers that must
+        not claim success over a still-present file (``delete_version``) can
+        react. The disk cache copy is dropped either way — it is pure cache.
+        """
+        ok = True
+        try:
+            self._backend.delete(file_id)
+        except BackendError as exc:
+            ok = False
+            logger.warning(
+                "Cannot delete file %s of artifact %s: %s", file_id, artifact_id, exc
+            )
+        self._delete_disk_cache(artifact_id, file_id)
+        return ok
+
     # ----------------------------------------------------------------- load
 
     def _is_live(self, artifact_id: str, entry: _ArtEntry, version: int) -> bool:
@@ -1049,24 +1358,43 @@ class ArtifactStore:
         """Load one version, transparently migrating a legacy schema-1 file."""
         ver_entry = entry.versions.get(version)
         if ver_entry is not None:
-            env = self._load_envelope(artifact_id, ver_entry.file_id)
-            if env is not None:
-                ver_entry.status = env.status
-                env.version = version
+            env = self._load_envelope(
+                artifact_id, ver_entry.file_id, size_hint=ver_entry.size_bytes or None
+            )
+            if env is None:
+                return None
+            # The version tag is authoritative. A file tagged v{n} whose payload
+            # claims a different version number is a mislabelled/cross-wired
+            # record; skip it rather than serve content under the wrong number.
+            if env.version != version:
+                logger.warning(
+                    "Version file %s of artifact %s is tagged v%s but its "
+                    "payload declares v%s; skipping as corrupt",
+                    ver_entry.file_id,
+                    artifact_id,
+                    version,
+                    env.version,
+                )
+                return None
+            ver_entry.status = env.status
             return env
         if version == 1 and entry.legacy_file_id is not None:
-            migrated = self._load_legacy(artifact_id, entry.legacy_file_id)
+            migrated = self._load_legacy(
+                artifact_id,
+                entry.legacy_file_id,
+                size_hint=entry.legacy_size_bytes or None,
+            )
             return migrated[0] if migrated is not None else None
         return None
 
     def _load_legacy(
-        self, artifact_id: str, file_id: int
+        self, artifact_id: str, file_id: int, size_hint: int | None = None
     ) -> tuple[Envelope, ArtifactMeta] | None:
-        raw = self._read_raw(artifact_id, file_id)
+        raw = self._read_raw(artifact_id, file_id, size_hint=size_hint)
         if raw is None:
             return None
         try:
-            return migrate_legacy(raw)
+            migrated = migrate_legacy(raw)
         except ValueError as exc:
             logger.error(
                 "Corrupt legacy envelope for artifact %s (file %s): %s",
@@ -1075,8 +1403,22 @@ class ArtifactStore:
                 exc,
             )
             return None
+        # Cross-artifact guard: the legacy payload's own id must match the
+        # artifact it was filed under.
+        if migrated[0].id != artifact_id:
+            logger.warning(
+                "Legacy envelope in file %s is tagged for artifact %s but "
+                "declares id %r; skipping as cross-wired/corrupt",
+                file_id,
+                artifact_id,
+                migrated[0].id,
+            )
+            return None
+        return migrated
 
-    def _load_envelope(self, artifact_id: str, file_id: int) -> Envelope | None:
+    def _load_envelope(
+        self, artifact_id: str, file_id: int, size_hint: int | None = None
+    ) -> Envelope | None:
         key = (artifact_id, file_id)
         with self._lock:
             envelope = self._memory.get(key)
@@ -1084,7 +1426,7 @@ class ArtifactStore:
                 self._memory.move_to_end(key)
                 return envelope
 
-        raw = self._read_raw(artifact_id, file_id)
+        raw = self._read_raw(artifact_id, file_id, size_hint=size_hint)
         if raw is None:
             return None
         try:
@@ -1097,11 +1439,26 @@ class ArtifactStore:
                 exc,
             )
             return None
+        # The file was selected by the ``artifact-id-{id}`` tag / index; refuse
+        # to serve a payload whose own id disagrees. Otherwise a file tagged for
+        # artifact A but carrying id B would leak B's content under A's
+        # capability URL and authorization context.
+        if envelope.id != artifact_id:
+            logger.warning(
+                "Envelope in file %s is tagged for artifact %s but declares id "
+                "%r; skipping as cross-wired/corrupt",
+                file_id,
+                artifact_id,
+                envelope.id,
+            )
+            return None
         with self._lock:
             self._remember_locked(artifact_id, file_id, envelope)
         return envelope
 
-    def _load_meta(self, artifact_id: str, file_id: int) -> ArtifactMeta | None:
+    def _load_meta(
+        self, artifact_id: str, file_id: int, size_hint: int | None = None
+    ) -> ArtifactMeta | None:
         key = (artifact_id, file_id)
         with self._lock:
             meta = self._meta_memory.get(key)
@@ -1109,7 +1466,7 @@ class ArtifactStore:
                 self._meta_memory.move_to_end(key)
                 return meta
 
-        raw = self._read_raw(artifact_id, file_id)
+        raw = self._read_raw(artifact_id, file_id, size_hint=size_hint)
         if raw is None:
             return None
         try:
@@ -1122,20 +1479,65 @@ class ArtifactStore:
                 exc,
             )
             return None
+        # Same cross-artifact guard as _load_envelope: the meta record's own id
+        # must match the artifact it was filed under.
+        if meta.id != artifact_id:
+            logger.warning(
+                "Meta in file %s is tagged for artifact %s but declares id %r; "
+                "skipping as cross-wired/corrupt",
+                file_id,
+                artifact_id,
+                meta.id,
+            )
+            return None
         with self._lock:
             self._remember_meta_locked(artifact_id, file_id, meta)
         return meta
 
-    def _read_raw(self, artifact_id: str, file_id: int) -> bytes | None:
+    def _too_large(self, size: int | None) -> bool:
+        """True when ``size`` exceeds the configured envelope byte bound."""
+        return (
+            self._max_envelope_bytes > 0
+            and size is not None
+            and size > self._max_envelope_bytes
+        )
+
+    def _read_raw(
+        self, artifact_id: str, file_id: int, size_hint: int | None = None
+    ) -> bytes | None:
         """Disk cache -> Storage download. None when the file is unreadable.
+
+        ``size_hint`` is the Storage-reported byte size (from the file listing).
+        When it — or the actually downloaded payload — exceeds
+        ``max_envelope_bytes`` the record is skipped (logged, treated as
+        not-found) so an oversized persisted record cannot exhaust memory.
 
         ``BackendError`` from Storage reads propagates (the API maps it to 502).
         """
+        if self._too_large(size_hint):
+            logger.warning(
+                "Skipping oversized file %s of artifact %s: %s bytes > limit %s",
+                file_id,
+                artifact_id,
+                size_hint,
+                self._max_envelope_bytes,
+            )
+            return None
         raw = self._read_disk_cache(artifact_id, file_id)
         if raw is not None:
             return raw
         raw = self._backend.download(file_id)
         if raw is None:
+            return None
+        if self._too_large(len(raw)):
+            logger.warning(
+                "Discarding oversized download of file %s of artifact %s: "
+                "%s bytes > limit %s",
+                file_id,
+                artifact_id,
+                len(raw),
+                self._max_envelope_bytes,
+            )
             return None
         self._write_disk_cache(artifact_id, file_id, raw)
         return raw
@@ -1187,6 +1589,27 @@ class ArtifactStore:
         path = self._cache_path(artifact_id, file_id)
         if path is None:
             return None
+        # Bound the read: a cache file above the envelope limit is dropped
+        # rather than loaded into memory (it is pure cache, re-fetchable).
+        if self._max_envelope_bytes > 0:
+            try:
+                cached_size = path.stat().st_size
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                logger.warning("Cannot stat disk cache %s: %s", path, exc)
+                return None
+            if cached_size > self._max_envelope_bytes:
+                logger.warning(
+                    "Dropping oversized disk cache for artifact %s (file %s): "
+                    "%s bytes > limit %s",
+                    artifact_id,
+                    file_id,
+                    cached_size,
+                    self._max_envelope_bytes,
+                )
+                self._delete_disk_cache(artifact_id, file_id)
+                return None
         try:
             raw = path.read_bytes()
         except FileNotFoundError:
@@ -1254,13 +1677,17 @@ def _absorb_file(entry: _ArtEntry, info: FileInfo) -> None:
     if TAG_META in tags:
         if entry.meta_file_id is None or entry.meta_file_id < info.id:
             entry.meta_file_id = info.id
+            entry.meta_size_bytes = info.size_bytes
         return
     version = _version_from_tags(tags)
     if version is not None:
         existing = entry.versions.get(version)
         if existing is None or existing.file_id < info.id:
-            entry.versions[version] = _VerEntry(file_id=info.id)
+            entry.versions[version] = _VerEntry(
+                file_id=info.id, size_bytes=info.size_bytes
+            )
         return
     # Neither meta nor version tag: a schema-1 single-envelope artifact.
     if entry.legacy_file_id is None or entry.legacy_file_id < info.id:
         entry.legacy_file_id = info.id
+        entry.legacy_size_bytes = info.size_bytes

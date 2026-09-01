@@ -19,20 +19,32 @@ subprocess. Everything else is local.
 
 Private repositories are supported by passing a transient ``git_token`` (and
 optionally ``git_username``) to :func:`build_from_git`. The credentials are
-injected into the clone URL for the duration of that one subprocess call and
-nothing else: the *unauthenticated* URL is what gets logged, recorded and
-echoed back, and every string that can reach a :class:`BuildError` message goes
-through :func:`_scrub` with the token as an extra literal to redact.
+handed to git through a short-lived ``GIT_ASKPASS`` helper (token in a curated
+subprocess environment, never in ``argv`` and never in the clone URL) for the
+duration of that one subprocess call and nothing else: the *unauthenticated*
+URL is what gets logged, recorded and echoed back, and every string that can
+reach a :class:`BuildError` message goes through :func:`_scrub` with the token
+as an extra literal to redact (defence in depth).
+
+Security note on rendered Markdown/HTML: the Markdown renderer intentionally
+keeps ``html: True`` so authors can embed rich raw HTML (and thus ``<script>``)
+in "markdown" artifacts, and HTML artifacts are served verbatim. This is *by
+design* for rich content; the security boundary that stops artifact script from
+touching the hub origin is the sandboxed iframe applied by the serving layer
+(``src/main.py`` / ``src/pages.py``), NOT sanitisation here. Do not rely on this
+module to neutralise artifact markup.
 """
 
 from __future__ import annotations
 
 import base64
 import html as html_lib
+import ipaddress
 import logging
 import mimetypes
 import os
 import re
+import socket
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -68,9 +80,6 @@ README_CANDIDATES: tuple[str, ...] = ("readme.md", "readme.markdown")
 #: Anchors are generated for h1..h3 only — deeper headings rarely need links.
 ANCHOR_MAX_LEVEL = 3
 
-#: Directory skipped when measuring repository size.
-GIT_METADATA_DIR = ".git"
-
 DEFAULT_MIME_TYPE = "application/octet-stream"
 
 #: Username used when a git token is supplied without one. Works for GitHub
@@ -90,18 +99,34 @@ EXTERNAL_URL_PREFIXES: tuple[str, ...] = (
     "cid:",
 )
 
+# CDN dependencies for rendered Markdown pages.
+#
+# These are pinned to *exact* patch versions rather than a floating major
+# (``@11``) so a rendered artifact always pulls the reviewed bytes and a silent
+# upstream mutation cannot change the code that runs in it. Subresource
+# Integrity (SRI) is not applied: it is impractical for the ESM ``import`` of
+# mermaid (the module in turn imports further chunks the top-level hash cannot
+# cover), and the *actual* security boundary for artifact pages is the sandboxed
+# iframe the serving layer wraps them in (see the module docstring) — not SRI or
+# a per-page CSP. Bump these deliberately and re-review when upgrading.
+HLJS_VERSION = "11.9.0"
+MERMAID_VERSION = "11.4.1"
 HLJS_CSS_LIGHT = (
-    "https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11"
+    f"https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@{HLJS_VERSION}"
     "/build/styles/github.min.css"
 )
 HLJS_CSS_DARK = (
-    "https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11"
+    f"https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@{HLJS_VERSION}"
     "/build/styles/github-dark.min.css"
 )
 HLJS_JS = (
-    "https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"
+    f"https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@{HLJS_VERSION}"
+    "/build/highlight.min.js"
 )
-MERMAID_ESM = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs"
+MERMAID_ESM = (
+    f"https://cdn.jsdelivr.net/npm/mermaid@{MERMAID_VERSION}"
+    "/dist/mermaid.esm.min.mjs"
+)
 
 #: Placeholders substituted into PAGE_TEMPLATE (plain replace — the template
 #: contains CSS/JS braces, so str.format() is not usable here).
@@ -523,13 +548,16 @@ def _last_line(text: str, secret: str | None = None) -> str:
 
 
 def _authed_clone_url(git_url: str, username: str | None, token: str) -> str:
-    """Return ``git_url`` with transient clone credentials in its userinfo.
+    """Return ``git_url`` with credentials embedded in its userinfo.
 
-    The result is passed to ``git clone`` and to nothing else: it is never
-    logged, stored, or included in an error message. Both parts are
-    percent-encoded with ``safe=""`` so that a token containing ``@``, ``:``
-    or ``/`` cannot break out of the userinfo section. Any userinfo already
-    present in ``git_url`` is replaced.
+    The clone itself no longer uses this form — the token is delivered via
+    ``GIT_ASKPASS`` so it never enters ``argv`` or the URL (see :func:`_clone`).
+    This helper is retained to exercise :func:`_scrub`'s defence-in-depth: if a
+    credentialed URL ever surfaces (e.g. echoed by git from ``.git/config`` or a
+    redirect), the scrubber must still strip it before it reaches a log or an
+    error. Both parts are percent-encoded with ``safe=""`` so a token containing
+    ``@``, ``:`` or ``/`` cannot break out of the userinfo section; any userinfo
+    already present in ``git_url`` is replaced.
     """
     parsed = urlparse(git_url)
     host = parsed.netloc.rsplit("@", 1)[-1]
@@ -552,12 +580,142 @@ def _validate_git_url(git_url: str) -> str:
     return git_url.strip()
 
 
-def _run_git(args: list[str], timeout_s: int) -> subprocess.CompletedProcess[str]:
-    """Run a git command, capturing output; never raises on non-zero exit."""
+#: Host names that must never be cloned — cloud metadata / internal service
+#: names. ``*.internal`` (GCP/AWS internal DNS) is matched by suffix separately.
+_BLOCKED_HOSTNAMES: frozenset[str] = frozenset(
+    {"metadata", "metadata.google.internal", "localhost"}
+)
+
+
+def _resolve_host_ips(hostname: str) -> list[str]:
+    """Resolve ``hostname`` to the list of IP strings it maps to.
+
+    Isolated so tests can inject a fake resolver instead of doing real DNS.
+    """
+    infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+    return [info[4][0] for info in infos]
+
+
+def _ip_is_blocked(ip: str) -> bool:
+    """True when ``ip`` is private, loopback, link-local, reserved, etc."""
     try:
-        # GIT_TERMINAL_PROMPT=0 makes git fail immediately on private or
-        # missing repositories instead of waiting for interactive credentials.
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True  # unparseable — refuse rather than risk it
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    )
+
+
+def _check_git_host(
+    git_url: str,
+    *,
+    allow_private: bool,
+    resolver: Callable[[str], list[str]] | None = None,
+) -> None:
+    """SSRF guard: reject a git_url whose host is internal or resolves private.
+
+    Applied *before* any clone. Literal-IP hosts in a blocked range and host
+    names that resolve to one (private/loopback/link-local/ULA/reserved, plus
+    cloud-metadata endpoints such as 169.254.169.254 and ``*.internal``) are
+    refused unless ``allow_private`` is set (self-hosting opt-in). This checks
+    the addresses at validation time; git re-resolves at clone time, so a
+    determined DNS-rebinding attacker retains a narrow TOCTOU window — the
+    residual risk accepted for this network-local guard.
+    """
+    if allow_private:
+        return
+    if resolver is None:
+        resolver = _resolve_host_ips
+    hostname = (urlparse(git_url).hostname or "").strip().rstrip(".").lower()
+    if not hostname:
+        raise BuildError("git_url must have a hostname.")
+    if hostname in _BLOCKED_HOSTNAMES or hostname.endswith(".internal"):
+        raise BuildError(
+            "git_url host is not permitted: internal/metadata hostnames are "
+            "blocked."
+        )
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        candidates = [hostname]
+    else:
+        try:
+            candidates = resolver(hostname)
+        except OSError as exc:
+            raise BuildError(
+                f"Could not resolve git_url host {hostname!r}."
+            ) from exc
+        if not candidates:
+            raise BuildError(f"Could not resolve git_url host {hostname!r}.")
+    for ip in candidates:
+        if _ip_is_blocked(ip):
+            raise BuildError(
+                "git_url resolves to a private, loopback, link-local, or "
+                "reserved address, which is not allowed. Set "
+                "HUB_GIT_ALLOW_PRIVATE_HOSTS=1 for trusted self-hosting."
+            )
+
+
+#: Environment variables git may read that we deliberately forward. Everything
+#: else in ``os.environ`` (notably the app's own HUB_* secrets) is withheld so a
+#: git config/credential helper or any subprocess git spawns cannot read it.
+_GIT_ENV_PASSTHROUGH: tuple[str, ...] = ("PATH", "HOME", "LANG", "LC_ALL")
+
+#: askpass helper: git calls this once for the username and once for the
+#: password. It returns the value from the (curated) environment so the token
+#: is never placed in ``argv``. ``$1`` is the human prompt ("Username for ...",
+#: "Password for ...").
+_ASKPASS_SCRIPT = (
+    "#!/bin/sh\n"
+    'case "$1" in\n'
+    '  Username*|username*) printf %s "$GIT_ASKPASS_USER" ;;\n'
+    '  *) printf %s "$GIT_ASKPASS_PASS" ;;\n'
+    "esac\n"
+)
+
+
+def _git_base_env() -> dict[str, str]:
+    """Minimal, curated environment for every git subprocess.
+
+    Only a handful of harmless vars are forwarded (never the app's HUB_*
+    secrets). ``GIT_TERMINAL_PROMPT=0`` makes git fail immediately on private
+    or missing repositories instead of blocking on an interactive prompt.
+    """
+    env = {"GIT_TERMINAL_PROMPT": "0"}
+    for key in _GIT_ENV_PASSTHROUGH:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    return env
+
+
+def _run_git(
+    args: list[str],
+    timeout_s: int,
+    *,
+    env_extra: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a git command, capturing output; never raises on non-zero exit.
+
+    The subprocess only ever sees :func:`_git_base_env` plus the optional
+    ``env_extra`` (the transient git-auth vars) — the full process environment
+    is deliberately *not* inherited.
+    """
+    env = _git_base_env()
+    if env_extra:
+        env.update(env_extra)
+    try:
         return subprocess.run(  # noqa: S603 - fixed argv, no shell
             args,
             capture_output=True,
@@ -583,19 +741,46 @@ def _clone(
     *,
     username: str | None = None,
     token: str | None = None,
+    blob_limit_bytes: int | None = None,
 ) -> None:
     """Shallow-clone ``git_url`` (optionally at ``ref``) into ``dest``.
 
-    With ``token`` set, the clone runs against a credentialed variant of the
-    URL (see :func:`_authed_clone_url`); ``git_url`` itself stays the
-    unauthenticated URL used for every message raised from here.
+    ``git_url`` is always the *clean*, unauthenticated URL — it is what lands in
+    ``argv`` and in every message raised from here. When ``token`` is set the
+    credential is delivered out-of-band through a short-lived ``GIT_ASKPASS``
+    helper (:data:`_ASKPASS_SCRIPT`) reading a curated environment, so the token
+    never appears in ``argv``, process listings, or the persisted URL.
     """
-    clone_url = _authed_clone_url(git_url, username, token) if token else git_url
     args = ["git", "clone", "--depth", "1"]
+    if blob_limit_bytes and blob_limit_bytes > 0:
+        # Partial clone: ask the server to withhold blobs larger than the hard
+        # repo cap. Servers without partial-clone support merely warn and send
+        # everything, so this never breaks a clone. It only reduces blast
+        # radius — git still materialises HEAD blobs during checkout, and the
+        # whole shallow tree lands on disk before the size check runs. Residual
+        # risk is therefore bounded by the clone *timeout* (the only true
+        # during-download limit) and caught by the post-clone size check, which
+        # now includes the .git directory (see ``_repo_size_bytes``).
+        args.append(f"--filter=blob:limit={blob_limit_bytes}")
     if ref:
         args += ["--branch", ref]
-    args += [clone_url, str(dest)]
-    result = _run_git(args, timeout_s)
+    args += [git_url, str(dest)]
+
+    if token:
+        # The token lives only in a curated env handed to a 0700 askpass helper,
+        # torn down in the ``with`` finally. It is never an argv element.
+        with tempfile.TemporaryDirectory(prefix="artifact-askpass-") as helper_dir:
+            askpass = Path(helper_dir) / "askpass.sh"
+            askpass.write_text(_ASKPASS_SCRIPT, encoding="utf-8")
+            askpass.chmod(0o700)
+            env_extra = {
+                "GIT_ASKPASS": str(askpass),
+                "GIT_ASKPASS_USER": username or DEFAULT_GIT_USERNAME,
+                "GIT_ASKPASS_PASS": token,
+            }
+            result = _run_git(args, timeout_s, env_extra=env_extra)
+    else:
+        result = _run_git(args, timeout_s)
     if result.returncode == 0:
         return
     reason = _last_line(result.stderr, token) or _last_line(result.stdout, token)
@@ -621,11 +806,16 @@ def _clone(
 
 
 def _repo_size_bytes(root: Path) -> int:
-    """Sum file sizes under ``root``, excluding git metadata."""
+    """Sum file sizes under ``root``, *including* the ``.git`` directory.
+
+    The ``.git`` pack is counted deliberately: it is where a shallow clone's
+    downloaded objects land, so counting it turns the post-clone check into a
+    real hard stop against a repository with a huge history/pack — not just a
+    huge working tree. Symlinks are never followed (their tiny link size is
+    ignored); containment of the entry/image files is enforced elsewhere.
+    """
     total = 0
     for dirpath, dirnames, filenames in os.walk(root):
-        if GIT_METADATA_DIR in dirnames:
-            dirnames.remove(GIT_METADATA_DIR)
         for name in filenames:
             candidate = Path(dirpath) / name
             try:
@@ -701,7 +891,25 @@ def _default_entry(directory: Path, where: str) -> Path:
 
 
 def _resolve_entry(repo_root: Path, path: str | None) -> Path:
-    """Pick the file to build from, honouring an explicit ``git_path``."""
+    """Pick the file to build from, honouring an explicit ``git_path``.
+
+    Whatever branch is taken (explicit path, an explicit directory's default,
+    or the repository-root default), the final entry is verified to resolve
+    *inside* ``repo_root`` with symlinks followed — a repo shipping an
+    ``index.html`` / ``README.md`` symlink that points at ``/etc/passwd`` is
+    rejected rather than read.
+    """
+    entry = _pick_entry(repo_root, path)
+    if not _is_inside(repo_root, entry):
+        raise BuildError(
+            "The selected entry file resolves outside the repository "
+            "(symlink escape) and cannot be published."
+        )
+    return entry
+
+
+def _pick_entry(repo_root: Path, path: str | None) -> Path:
+    """Select the entry file without the final containment check."""
     if not path:
         return _default_entry(repo_root, "the repository root")
 
@@ -825,6 +1033,7 @@ def build_from_git(
     token.
     """
     url = _validate_git_url(git_url)
+    _check_git_host(url, allow_private=settings.git_allow_private_hosts)
 
     with tempfile.TemporaryDirectory(prefix="artifact-git-") as tmp:
         dest = Path(tmp) / "repo"
@@ -838,6 +1047,7 @@ def build_from_git(
             settings.git_clone_timeout_s,
             username=git_username,
             token=git_token,
+            blob_limit_bytes=settings.git_max_repo_bytes,
         )
 
         size = _repo_size_bytes(dest)

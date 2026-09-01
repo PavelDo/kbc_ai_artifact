@@ -17,6 +17,13 @@ def _int_env(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass(frozen=True)
 class Settings:
     # Host project access (where serving envelopes live)
@@ -34,6 +41,10 @@ class Settings:
     max_inline_total_bytes: int = 15 * 1024 * 1024
     git_clone_timeout_s: int = 90
     git_max_repo_bytes: int = 200 * 1024 * 1024
+    # SSRF guard: reject git_url hosts that resolve to private/loopback/
+    # link-local/reserved addresses (incl. cloud metadata endpoints). Set
+    # HUB_GIT_ALLOW_PRIVATE_HOSTS=1 only for trusted self-hosting.
+    git_allow_private_hosts: bool = False
     cache_max_entries: int = 200
     unlock_cookie_max_age_s: int = 12 * 3600
     token_verify_timeout_s: int = 15
@@ -49,6 +60,14 @@ class Settings:
     max_comments_per_day: int = 100
     # Extra stack URLs (comma-separated) beyond the *.keboola.com rule
     extra_stacks: tuple[str, ...] = ()
+    # Largest persisted envelope/meta record (bytes) the store will download or
+    # read from disk cache before serving. Records above this are skipped as a
+    # denial-of-service guard (env HUB_MAX_ENVELOPE_BYTES). 0 disables the bound.
+    max_envelope_bytes: int = 20 * 1024 * 1024
+    # Per-artifact cap on retained "proposed" versions; the oldest proposals
+    # above this are pruned (env HUB_MAX_PROPOSED_VERSIONS). Proposals are never
+    # served as head, so pruning the oldest is always safe.
+    max_proposed_versions: int = 50
 
 
 def load_settings() -> Settings:
@@ -73,6 +92,7 @@ def load_settings() -> Settings:
         max_inline_total_bytes=_int_env("HUB_MAX_INLINE_TOTAL_BYTES", 15 * 1024 * 1024),
         git_clone_timeout_s=_int_env("HUB_GIT_CLONE_TIMEOUT_S", 90),
         git_max_repo_bytes=_int_env("HUB_GIT_MAX_REPO_BYTES", 200 * 1024 * 1024),
+        git_allow_private_hosts=_bool_env("HUB_GIT_ALLOW_PRIVATE_HOSTS", False),
         cache_max_entries=_int_env("HUB_CACHE_MAX_ENTRIES", 200),
         unlock_cookie_max_age_s=_int_env("HUB_UNLOCK_COOKIE_MAX_AGE_S", 12 * 3600),
         token_verify_timeout_s=_int_env("HUB_TOKEN_VERIFY_TIMEOUT_S", 15),
@@ -81,4 +101,6 @@ def load_settings() -> Settings:
         diff_max_bytes=_int_env("HUB_DIFF_MAX_BYTES", 2 * 1024 * 1024),
         max_comments_per_day=_int_env("HUB_MAX_COMMENTS_PER_DAY", 100),
         extra_stacks=extra,
+        max_envelope_bytes=_int_env("HUB_MAX_ENVELOPE_BYTES", 20 * 1024 * 1024),
+        max_proposed_versions=_int_env("HUB_MAX_PROPOSED_VERSIONS", 50),
     )

@@ -1,9 +1,11 @@
 """Tests for src.store: envelopes, meta records and the versioned store."""
 
 import json
+import threading
 
 import pytest
 
+from src.kbc import BackendError, InMemoryFilesBackend
 from src.store import (
     ACCEPT_ALLOWLIST,
     ACCEPT_ANYONE,
@@ -887,3 +889,416 @@ class TestDiskCache:
         head = fresh.get_head("abc123")
         assert head is not None
         assert head.title == "Test Artifact v1"
+
+
+# --------------------------------------------------------------------------
+# Test doubles for failure-injection / concurrency
+# --------------------------------------------------------------------------
+
+
+class _FailingDeleteBackend(InMemoryFilesBackend):
+    """In-memory backend whose delete raises for a chosen set of file ids."""
+
+    def __init__(self, fail_ids: set[int] | None = None) -> None:
+        super().__init__()
+        self.fail_ids: set[int] = set(fail_ids or set())
+
+    def delete(self, file_id: int) -> None:
+        if file_id in self.fail_ids:
+            raise BackendError(f"boom deleting {file_id}")
+        super().delete(file_id)
+
+
+class _LockingBackend(InMemoryFilesBackend):
+    """Serializes uploads so a threaded test never races the id counter."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._upload_lock = threading.Lock()
+
+    def upload(self, name: str, content: bytes, tags: list[str]) -> int:
+        with self._upload_lock:
+            return super().upload(name, content, tags)
+
+
+# --------------------------------------------------------------------------
+# Finding 1: envelope/meta id must match the requested artifact id
+# --------------------------------------------------------------------------
+
+
+class TestEnvelopeIdVerification:
+    def test_version_file_with_wrong_payload_id_is_skipped(self, backend, tmp_path):
+        # A file tagged for artifact A but whose JSON declares id B must not be
+        # served under A (cross-artifact content leak).
+        store = _store_with_limit(backend, tmp_path, 50)
+        payload = json.loads(_make_envelope(artifact_id="B", version=1).to_json())
+        backend.upload(
+            "artifact-A-v1.json",
+            json.dumps(payload).encode("utf-8"),
+            [TAG_ALL, tag_for_id("A"), tag_for_version(1)],
+        )
+        store.hydrate()
+        assert store.get_head("A") is None
+        assert store.get_version("A", 1) is None
+        assert store.list_versions("A") == []
+
+    def test_meta_file_with_wrong_payload_id_is_skipped(self, backend, tmp_path):
+        store = _store_with_limit(backend, tmp_path, 50)
+        payload = json.loads(_make_meta(artifact_id="B").to_json())
+        backend.upload(
+            "artifact-A-meta.json",
+            json.dumps(payload).encode("utf-8"),
+            [TAG_ALL, tag_for_id("A"), TAG_META, tag_for_owner(OWNER_A)],
+        )
+        store.hydrate()
+        assert store.get_meta("A") is None
+
+    def test_version_tag_mismatch_is_skipped(self, backend, tmp_path):
+        # File tagged v2 but its payload says version 5: the tag is
+        # authoritative and the mislabelled record is skipped.
+        store = _store_with_limit(backend, tmp_path, 50)
+        payload = json.loads(_make_envelope(artifact_id="A", version=5).to_json())
+        backend.upload(
+            "artifact-A-v2.json",
+            json.dumps(payload).encode("utf-8"),
+            [TAG_ALL, tag_for_id("A"), tag_for_version(2)],
+        )
+        store.hydrate()
+        assert store.get_version("A", 2) is None
+
+    def test_matching_id_still_serves(self, tmp_store):
+        tmp_store.create(_make_meta(artifact_id="ok1"), _make_envelope("ok1"))
+        assert tmp_store.get_head("ok1") is not None
+
+
+# --------------------------------------------------------------------------
+# Finding 2: non-string title/html rejected as corrupt
+# --------------------------------------------------------------------------
+
+
+class TestEnvelopeValueValidation:
+    def test_non_string_title_raises(self):
+        raw = json.dumps({"id": "x", "title": 123}).encode("utf-8")
+        with pytest.raises(ValueError):
+            Envelope.from_json(raw)
+
+    def test_non_string_html_raises(self):
+        raw = json.dumps({"id": "x", "html": {"unexpected": True}}).encode("utf-8")
+        with pytest.raises(ValueError):
+            Envelope.from_json(raw)
+
+    def test_unknown_source_type_normalizes_to_html(self):
+        raw = json.dumps({"id": "x", "source_type": "wat"}).encode("utf-8")
+        assert Envelope.from_json(raw).source_type == "html"
+
+    def test_non_string_source_type_normalizes_to_html(self):
+        raw = json.dumps({"id": "x", "source_type": 7}).encode("utf-8")
+        assert Envelope.from_json(raw).source_type == "html"
+
+    def test_corrupt_title_makes_store_skip_the_record(self, backend, tmp_path):
+        # A malformed persisted record must be quarantined, not 500 later.
+        store = _store_with_limit(backend, tmp_path, 50)
+        backend.upload(
+            "artifact-A-v1.json",
+            json.dumps({"id": "A", "title": 123, "html": "<p>hi</p>"}).encode("utf-8"),
+            [TAG_ALL, tag_for_id("A"), tag_for_version(1)],
+        )
+        store.hydrate()
+        assert store.get_version("A", 1) is None
+
+
+# --------------------------------------------------------------------------
+# Finding 3: oversized records are skipped before decode
+# --------------------------------------------------------------------------
+
+
+class TestEnvelopeSizeBound:
+    def _small_store(self, backend, tmp_path, limit_bytes):
+        return ArtifactStore(
+            backend=backend,
+            cache_dir=tmp_path / "cache",
+            cache_max_entries=50,
+            max_versions=50,
+            max_envelope_bytes=limit_bytes,
+        )
+
+    def test_oversized_version_is_skipped(self, backend, tmp_path):
+        # Seed an oversized version file directly and read it from a cold store
+        # (empty LRU), so the read goes through the size-bounded download path.
+        big_html = "x" * 5000
+        backend.upload(
+            "artifact-abc123-v1.json",
+            _make_envelope(html=big_html).to_json(),
+            [TAG_ALL, tag_for_id("abc123"), tag_for_version(1)],
+        )
+        store = self._small_store(backend, tmp_path, 1000)
+        store.hydrate()
+        # The record exceeds the 1000-byte bound, so it is not served.
+        assert store.get_head("abc123") is None
+        assert store.get_version("abc123", 1) is None
+
+    def test_within_bound_is_served(self, backend, tmp_path):
+        store = self._small_store(backend, tmp_path, 20 * 1024 * 1024)
+        store.create(_make_meta(), _make_envelope())
+        assert store.get_head("abc123") is not None
+
+    def test_zero_bound_disables_the_limit(self, backend, tmp_path):
+        store = self._small_store(backend, tmp_path, 0)
+        store.create(_make_meta(), _make_envelope(html="x" * 100000))
+        assert store.get_head("abc123") is not None
+
+    def test_oversized_disk_cache_is_dropped(self, backend, tmp_path):
+        store = self._small_store(backend, tmp_path, 1000)
+        # Write a valid small artifact, then corrupt its cache to be oversized.
+        big_store = self._small_store(backend, tmp_path, 20 * 1024 * 1024)
+        big_store.create(_make_meta(), _make_envelope())
+        cache_files = list((tmp_path / "cache").glob("abc123-*.json"))
+        assert cache_files
+        for path in cache_files:
+            path.write_bytes(b"x" * 5000)
+        # store shares the same cache dir; the oversized cache file is dropped
+        # and (since the backend copy is small) the record still loads.
+        assert store.get_head("abc123") is not None
+
+
+# --------------------------------------------------------------------------
+# Finding 4: atomic version allocation (no colliding numbers)
+# --------------------------------------------------------------------------
+
+
+class TestAddVersionNext:
+    def test_sequential_calls_get_distinct_numbers(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope(version=1))
+        v_a = tmp_store.add_version_next(_make_envelope(title="a"))
+        v_b = tmp_store.add_version_next(_make_envelope(title="b"))
+        assert {v_a, v_b} == {2, 3}
+        assert [row["version"] for row in tmp_store.list_versions("abc123")] == [3, 2, 1]
+
+    def test_returns_the_assigned_number_and_ignores_env_version(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope(version=1))
+        # env carries version=99 but the store assigns the real next number.
+        assigned = tmp_store.add_version_next(_make_envelope(version=99, title="x"))
+        assert assigned == 2
+        env = tmp_store.get_version("abc123", 2)
+        assert env is not None and env.version == 2 and env.title == "x"
+
+    def test_first_version_is_one(self, tmp_store):
+        assigned = tmp_store.add_version_next(_make_envelope())
+        assert assigned == 1
+
+    def test_concurrent_allocations_do_not_collide(self, tmp_path):
+        backend = _LockingBackend()
+        store = ArtifactStore(
+            backend=backend,
+            cache_dir=tmp_path / "cache",
+            cache_max_entries=50,
+            max_versions=50,
+        )
+        store.create(_make_meta(), _make_envelope(version=1))
+
+        assigned: list[int] = []
+        lock = threading.Lock()
+        start = threading.Barrier(4)
+
+        def worker(i: int) -> None:
+            start.wait()
+            n = store.add_version_next(_make_envelope(title=f"t{i}"))
+            with lock:
+                assigned.append(n)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Four distinct numbers, none reused, contiguous with the seed v1.
+        assert sorted(assigned) == [2, 3, 4, 5]
+        numbers = [row["version"] for row in store.list_versions("abc123")]
+        assert sorted(numbers) == [1, 2, 3, 4, 5]
+
+
+# --------------------------------------------------------------------------
+# Finding 5: delete reports partial failure
+# --------------------------------------------------------------------------
+
+
+class TestDeletePartialFailure:
+    def test_delete_returns_false_when_a_backend_delete_fails(self, tmp_path):
+        backend = _FailingDeleteBackend()
+        store = _store_with_limit(backend, tmp_path, 50)
+        store.create(_make_meta(), _make_envelope(version=1))
+        store.add_version(_make_envelope(version=2))
+
+        # Make one of the artifact's files undeletable.
+        victim = next(
+            info.id
+            for info, _ in backend.files.values()
+            if tag_for_id("abc123") in info.tags
+        )
+        backend.fail_ids = {victim}
+
+        assert store.delete("abc123") is False
+        # The still-present file keeps the index entry alive (no false success).
+        remaining = [
+            info for info, _ in backend.files.values() if tag_for_id("abc123") in info.tags
+        ]
+        assert remaining  # the undeletable file is still there
+
+    def test_delete_returns_true_when_all_deleted(self, tmp_store, backend):
+        tmp_store.create(_make_meta(), _make_envelope(version=1))
+        assert tmp_store.delete("abc123") is True
+
+    def test_delete_unknown_returns_false(self, tmp_store):
+        assert tmp_store.delete("nope") is False
+
+    def test_delete_version_returns_false_when_backend_fails(self, tmp_path):
+        backend = _FailingDeleteBackend()
+        store = _store_with_limit(backend, tmp_path, 50)
+        store.create(_make_meta(), _make_envelope(version=1))
+        store.add_version(_make_envelope(version=2, status=STATUS_PROPOSED))
+
+        victim = next(
+            info.id
+            for info, _ in backend.files.values()
+            if tag_for_version(2) in info.tags
+        )
+        backend.fail_ids = {victim}
+        assert store.delete_version("abc123", 2) is False
+        # Index still knows about v2 (its file was not removed).
+        assert store.get_version("abc123", 2) is not None
+
+
+# --------------------------------------------------------------------------
+# Finding 6: deterministic single head / verify_single_head
+# --------------------------------------------------------------------------
+
+
+class TestVerifySingleHead:
+    def test_true_for_a_normal_artifact(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope(version=1))
+        tmp_store.add_version(_make_envelope(version=2))
+        assert tmp_store.verify_single_head("abc123") is True
+        assert tmp_store.get_head("abc123").version == 2
+
+    def test_highest_live_wins_even_with_a_stale_duplicate_file(self, backend, tmp_path):
+        # Two files claim v1 (an interrupted write left an older one); the newest
+        # file id wins and the head is still the highest live version.
+        store = _store_with_limit(backend, tmp_path, 50)
+        store.create(_make_meta(), _make_envelope(version=1, title="v1"))
+        store.add_version(_make_envelope(version=2, title="v2"))
+        # Inject a second, older-looking v1 file directly.
+        backend.upload(
+            "artifact-abc123-v1.json",
+            _make_envelope(version=1, title="stale").to_json(),
+            [TAG_ALL, tag_for_id("abc123"), tag_for_version(1)],
+        )
+        store.refresh("abc123")
+        assert store.verify_single_head("abc123") is True
+        assert store.get_head("abc123").version == 2
+
+    def test_pinned_live_head_is_verified(self, tmp_store):
+        tmp_store.create(_make_meta(), _make_envelope(version=1))
+        tmp_store.add_version(_make_envelope(version=2))
+        tmp_store.save_meta(_make_meta(head_mode=HEAD_PINNED, head_version=1))
+        assert tmp_store.get_head("abc123").version == 1
+        assert tmp_store.verify_single_head("abc123") is True
+
+    def test_false_when_no_live_version(self, tmp_store):
+        assert tmp_store.verify_single_head("nope") is False
+
+
+# --------------------------------------------------------------------------
+# Finding 7: refresh picks up cross-replica writes
+# --------------------------------------------------------------------------
+
+
+class TestRefresh:
+    def test_refresh_picks_up_a_new_version(self, backend, tmp_path):
+        writer = _store_with_limit(backend, tmp_path / "w", 50)
+        reader = _store_with_limit(backend, tmp_path / "r", 50)
+        writer.create(_make_meta(), _make_envelope(version=1))
+        reader.hydrate()
+        assert reader.get_head("abc123").version == 1
+
+        # Another replica adds v2; the reader is stale until it refreshes.
+        writer.add_version(_make_envelope(version=2, title="second"))
+        assert reader.get_head("abc123").version == 1  # still stale (index hit)
+
+        assert reader.refresh("abc123") is True
+        head = reader.get_head("abc123")
+        assert head is not None and head.version == 2 and head.title == "second"
+
+    def test_get_head_fresh_true_reads_through(self, backend, tmp_path):
+        writer = _store_with_limit(backend, tmp_path / "w", 50)
+        reader = _store_with_limit(backend, tmp_path / "r", 50)
+        writer.create(_make_meta(), _make_envelope(version=1))
+        reader.hydrate()
+        writer.add_version(_make_envelope(version=2, title="second"))
+
+        stale = reader.get_head("abc123")
+        assert stale is not None and stale.version == 1
+        fresh = reader.get_head("abc123", fresh=True)
+        assert fresh is not None and fresh.version == 2
+
+    def test_refresh_of_deleted_artifact_returns_false(self, backend, tmp_path):
+        store = _store_with_limit(backend, tmp_path, 50)
+        store.create(_make_meta(), _make_envelope(version=1))
+        store.hydrate()
+        store.delete("abc123")
+        assert store.refresh("abc123") is False
+
+
+# --------------------------------------------------------------------------
+# Finding 8: proposed versions are capped
+# --------------------------------------------------------------------------
+
+
+class TestProposalCap:
+    def _capped_store(self, backend, tmp_path, cap):
+        return ArtifactStore(
+            backend=backend,
+            cache_dir=tmp_path / "cache",
+            cache_max_entries=50,
+            max_versions=50,
+            max_proposed_versions=cap,
+        )
+
+    def test_oldest_proposals_pruned_over_cap(self, backend, tmp_path):
+        store = self._capped_store(backend, tmp_path, 2)
+        store.create(_make_meta(), _make_envelope(version=1))  # live head
+        for n in range(2, 7):  # v2..v6 proposed
+            store.add_version(
+                _make_envelope(version=n, status=STATUS_PROPOSED, author_key=OWNER_B)
+            )
+
+        rows = {row["version"]: row["status"] for row in store.list_versions("abc123")}
+        proposed = [v for v, s in rows.items() if s == STATUS_PROPOSED]
+        # Only the newest two proposals survive.
+        assert sorted(proposed) == [5, 6]
+        # The live head is untouched.
+        assert store.get_head("abc123").version == 1
+
+    def test_zero_cap_disables_pruning(self, backend, tmp_path):
+        store = self._capped_store(backend, tmp_path, 0)
+        store.create(_make_meta(), _make_envelope(version=1))
+        for n in range(2, 6):
+            store.add_version(_make_envelope(version=n, status=STATUS_PROPOSED))
+        proposed = [
+            row["version"]
+            for row in store.list_versions("abc123")
+            if row["status"] == STATUS_PROPOSED
+        ]
+        assert sorted(proposed) == [2, 3, 4, 5]
+
+    def test_pinned_proposal_is_spared(self, backend, tmp_path):
+        store = self._capped_store(backend, tmp_path, 1)
+        store.create(_make_meta(), _make_envelope(version=1))
+        store.add_version(_make_envelope(version=2, status=STATUS_PROPOSED))
+        # Pin v2 (a proposal) as head_version; get_head falls back to live v1
+        # but the pin target must survive pruning.
+        store.save_meta(_make_meta(head_mode=HEAD_PINNED, head_version=2))
+        for n in range(3, 6):
+            store.add_version(_make_envelope(version=n, status=STATUS_PROPOSED))
+        rows = {row["version"]: row["status"] for row in store.list_versions("abc123")}
+        assert 2 in rows  # the pinned proposal was spared
