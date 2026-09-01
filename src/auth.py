@@ -42,17 +42,54 @@ class StackUnreachableError(Exception):
     """Raised when the stack cannot be reached (502 semantics)."""
 
 
+#: ``admin.role`` values a stack has been seen to return. Anything outside
+#: this set is treated as a non-admin role: an unrecognized role is schema
+#: drift or a new, narrower role, and neither is a reason to hand out
+#: destructive authority.
+KNOWN_ADMIN_ROLES = frozenset({"admin", "guest", "readOnly", "share"})
+
+#: The one ``admin.role`` that carries project administration.
+ADMIN_ROLE = "admin"
+
+
 @dataclass(frozen=True)
 class Owner:
     stack_url: str
     project_id: int
     project_name: str
+    # Non-secret, token-level claims from the same verify response
+    # (SEC-075-011). The project identity above answers "which project is
+    # this?"; these answer "what kind of credential is it?", which is what
+    # HUB_DESTRUCTIVE_TOKEN_POLICY needs to decide whether a token may erase
+    # things. They are request-scope only, exactly like the raw token: never
+    # persisted into an envelope or meta record, never logged, never echoed.
+    #
+    # Every one of them defaults to the least-privileged value, and parsing
+    # never raises: a stack that omits a claim, renames it, or answers with a
+    # type nobody expected must degrade a caller to "ordinary token", not fail
+    # the request and not accidentally promote them.
+    token_id: str | None = None
+    is_master_token: bool = False
+    admin_role: str | None = None
+    can_purge_trash: bool = False
+    can_manage_tokens: bool = False
 
     @property
     def key(self) -> str:
         """Stable owner identifier usable as a Storage File tag."""
         host = urlparse(self.stack_url).hostname or "unknown"
         return f"{self.project_id}@{host}"
+
+    @property
+    def is_project_admin(self) -> bool:
+        """True when this credential administers the project as a whole.
+
+        A master token is the project's root credential; a user token whose
+        ``admin.role`` is ``admin`` belongs to a project administrator. Any
+        other role — and any token with no ``admin`` object at all, such as a
+        narrowly scoped machine token — is not an administrator.
+        """
+        return self.is_master_token or self.admin_role == ADMIN_ROLE
 
 
 def resolve_stack(raw: str, extra_stacks: tuple[str, ...] = ()) -> str:
@@ -112,11 +149,73 @@ def verify_token(stack_url: str, token: str, timeout_s: int = 15) -> Owner:
     owner = data.get("owner")
     if not isinstance(owner, dict):
         raise AuthError("Token verify response has no owner project")
+    admin = data.get("admin")
     return Owner(
         stack_url=stack_url,
         project_id=_owner_project_id(owner.get("id")),
         project_name=_owner_project_name(owner.get("name")),
+        # SEC-075-011: the token-level claims. Unlike the project identity
+        # above, none of these can fail the request — see the Owner docstring.
+        token_id=_claim_token_id(data.get("id")),
+        is_master_token=_claim_flag(data.get("isMasterToken")),
+        admin_role=_claim_admin_role(admin),
+        can_purge_trash=_claim_flag(data.get("canPurgeTrash")),
+        can_manage_tokens=_claim_flag(data.get("canManageTokens")),
     )
+
+
+def _claim_flag(raw: object) -> bool:
+    """A boolean capability claim, defaulting to False for anything unusual.
+
+    Only a real JSON ``true`` grants the flag. A stack that spells the value
+    ``"true"``, ``1`` or anything else is answering in a shape this code has
+    not verified, and the safe reading of an unverified shape is "no".
+    """
+    return raw is True
+
+
+def _claim_token_id(raw: object) -> str | None:
+    """The token's own id as a string, or None when absent or unusable.
+
+    Some stacks serialize the id as a number, so an int is normalized to its
+    decimal string — that is the form an operator copies into
+    HUB_DESTRUCTIVE_TOKEN_IDS. The id is an identifier, never a secret, but it
+    is still request-scope: it is matched against the allowlist and dropped.
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        return str(raw)
+    if isinstance(raw, str):
+        value = raw.strip()
+        return value or None
+    return None
+
+
+def _claim_admin_role(raw: object) -> str | None:
+    """The project user's role, or None when the token is not a user token.
+
+    An unknown role string is deliberately *kept* rather than discarded: it is
+    reported as-is so the value is visible, and because only the exact string
+    ``admin`` grants authority (see :attr:`Owner.is_project_admin`), an
+    unrecognized role is inert. Non-``admin`` values, including a role this
+    version has never heard of, are simply not administrators.
+    """
+    if not isinstance(raw, dict):
+        return None
+    role = raw.get("role")
+    if not isinstance(role, str):
+        return None
+    role = role.strip()
+    if not role:
+        return None
+    if role not in KNOWN_ADMIN_ROLES:
+        # Worth knowing about (a stack grew a role this version predates), but
+        # never worth failing on: an unknown role is not ADMIN_ROLE, so it
+        # already grants nothing. The role name is not a secret; the token is
+        # not named here.
+        logger.info("Unrecognized project admin role %r in token verify", role)
+    return role
 
 
 def _owner_project_id(raw: object) -> int:

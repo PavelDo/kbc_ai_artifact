@@ -30,6 +30,14 @@ REQUEST_ENVELOPE_SLACK_BYTES = 1024 * 1024
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 
+#: Accepted values of ``HUB_DESTRUCTIVE_TOKEN_POLICY`` (SEC-075-011), from
+#: widest to narrowest. ``project`` is the historical behaviour and stays the
+#: default so an upgrade never silently locks an operator out of their own
+#: artifacts; the other two are opt-in.
+DESTRUCTIVE_TOKEN_POLICIES = ("project", "admin", "allowlist")
+DEFAULT_DESTRUCTIVE_TOKEN_POLICY = "project"
+
+
 def _int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     return int(raw) if raw else default
@@ -59,6 +67,36 @@ def _cidr_env(name: str) -> tuple[IPNetwork, ...]:
                 f"({entry!r}): {exc}"
             ) from exc
     return tuple(networks)
+
+
+def _destructive_policy_env(name: str) -> str:
+    """Parse the destructive-token policy, or fail fast at startup.
+
+    A typo here is not a small thing: ``HUB_DESTRUCTIVE_TOKEN_POLICY=admn``
+    silently falling back to the default would leave an operator believing
+    they had narrowed destructive authority when they had not. That is exactly
+    the failure mode the control exists to prevent, so an unrecognized value
+    stops the process instead.
+    """
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return DEFAULT_DESTRUCTIVE_TOKEN_POLICY
+    if raw not in DESTRUCTIVE_TOKEN_POLICIES:
+        raise RuntimeError(
+            f"{name}={raw!r} is not a known policy. Use one of: "
+            f"{', '.join(DESTRUCTIVE_TOKEN_POLICIES)}."
+        )
+    return raw
+
+
+def _token_ids_env(name: str) -> tuple[str, ...]:
+    """Parse a comma-separated list of Storage token ids, order-preserving."""
+    seen: list[str] = []
+    for entry in os.environ.get(name, "").split(","):
+        entry = entry.strip()
+        if entry and entry not in seen:
+            seen.append(entry)
+    return tuple(seen)
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -136,6 +174,30 @@ class Settings:
     # everything buckets by the peer address, which is safe but coarse behind
     # a proxy, since every caller then shares the proxy's bucket.
     trusted_proxy_cidrs: tuple[IPNetwork, ...] = ()
+    # Which tokens of the owning project may run a *destructive* route — soft
+    # delete, purge, rotate-link, version delete, webhook key rotation
+    # (env HUB_DESTRUCTIVE_TOKEN_POLICY). SEC-075-011: ownership is a
+    # (stack, project) pair, so before this every token of that project — a
+    # read-only one included — could purge every artifact the project owns.
+    #
+    #   "project"   every token of the owning project (the historical
+    #               behaviour, and the default: an upgrade must not lock an
+    #               operator out of artifacts they already own)
+    #   "admin"     a master token, or one belonging to a project user whose
+    #               admin.role is "admin"
+    #   "allowlist" only tokens whose id appears in
+    #               HUB_DESTRUCTIVE_TOKEN_IDS
+    #
+    # Non-destructive owner routes (update, head pin, promote, settings,
+    # invitations, stats, trash restore) are untouched by every mode.
+    destructive_token_policy: str = DEFAULT_DESTRUCTIVE_TOKEN_POLICY
+    # Storage token ids allowed to run destructive routes under the
+    # "allowlist" policy (env HUB_DESTRUCTIVE_TOKEN_IDS, comma-separated).
+    # A token id is an identifier, not a secret. Ignored in the other modes;
+    # required non-empty in "allowlist", since an empty allowlist would refuse
+    # the owner their own destructive routes with no way to tell that from a
+    # deliberate lockdown.
+    destructive_token_ids: tuple[str, ...] = ()
     # Failed unlock attempts allowed per (artifact, client IP) per UTC hour
     # before the password gate answers 429 (env
     # HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR). Each attempt costs a full PBKDF2
@@ -265,6 +327,18 @@ def load_settings() -> Settings:
         for s in os.environ.get("HUB_EXTRA_STACKS", "").split(",")
         if s.strip()
     )
+    destructive_policy = _destructive_policy_env("HUB_DESTRUCTIVE_TOKEN_POLICY")
+    destructive_token_ids = _token_ids_env("HUB_DESTRUCTIVE_TOKEN_IDS")
+    if destructive_policy == "allowlist" and not destructive_token_ids:
+        # SEC-075-011: an empty allowlist is never what somebody meant. It
+        # would refuse every destructive call, including the operator's own,
+        # and look identical to a deliberate freeze — so it is a startup
+        # error, not a very strict configuration.
+        raise RuntimeError(
+            "HUB_DESTRUCTIVE_TOKEN_POLICY=allowlist requires a non-empty "
+            "HUB_DESTRUCTIVE_TOKEN_IDS (comma-separated Storage token ids). "
+            "Read a token's id from GET {stack}/v2/storage/tokens/verify."
+        )
     return Settings(
         hub_storage_token=os.environ["HUB_STORAGE_TOKEN"],
         hub_stack_url=os.environ["HUB_STACK_URL"].rstrip("/"),
@@ -291,6 +365,8 @@ def load_settings() -> Settings:
         max_proposed_versions=_int_env("HUB_MAX_PROPOSED_VERSIONS", 50),
         trust_forwarded_headers=_bool_env("HUB_TRUST_FORWARDED_HEADERS", False),
         trusted_proxy_cidrs=_cidr_env("HUB_TRUSTED_PROXY_CIDRS"),
+        destructive_token_policy=destructive_policy,
+        destructive_token_ids=destructive_token_ids,
         max_unlock_attempts_per_hour=_int_env(
             "HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR", 30
         ),
