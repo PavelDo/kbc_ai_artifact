@@ -1500,11 +1500,25 @@ def _card(heading: str, text: str) -> str:
     )
 
 
-def landing_page(base_url: str, service_version: str, github_url: str) -> str:
-    """Render the public landing page: what the hub is and how to drive it."""
+def landing_page(
+    base_url: str,
+    service_version: str,
+    github_url: str,
+    demo_url: str | None = None,
+) -> str:
+    """Render the public landing page: what the hub is and how to drive it.
+
+    ``demo_url`` points at a published showcase artifact. It is optional:
+    when it is not configured the link is simply absent.
+    """
     base = html.escape(base_url.rstrip("/"))
     version = html.escape(service_version)
     repo = html.escape(github_url.rstrip("/"))
+    demo_link = (
+        f'<a class="primary" href="{html.escape(demo_url.rstrip("/"))}">See the demo</a>'
+        if demo_url
+        else ""
+    )
 
     hero_term = _term(
         "PUBLISH → PUBLIC URL",
@@ -1648,6 +1662,7 @@ Keboola Storage API token, on any stack, is the only credential you need.</p>
 </div>
 {hero_term}
 <div class="hero-links">
+{demo_link}
 <a class="primary" href="{base}/admin">Admin studio</a>
 <a href="{repo}">GitHub repo</a>
 <a href="{base}/docs">/docs</a>

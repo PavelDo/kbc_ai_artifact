@@ -146,8 +146,11 @@ versions with a note explaining the change; anyone can fetch `/meta`,
 adding their own point, so the discussion converges instead of repeating
 itself. The owner reviews diffs and threads at `/admin` and `/review`,
 promotes or rejects proposals, and — once the document is settled — marks it
-`final`, freezing further changes for everyone. At that point `/export/vault`
-turns the whole history (every version, every thread, every decision) into a
+`final`, freezing further changes for everyone — which every describing
+payload reports as `document_status: "final"` and
+`contributions_frozen: true`, so a contributor can check before it writes.
+At that point `/export/vault` turns the whole history (every version,
+every thread, every decision) into a
 ready-to-open Obsidian vault: a permanent, browsable record of how the
 document got to where it is, with nothing to reconstruct from memory.
 
@@ -168,12 +171,12 @@ Public (no auth):
 | GET | `/a/{id}` | Head version rendered in a sandboxed iframe, or the password unlock form |
 | POST | `/a/{id}/unlock` | Password form target; sets a signed unlock cookie |
 | GET | `/a/{id}/v/{n}` | One specific version (owner/author only when proposed) |
-| GET | `/a/{id}/versions` | Version history JSON, proposed rows flagged `outdated`; `?format=html` renders a picker page |
+| GET | `/a/{id}/versions` | Version history JSON (each row's `status` is that version's `live`/`proposed`), plus the document-level `document_status` / `contributions_frozen` / `accept_versions_mode`; proposed rows flagged `outdated`; `?format=html` renders a picker page |
 | GET | `/a/{id}/diff/{a}..{b}` | Diff two versions; `?format=html\|unified\|json\|visual` |
 | GET | `/a/{id}/raw` | Raw built HTML, byte-exact, no iframe (password via `X-Artifact-Password` if protected) |
 | GET | `/a/{id}/source` | Original submitted source (markdown or html) |
-| GET | `/a/{id}/meta` | Public metadata JSON (no owner details) |
-| GET | `/a/{id}/comments` | Every inline comment thread (open and resolved) as JSON |
+| GET | `/a/{id}/meta` | Public metadata JSON (no owner details); `status` is the head **version's** (`live`/`proposed`), `document_status` is the **document's** (`draft`/`final`), with `contributions_frozen` and `accept_versions_mode` |
+| GET | `/a/{id}/comments` | Every inline comment thread (open and resolved) as JSON, plus `comments_mode` and the document status as `document_status` (also as the legacy `status`, which on this endpoint has always meant the document) |
 | GET | `/a/{id}/guest` | Resolve an `X-Artifact-Guest` credential to its display name |
 | GET | `/a/{id}/review` | Browser review UI: select text to comment, sandboxed artifact iframe; also the guest entry point via a `#invite=` fragment |
 | GET | `/a/{id}/export/markdown` | Head version's Markdown source (or HTML when it has none) |
@@ -187,7 +190,7 @@ Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 |---|---|---|
 | POST | `/api/artifacts` | Publish `{html \| markdown \| git_url[, git_ref, git_path, git_token, git_username], title?, password?, accept_versions?}` → `{id, version, head_version, url, raw_url, meta_url, versions_url, ...}` |
 | PUT | `/api/artifacts/{id}` | Add a live version and/or change `password` / `clear_password` / `accept_versions_mode` / `contributors` / `comments_mode` / `status` / `webhooks` (owner project only) |
-| GET | `/api/artifacts` | List the caller's project's own artifacts (trashed ones included, with `webhooks_count`) |
+| GET | `/api/artifacts` | List the caller's project's own artifacts (trashed ones included, with `webhooks_count`); each row's `status` is the document's, mirrored as `document_status` with a derived `contributions_frozen` |
 | DELETE | `/api/artifacts/{id}` | **Soft delete**: move to the trash — public link dies, everything is kept and restorable (owner project only) |
 | POST | `/api/artifacts/{id}/restore` | Undo the soft delete: back on the same share id, same status as before (owner project only) |
 | DELETE | `/api/artifacts/{id}/purge` | **Permanent** delete: erase every version, comment thread and the meta record — no undo (owner project only) |

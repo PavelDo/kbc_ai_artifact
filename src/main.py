@@ -98,6 +98,7 @@ from src.store import (
     ARTIFACT_DRAFT,
     ARTIFACT_FINAL,
     ARTIFACT_SETTABLE_STATUSES,
+    ARTIFACT_TRASHED,
     COMMENTS_MODES,
     HEAD_LATEST,
     HEAD_PINNED,
@@ -236,6 +237,26 @@ PASSWORD_GATE_NOTE = (
     "which sets a signed cookie scoped to the artifact path and to the "
     "current password. Failed attempts are rate-limited per artifact and "
     "client address, so a wrong password may answer 429 instead of 401."
+)
+
+#: Paragraph appended to every public route that describes an artifact.
+#:
+#: An artifact carries two independent notions of "status" and they are easy to
+#: confuse, so every payload that names one says which it is: a *version's*
+#: status is 'live' or 'proposed', while the *document's* status is 'draft' or
+#: 'final'. The document status is always reported under the unambiguous
+#: 'document_status' key, on every endpoint.
+STATUS_VS_DOCUMENT_STATUS_NOTE = (
+    "**Two kinds of status.** A *version* has a status of 'live' or "
+    "'proposed' (whether that version is served or is still a proposal); the "
+    "*document* has a status of 'draft' or 'final' ('final' freezes new "
+    "versions and new comments). The document's status is always reported "
+    "under 'document_status', so it can be read the same way on every "
+    "endpoint, and 'contributions_frozen' is the derived answer to \"may I "
+    "still contribute?\" — true when the document is final (or trashed). "
+    "'accept_versions'/'accept_versions_mode' remain the owner's raw setting "
+    "and are not rewritten by the freeze, so check 'contributions_frozen' "
+    "before submitting a version or a comment."
 )
 
 #: Paragraph appended to every comment-write route: the guest alternative.
@@ -2514,7 +2535,12 @@ def _artifact_response(
 def landing(request: Request) -> HTMLResponse:
     """Human-facing documentation page."""
     return HTMLResponse(
-        landing_page(base_url(request), SERVICE_VERSION, GITHUB_REPO_URL)
+        landing_page(
+            base_url(request),
+            SERVICE_VERSION,
+            GITHUB_REPO_URL,
+            settings.demo_url,
+        )
     )
 
 
@@ -3831,10 +3857,12 @@ def read_source(
     description=(
         "JSON metadata of the artifact and its head version: title, source "
         "type, timestamps, size, head version, total and proposed version "
-        "counts, the 'protected' and 'accept_versions' flags, and every "
-        "public URL. Deliberately carries no owner identity and no password "
-        "record. Unlike the content endpoints this is readable even when the "
-        "artifact is password-protected — it is metadata only."
+        "counts, the 'protected', 'accept_versions' and "
+        "'accept_versions_mode' settings, the derived 'contributions_frozen' "
+        "flag, and every public URL. Deliberately carries no owner identity "
+        "and no password record. Unlike the content endpoints this is "
+        "readable even when the artifact is password-protected — it is "
+        "metadata only.\n\n" + STATUS_VS_DOCUMENT_STATUS_NOTE
     ),
     responses={
         200: {"description": "The artifact's public metadata."},
@@ -3867,7 +3895,16 @@ def read_meta(
             # capability-URL holder is not entitled to the internal id.
             "id": meta.share_id,
             "protected": bool(meta.password),
+            # The owner's raw contribution setting, kept raw: it is what the
+            # owner configured, not what is currently possible.
             "accept_versions": meta.accept_versions,
+            "accept_versions_mode": meta.accept_versions_mode,
+            # ... while these two describe the *document*. The spread above
+            # carries the head *version's* "status" ('live'/'proposed'), which
+            # is a different axis entirely - see
+            # STATUS_VS_DOCUMENT_STATUS_NOTE.
+            "document_status": meta.status,
+            "contributions_frozen": meta.is_frozen(),
             "created_at": meta.created_at,
             "updated_at": meta.updated_at,
             "head_version": head.version,
@@ -3945,8 +3982,12 @@ def read_version(
     description=(
         "Lists every version (live and proposed) newest first, with its "
         "number, title, status, author project, note, size, source type and "
-        "creation time, plus the current head version and the artifact's "
-        "'protected' and 'accept_versions' flags.\n\n"
+        "creation time, plus the current head version, the artifact's "
+        "'protected', 'accept_versions' and 'accept_versions_mode' settings, "
+        "its 'document_status' and the derived 'contributions_frozen' "
+        "flag.\n\n" + STATUS_VS_DOCUMENT_STATUS_NOTE + "\n\n"
+        "Each row's own 'status' is therefore the version's ('live' or "
+        "'proposed'), never the document's.\n\n"
         "Proposal *metadata* is public to capability-URL holders; proposal "
         "*content* is not — fetching it still requires being the owner or the "
         "author (see GET /a/{id}/v/{n}).\n\n"
@@ -4028,7 +4069,13 @@ def read_versions(
         {
             "id": meta.share_id,
             "head_version": head_version,
+            # Raw owner setting (see /a/{id}/meta) ...
             "accept_versions": meta.accept_versions,
+            "accept_versions_mode": meta.accept_versions_mode,
+            # ... and the document-level facts. Each row below carries its own
+            # "status", which is the *version's* ('live'/'proposed').
+            "document_status": meta.status,
+            "contributions_frozen": meta.is_frozen(),
             "protected": bool(meta.password),
             "versions": [
                 {
@@ -4220,21 +4267,28 @@ def _visual_diff(request: Request, older: Envelope, newer: Envelope) -> Response
     summary="Inline comment threads",
     description=(
         "Every inline comment thread of this artifact, oldest first, together "
-        "with the artifact's current 'comments_mode' and draft/final "
-        "'status'. Each thread carries its TextQuoteSelector (the quote plus "
+        "with the artifact's current 'comments_mode' and its draft/final "
+        "document status — reported both as 'document_status' (the key every "
+        "other endpoint uses) and, unchanged for backwards compatibility, as "
+        "'status'. On this endpoint 'status' has always meant the "
+        "*document's* status, not a version's; both keys carry the same "
+        "value. Each thread carries its TextQuoteSelector (the quote plus "
         "a little surrounding context), the comment body, its replies, the "
         "resolved flag and the *project identity* of everyone who spoke — "
         "project id, project name and stack hostname only, never a full stack "
         "URL and never an internal owner key.\n\n"
         "Threads are public to capability-URL holders; writing one needs a "
         "Storage token (POST /api/artifacts/{id}/comments).\n\n"
+        + STATUS_VS_DOCUMENT_STATUS_NOTE
+        + "\n\n"
         + PASSWORD_GATE_NOTE
     ),
     responses={
         200: {
             "description": (
-                "JSON with 'id', 'comments_mode', 'status' and the 'threads' "
-                "array (possibly empty)."
+                "JSON with 'id', 'comments_mode', 'document_status' (also "
+                "echoed as the legacy 'status') and the 'threads' array "
+                "(possibly empty)."
             )
         },
         401: {
@@ -4264,7 +4318,12 @@ def read_comments(
         {
             "id": meta.share_id,
             "comments_mode": meta.comments_mode,
+            # "status" here has always meant the *document's* status, unlike
+            # every other public payload where it is a version's. It stays
+            # exactly as it is for existing callers (the review page reads
+            # it), and "document_status" is the name to use going forward.
             "status": meta.status,
+            "document_status": meta.status,
             "threads": [thread.public_dict() for thread in threads],
         }
     )
@@ -4845,10 +4904,14 @@ def update_artifact(
         "listing depends only on the credentials, never on a query. Each row "
         "carries the internal 'id' and the public 'share_id', the title, "
         "timestamps, 'protected' and 'accept_versions' flags, head version, "
-        "total version count, pending 'proposed_count', the artifact 'status' "
-        "with 'trashed_at', a 'webhooks_count' (never the URLs themselves), "
-        "and every public URL built from the share id. Newest 'updated_at' "
-        "first.\n\n"
+        "total version count, pending 'proposed_count', the document status "
+        "(as 'document_status', and unchanged as the original 'status') with "
+        "'trashed_at' and the derived 'contributions_frozen' flag, a "
+        "'webhooks_count' (never the URLs themselves), and every public URL "
+        "built from the share id. Newest 'updated_at' first.\n\n"
+        "Every row's 'status'/'document_status' here is the *document's* "
+        "('draft', 'final' or 'trashed'), not a version's ('live' or "
+        "'proposed').\n\n"
         "Trashed artifacts are listed too, with status 'trashed' and a "
         "'trashed_at' timestamp: this is the owner's own view, so it is also "
         "their trash can. Their public URLs answer 404 until they are "
@@ -4887,6 +4950,12 @@ def list_artifacts(
         artifacts.append(
             {
                 **row,
+                # The row's "status" from the store is already the *document's*
+                # status; mirror it under the name every other endpoint uses so
+                # a consumer can read one key everywhere. "status" is kept.
+                "document_status": row.get("status"),
+                "contributions_frozen": row.get("status")
+                in (ARTIFACT_FINAL, ARTIFACT_TRASHED),
                 # A count, never the URLs: a webhook URL is a capability (a
                 # Slack hook's path *is* its credential), so the only response
                 # that echoes them is the owner PUT that set them.

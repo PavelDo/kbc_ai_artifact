@@ -469,6 +469,20 @@ def test_openapi_documents_the_versions_format_query_parameter(api: Api) -> None
     assert "html" in parameter["description"]
 
 
+def test_openapi_distinguishes_version_status_from_document_status(api: Api) -> None:
+    """/docs must say which "status" is which on every artifact-describing route."""
+    schema = api.client.get("/openapi.json").json()
+    for path in (
+        "/a/{artifact_id}/meta",
+        "/a/{artifact_id}/versions",
+        "/a/{artifact_id}/comments",
+        "/api/artifacts",
+    ):
+        description = schema["paths"][path]["get"]["description"]
+        assert "document_status" in description, path
+        assert "proposed" in description, path
+
+
 def test_openapi_documents_the_diff_format_query_parameter(api: Api) -> None:
     schema = api.client.get("/openapi.json").json()
     parameter = _parameter(schema, "/a/{artifact_id}/diff/{spec}", "get", "format")
@@ -2298,6 +2312,94 @@ def test_unknown_policy_values_are_422(api: Api) -> None:
     assert _policy(api, artifact_id, status="archived").status_code == 422
     assert _policy(api, artifact_id, comments_mode="sometimes").status_code == 422
     assert _policy(api, artifact_id, accept_versions_mode="maybe").status_code == 422
+
+
+def test_document_status_is_reported_on_every_public_payload(api: Api) -> None:
+    """A draft artifact says so identically on /meta, /versions and /comments.
+
+    The two notions of "status" used to be indistinguishable from the outside:
+    /meta's 'status' is the head *version's* ('live'), while a document is
+    'draft' or 'final'. 'document_status' is the one name that means the
+    document everywhere.
+    """
+    artifact_id = _publish_markdown(api, "# Draft", accept_versions=True)
+
+    meta = api.client.get(f"/a/{artifact_id}/meta").json()
+    assert meta["document_status"] == "draft"
+    assert meta["contributions_frozen"] is False
+    assert meta["accept_versions"] is True
+    assert meta["accept_versions_mode"] == "anyone"
+    # Unchanged meaning: /meta's own 'status' is still the head VERSION's.
+    assert meta["status"] == "live"
+
+    versions = api.client.get(f"/a/{artifact_id}/versions").json()
+    assert versions["document_status"] == "draft"
+    assert versions["contributions_frozen"] is False
+    assert versions["accept_versions"] is True
+    assert versions["accept_versions_mode"] == "anyone"
+    # Each row's 'status' remains the version's, not the document's.
+    assert [row["status"] for row in versions["versions"]] == ["live"]
+
+    comments = api.client.get(f"/a/{artifact_id}/comments").json()
+    assert comments["document_status"] == "draft"
+    # The pre-existing key keeps its (document) meaning, byte for byte.
+    assert comments["status"] == "draft"
+
+
+def test_finalised_artifact_reports_frozen_contributions_everywhere(api: Api) -> None:
+    """Once final, every payload says 'final' and 'contributions_frozen'.
+
+    'accept_versions' deliberately stays true — it is the owner's raw setting,
+    not the effective state — which is exactly why the derived flag exists.
+    """
+    artifact_id = _publish_markdown(api, "# Draft", accept_versions=True)
+    # A pending proposal keeps the head version 'live', so the version-level
+    # and document-level statuses genuinely differ below.
+    proposal = _submit_version(
+        api, artifact_id, "# Proposed", headers=OTHER_AUTH_HEADERS
+    )
+    assert proposal.status_code == 201, proposal.text
+    assert proposal.json()["status"] == "proposed"
+
+    assert _policy(api, artifact_id, status="final").status_code == 200
+
+    meta = api.client.get(f"/a/{artifact_id}/meta").json()
+    assert meta["document_status"] == "final"
+    assert meta["contributions_frozen"] is True
+    assert meta["accept_versions"] is True
+    assert meta["accept_versions_mode"] == "anyone"
+    # The head VERSION is still live: 'status' did not change meaning.
+    assert meta["status"] == "live"
+    assert meta["proposed_count"] == 1
+
+    versions = api.client.get(f"/a/{artifact_id}/versions").json()
+    assert versions["document_status"] == "final"
+    assert versions["contributions_frozen"] is True
+    assert versions["accept_versions"] is True
+    assert versions["accept_versions_mode"] == "anyone"
+    assert sorted(row["status"] for row in versions["versions"]) == [
+        "live",
+        "proposed",
+    ]
+
+    comments = api.client.get(f"/a/{artifact_id}/comments").json()
+    assert comments["document_status"] == "final"
+    assert comments["status"] == "final"
+
+    # And the freeze the flag advertises is real.
+    assert _submit_version(api, artifact_id, "# Frozen").status_code == 409
+    assert _comment(api, artifact_id, exact="Draft").status_code == 409
+
+
+def test_owner_listing_carries_the_document_status_under_both_names(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Draft")
+    assert _policy(api, artifact_id, status="final").status_code == 200
+
+    rows = api.client.get("/api/artifacts", headers=AUTH_HEADERS).json()["artifacts"]
+    row = next(item for item in rows if item["id"] == artifact_id)
+    assert row["status"] == "final"
+    assert row["document_status"] == "final"
+    assert row["contributions_frozen"] is True
 
 
 # --------------------------------------------------------------------------
@@ -4994,3 +5096,21 @@ def test_context_documents_guests_and_the_visual_diff(api: Api) -> None:
         api.settings.max_invitations_per_artifact
     )
     assert "artifact.trashed" in body["webhooks"]["events"]
+
+
+class TestDemoLink:
+    """The landing page links a showcase artifact only when one is configured."""
+
+    def test_absent_when_not_configured(self, api: Api) -> None:
+        body = api.client.get("/").text
+        assert "See the demo" not in body
+
+    def test_rendered_when_configured(self, api: Api, monkeypatch) -> None:
+        monkeypatch.setattr(
+            main,
+            "settings",
+            dataclasses.replace(api.settings, demo_url="https://hub.example/a/demo"),
+        )
+        body = api.client.get("/").text
+        assert "See the demo" in body
+        assert "https://hub.example/a/demo" in body
