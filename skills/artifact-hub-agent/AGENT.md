@@ -580,6 +580,27 @@ receiver's feed. Webhook URLs
 are themselves credentials (a Slack hook's path is its only secret): `GET
 /api/artifacts` reports a `webhooks_count`, never the URLs — only the `PUT`
 response that set them ever echoes them back.
+
+**Rotating a receiver's key.** `POST
+/api/artifacts/{id}/webhooks/{receiver_id}/rotate-key` mints a fresh,
+independent key for one receiver without touching its URL —
+`receiver_id` is the `id` (or `rotate_key_url`) each entry of `GET
+.../webhooks` reports:
+
+```bash
+hub -X POST "$HUB/api/artifacts/$ID/webhooks/$RECEIVER_ID/rotate-key"
+```
+
+For `webhook_key_overlap_s` seconds afterwards (default 600, config
+`HUB_WEBHOOK_KEY_OVERLAP_S`), deliveries to that receiver carry *both*
+signatures — the new key in `X-Hub-Signature-256` as always, and the
+previous key in `X-Hub-Signature-256-Previous`. Update your receiver's
+configured key from the rotate response at your own pace within that window
+(checking only `X-Hub-Signature-256` needs no code change and is already
+protected); past the window `X-Hub-Signature-256-Previous` is no longer sent
+and the old key verifies nothing. Both the listing and the rotate response
+carry `Cache-Control: no-store` — never cache either one.
+
 Delivery is best-effort and in-memory (a hub restart drops what was pending,
 retried up to `HUB_WEBHOOK_MAX_ATTEMPTS` times) — treat it as a nudge to go
 check `/versions` or `/comments`, never as the system of record.

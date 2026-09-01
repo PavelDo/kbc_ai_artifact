@@ -272,6 +272,7 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("POST", "/api/artifacts/{id}/restore"),
         ("DELETE", "/api/artifacts/{id}/purge"),
         ("GET", "/api/artifacts/{id}/webhooks"),
+        ("POST", "/api/artifacts/{id}/webhooks/{receiver_id}/rotate-key"),
         ("POST", "/api/artifacts/{id}/rotate-link"),
         ("GET", "/api/artifacts/{id}/stats"),
         ("POST", "/api/artifacts/{id}/invitations"),
@@ -5513,7 +5514,16 @@ def test_guest_cannot_use_the_management_api(api: Api) -> None:
     assert row["status"] == "draft"
 
 
-def test_guest_comments_emit_a_webhook_naming_the_guest(api: Api) -> None:
+def test_guest_comments_emit_a_webhook_naming_the_guest(api: Api, monkeypatch) -> None:
+    # Registering "https://example.com/hook" goes through the real
+    # validate_webhook_url -> DNS resolution path (this test does not use the
+    # `hooked` fixture, which stubs that out for its own "hooks.test" host).
+    # Injecting a public answer here keeps the whole suite runnable with no
+    # network/public DNS available -- see the review's "tests must not depend
+    # on public DNS" finding.
+    monkeypatch.setattr(
+        "src.webhooks._resolve_host_ips", lambda _hostname: ["93.184.216.34"]
+    )
     artifact_id = _publish_markdown(api, "# Title\n\nBody text here.")
     assert _policy(
         api, artifact_id, webhooks=["https://example.com/hook"]

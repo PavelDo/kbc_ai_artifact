@@ -76,7 +76,10 @@ content, source, or metadata over a small JSON API.
 - **Outbound webhooks**: register up to `HUB_MAX_WEBHOOKS_PER_ARTIFACT` https
   URLs per artifact and get a signed (`X-Hub-Signature-256`) JSON POST — or a
   formatted Slack message for a `hooks.slack.com` URL — on every version,
-  comment, finalize, trash/restore and link-rotation event
+  comment, finalize, trash/restore and link-rotation event. Each receiver's
+  key can be rotated independently of its URL (`POST .../webhooks/{receiver_id}
+  /rotate-key`), with a short signed-overlap grace period so an in-flight
+  delivery still verifies
 - **Guest invitations**: `POST /api/artifacts/{id}/invitations` mints a named,
   revocable capability that lets one person with no Keboola account comment
   through the review UI, secret carried in the URL fragment and never logged
@@ -214,6 +217,8 @@ Authenticated (`X-StorageApi-Token` + `X-Storage-Stack` headers):
 | DELETE | `/api/artifacts/{id}` | **Soft delete**: move to the trash — public link dies, everything is kept and restorable (owner project only) |
 | POST | `/api/artifacts/{id}/restore` | Undo the soft delete: back on the same share id, same status as before (owner project only) |
 | DELETE | `/api/artifacts/{id}/purge` | **Permanent** delete: erase every version, comment thread and the meta record — no undo (owner project only) |
+| GET | `/api/artifacts/{id}/webhooks` | List each registered receiver with the key its deliveries are signed with (owner project only) |
+| POST | `/api/artifacts/{id}/webhooks/{receiver_id}/rotate-key` | Mint a fresh signing key for one receiver without touching its URL; the previous key still verifies for `webhook_key_overlap_s` seconds (owner project only) |
 | POST | `/api/artifacts/{id}/rotate-link` | Mint a fresh share id; the old link (and the bare internal id) stop resolving immediately (owner project only) |
 | GET | `/api/artifacts/{id}/stats` | View counts: `total`, `by_day` (last 30 UTC days), `by_kind` (owner project only) |
 | POST | `/api/artifacts/{id}/invitations` | Invite a guest to comment `{name}` → one-time `review_url` with the secret in the URL fragment (owner project only) |
@@ -435,6 +440,7 @@ are missing. Everything else has a documented default, overridable via env.
 | `HUB_WEBHOOK_MAX_ATTEMPTS` | `3` | Total POST attempts per (URL, event) before giving up; retries back off `2**n` seconds, capped at 60 |
 | `HUB_WEBHOOK_QUEUE_MAX` | `1000` | Queued-but-undelivered webhook deliveries kept at once; past this the newest is dropped with a log line rather than blocking the request that produced it |
 | `HUB_MAX_WEBHOOKS_PER_ARTIFACT` | `5` | How many webhook URLs one artifact may register |
+| `HUB_WEBHOOK_KEY_OVERLAP_S` | `600` | Seconds a receiver's previous signing key stays valid after `POST .../webhooks/{receiver_id}/rotate-key` (carried in `X-Hub-Signature-256-Previous` alongside the new key's `X-Hub-Signature-256`); `0` disables the grace period |
 | `HUB_MAX_INVITATIONS_PER_ARTIFACT` | `20` | How many live guest invitations one artifact may hold at once (revoked ones are reclaimed automatically to make room) |
 
 ## Deployment to Keboola
@@ -560,9 +566,29 @@ treated as equally sensitive: they are only ever echoed back in the `PUT`
 response that set them, never in `GET /api/artifacts` (which reports a count
 instead), and every delivery is HMAC-signed (`X-Hub-Signature-256`) so a
 receiver can reject a forged POST. Each receiver is signed with its **own**
-key, bound to the artifact and the receiver URL, so a receiver cannot forge a
-delivery for a different receiver or a different document; owners read those
-keys from `GET /api/artifacts/{id}/webhooks`.
+key, bound to the artifact, the receiver URL and a rotatable epoch, so a
+receiver cannot forge a delivery for a different receiver or a different
+document; owners read those keys from `GET /api/artifacts/{id}/webhooks`.
+Both that listing and `POST .../webhooks/{receiver_id}/rotate-key` carry
+`Cache-Control: no-store` and `Pragma: no-cache`, since the response body is
+a credential and must never be served from a shared or browser cache.
+
+**Rotating a receiver's key (SEC-100-006).** Before rotation, a receiver's
+key was derived purely from `(artifact_id, url)`: re-registering the same URL
+always reproduced the same key, so a leaked key could only be invalidated by
+changing the URL (revoking the receiver) or the hub's own master secret
+(rotating every receiver on every artifact at once). `POST
+/api/artifacts/{id}/webhooks/{receiver_id}/rotate-key` mints an independent,
+random key epoch for one receiver without touching its URL or any other
+receiver. For `HUB_WEBHOOK_KEY_OVERLAP_S` seconds afterwards (default 600),
+deliveries to that receiver carry both the new signature
+(`X-Hub-Signature-256`) and the previous one
+(`X-Hub-Signature-256-Previous`), so a receiver that has not yet picked up
+the new key from the rotate response keeps verifying deliveries; past the
+window only the new signature is sent and the old key verifies nothing. A
+meta record persisted before this field existed has no epoch on file at all,
+which is read exactly like a receiver that has simply never been rotated —
+no migration step, no re-registration.
 
 ## Contributing
 
