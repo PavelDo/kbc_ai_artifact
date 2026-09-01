@@ -2109,7 +2109,7 @@ html { background-image: none; }
 .rv-top .spacer { flex: 1; }
 
 .rv-body { flex: 1; display: flex; min-height: 0; }
-.rv-doc { flex: 1; min-width: 0; background: #ffffff; }
+.rv-doc { flex: 1; min-width: 0; background: #ffffff; position: relative; }
 .rv-doc iframe { width: 100%; height: 100%; border: 0; background: #ffffff; }
 
 .rv-side { width: 25rem; max-width: 45vw; flex: none; overflow-y: auto;
@@ -2150,6 +2150,30 @@ textarea.rv-field { min-height: 5rem; resize: vertical; }
   border-left: 2px solid var(--line); }
 .rv-replies li { margin-bottom: .35rem; }
 .rv-orphan { font-family: var(--font-mono); font-size: .7rem; color: var(--proposed); }
+
+/* Unlock panel, shown when a read or a write is refused because the artifact
+   is password-protected. It borrows the standalone unlock page's shape (rule
+   label + card + mono label) so the two gates read as the same thing in two
+   places, and it is laid *over* the document pane rather than replacing it in
+   the flow: opaque, so it reads as taking the pane's place, while a document
+   that had already loaded (a write can be refused while the reads still pass
+   on a cookie) is still underneath when the password lands. */
+.rv-lock { position: absolute; inset: 0; z-index: 2; overflow-y: auto;
+  display: flex; align-items: center; justify-content: center;
+  padding: 1.25rem; background: var(--paper); }
+.rv-lock-card { width: 100%; max-width: 26rem; }
+.rv-lock .rule { font-family: var(--font-mono); font-size: .72rem;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--muted);
+  margin-bottom: .6rem; }
+.rv-lock .rule::before { content: "//"; color: var(--accent); font-weight: 700;
+  margin-right: .5rem; }
+.rv-lock .card { padding: 1.35rem; }
+.rv-lock h1 { font-size: 1.1rem; margin: 0 0 .4rem; }
+.rv-lock p { font-size: .86rem; line-height: 1.6; color: var(--muted);
+  margin: 0 0 .7rem; }
+.rv-lock label { display: block; font-family: var(--font-mono); font-size: .68rem;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
+  margin: .7rem 0 .3rem; }
 """
 
 #: The script injected into the artifact HTML before it is loaded into the
@@ -2485,6 +2509,21 @@ _REVIEW_JS = """
      only ever travels in the X-Artifact-Guest request header, so it stays out
      of access logs, Referer headers and the hub's own routing. */
   var guest = null;
+  /* True while the invitation could not be checked *because the document is
+     locked* — /a/{id}/guest sits behind the same reader gate. The credential
+     is kept and re-checked after unlocking, so a good invitation is never
+     reported dead. */
+  var guestPending = false;
+
+  /* The reader password, once this tab unlocked the artifact. Memory only:
+     never sessionStorage, never a URL, never logged. It exists because a
+     comment *write* goes to /api/..., which the unlock cookie (path-scoped to
+     /a/{id}) never reaches — those requests carry the password header
+     instead. */
+  var readerPassword = null;
+  var locked = false;
+  /* A write that was refused for the password, replayed after unlocking. */
+  var pendingWrite = null;
 
   var threads = [];
   var headVersion = null;
@@ -2559,7 +2598,16 @@ _REVIEW_JS = """
          answers 401 here, before anybody writes a comment that would fail. */
       var data = JSON.parse(await read("/guest", true));
       guest.name = data.name || "";
+      guestPending = false;
     } catch (err) {
+      if (isLockError(err)) {
+        /* Locked document, not a dead invitation: /a/{id}/guest is behind the
+           reader gate too. Hold on to the credential and ask again once the
+           password lands. */
+        guestPending = true;
+        renderIdentity();
+        return;
+      }
       guest = null;
       setError($("rv-signin-error"),
         "That invitation link is not valid any more: " + err.message);
@@ -2621,6 +2669,10 @@ _REVIEW_JS = """
       out["X-Artifact-Guest"] = guest.credential;
     }
     if (withBody) { out["Content-Type"] = "application/json"; }
+    /* Comment writes live under /api/, which the unlock cookie is not scoped
+       to, so an unlocked tab re-states the password on them the documented
+       way. Absent on an unprotected artifact, where it is never obtained. */
+    if (readerPassword) { out["X-Artifact-Password"] = readerPassword; }
     return out;
   }
 
@@ -2636,6 +2688,23 @@ _REVIEW_JS = """
     return "HTTP " + status;
   }
 
+  /* Errors carry the HTTP status and parsed payload, because the reader gate
+     is told apart from every other failure by exactly those two. */
+  function apiError(status, data, text) {
+    var err = new Error(apiMessage(status, data, text));
+    err.status = status;
+    err.payload = data;
+    return err;
+  }
+
+  /* The gate's own 401 body: {"error": "password required"}. A bad token or a
+     revoked invitation is a different 401 and keeps its own message. */
+  function isLockError(err) {
+    if (!err || err.status !== 401) { return false; }
+    var payload = err.payload || {};
+    return payload.error === "password required";
+  }
+
   async function api(path, options) {
     var opts = options || {};
     var hasBody = opts.body !== undefined;
@@ -2647,7 +2716,7 @@ _REVIEW_JS = """
     var text = await resp.text();
     var data = null;
     try { data = text ? JSON.parse(text) : null; } catch (err) { data = null; }
-    if (!resp.ok) { throw new Error(apiMessage(resp.status, data, text)); }
+    if (!resp.ok) { throw apiError(resp.status, data, text); }
     return data;
   }
 
@@ -2665,9 +2734,120 @@ _REVIEW_JS = """
     if (!resp.ok) {
       var data = null;
       try { data = JSON.parse(text); } catch (err) { data = null; }
-      throw new Error(apiMessage(resp.status, data, text));
+      throw apiError(resp.status, data, text);
     }
     return text;
+  }
+
+  /* ----------------------------------------------------------------- lock */
+
+  /* A password-protected artifact refuses /raw, /versions, /comments and the
+     comment writes alike; this page has to be able to ask for that password
+     itself, because a visitor who arrived on an invitation link has never
+     seen the standalone unlock form and has no other way in. An invitation
+     grants a voice, not a key — that stays true, the password is simply
+     asked for here as well. */
+
+  /* Confirmed against /a/{id}/meta, which is public even while the document
+     is protected and reports the flag itself. Fetched once, and only after a
+     read has actually been refused, so an unprotected artifact never issues
+     this request at all. */
+  var lockCheck = null;
+
+  function protectedArtifact() {
+    if (!lockCheck) {
+      lockCheck = fetch(PATH + "/meta", { credentials: "same-origin" })
+        .then(function (resp) { return resp.ok ? resp.json() : null; })
+        .then(function (data) { return !!(data && data.protected); })
+        .catch(function () { return false; });
+    }
+    return lockCheck;
+  }
+
+  function showLock() {
+    locked = true;
+    show($("rv-lock-guest"), !!guest);
+    show($("rv-lock"), true);
+    show($("rv-lock-side"), true);
+    setError($("rv-error"), "");
+    $("rv-head").textContent = "locked";
+    var field = $("rv-lock-password");
+    if (field) { field.focus(); }
+  }
+
+  /* True when this failure was the reader gate and the panel now has the
+     screen; false when it was anything else and the caller should report it
+     the way it always did. */
+  async function lockDown(err) {
+    if (!isLockError(err)) { return false; }
+    if (locked) { return true; }
+    if (!(await protectedArtifact())) { return false; }
+    showLock();
+    return true;
+  }
+
+  function readFailed(err) {
+    lockDown(err).then(function (handled) {
+      if (!handled) { setError($("rv-error"), err.message); }
+    });
+  }
+
+  function unlockMessage(status) {
+    if (status === 429) {
+      return "Too many attempts \\u2014 wait an hour and try again.";
+    }
+    return "That password was not accepted.";
+  }
+
+  async function unlock(value) {
+    /* Form-encoded to the same endpoint the standalone form posts to, with
+       the field name it reads. The password travels in this body and nowhere
+       else. credentials:"same-origin" so the path-scoped cookie the 303 sets
+       is kept and the reads below ride on it. */
+    var resp = await fetch(PATH + "/unlock", {
+      method: "POST",
+      credentials: "same-origin",
+      redirect: "manual",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "password=" + encodeURIComponent(value)
+    });
+    if (resp.status === 401 || resp.status === 429) {
+      throw new Error(unlockMessage(resp.status));
+    }
+    /* Success answers 303, whose body fetch cannot read across a document
+       boundary, so the proof is a protected read that now goes through. */
+    try {
+      await read("/comments");
+    } catch (err) {
+      if (err.status === 401 || err.status === 429) {
+        throw new Error(unlockMessage(err.status));
+      }
+      throw err;
+    }
+    readerPassword = value;
+    locked = false;
+    show($("rv-lock"), false);
+    show($("rv-lock-side"), false);
+    $("rv-lock-password").value = "";
+    setError($("rv-lock-error"), "");
+    if (guest && guestPending) { await checkInvite(); }
+    await loadDocument();
+    await loadVersions();
+    await loadThreads();
+    var retry = pendingWrite;
+    pendingWrite = null;
+    if (retry) { await retry(); }
+  }
+
+  /* Shared by every write path: a comment refused for the password puts the
+     panel on screen and parks the write, instead of printing "password
+     required" at somebody who has nowhere to type one. The composer and the
+     reply box keep their text, so nothing typed is lost. */
+  function writeFailed(err, errBox, message) {
+    return lockDown(err).then(function (handled) {
+      setError(errBox, handled ? message : err.message);
+      return handled;
+    });
   }
 
   /* ------------------------------------------------------------- document */
@@ -2801,8 +2981,13 @@ _REVIEW_JS = """
       handler().then(function () {
         button.disabled = false;
       }, function (err) {
-        setError(errBox, err.message);
-        button.disabled = false;
+        writeFailed(err, errBox,
+          "This document is password-protected \\u2014 unlock it on the left " +
+          "and this will be sent."
+        ).then(function (handled) {
+          if (handled) { pendingWrite = handler; }
+          button.disabled = false;
+        });
       });
     }
 
@@ -2915,7 +3100,13 @@ _REVIEW_JS = """
       closeComposer();
       await loadThreads();
     } catch (err) {
-      setError($("rv-composer-error"), err.message);
+      /* The quote and the typed text stay in the composer, so unlocking and
+         replaying posts exactly what was written. */
+      if (await writeFailed(err, $("rv-composer-error"),
+        "This document is password-protected \\u2014 unlock it on the left " +
+        "and your comment will be posted.")) {
+        pendingWrite = submitComment;
+      }
     } finally {
       button.disabled = false;
     }
@@ -3003,6 +3194,22 @@ _REVIEW_JS = """
     });
   });
 
+  $("rv-lock-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    /* Not trimmed: a password may legitimately begin or end with a space. */
+    var value = $("rv-lock-password").value;
+    if (!value) {
+      setError($("rv-lock-error"), "Enter the password.");
+      return;
+    }
+    setError($("rv-lock-error"), "");
+    var button = $("rv-lock-btn");
+    button.disabled = true;
+    unlock(value).catch(function (err) {
+      setError($("rv-lock-error"), err.message);
+    }).then(function () { button.disabled = false; });
+  });
+
   $("rv-logout").addEventListener("click", signedOut);
   $("rv-post").addEventListener("click", submitComment);
   $("rv-cancel").addEventListener("click", closeComposer);
@@ -3039,12 +3246,8 @@ _REVIEW_JS = """
     });
   }
 
-  loadDocument().catch(function (err) {
-    setError($("rv-error"), err.message);
-  });
-  loadVersions().then(loadThreads).catch(function (err) {
-    setError($("rv-error"), err.message);
-  });
+  loadDocument().catch(readFailed);
+  loadVersions().then(loadThreads).catch(readFailed);
 })();
 """
 
@@ -3069,6 +3272,20 @@ def review_page(base_url: str, artifact_id: str, service_version: str) -> str:
     then comments with an ``X-Artifact-Guest`` header instead of a token. The
     fragment never reaches the server as part of a URL, and the credential
     never leaves this tab.
+
+    **Locked documents.** A password-protected artifact refuses ``/raw``,
+    ``/versions``, ``/comments`` and every comment write with 401 ``password
+    required``, and an invited guest has never seen the standalone unlock
+    form. When a read or a write is refused that way - and ``/a/{id}/meta``,
+    public even while the document is protected, confirms ``protected`` - the
+    page swaps the document pane for its own unlock panel, which posts the
+    password form-encoded to ``POST /a/{id}/unlock`` and re-tries a protected
+    read to see whether the cookie took. The password is held in the page's
+    closure for the life of the tab (never storage, never a URL) because
+    comment writes go to ``/api/...``, which the unlock cookie - scoped to
+    ``/a/{id}`` - never reaches; those requests carry it as the documented
+    ``X-Artifact-Password`` header. An invitation still grants a voice, not a
+    key: the panel says so rather than calling the invitation broken.
     """
     base = html.escape(base_url.rstrip("/"))
     safe_id = html.escape(artifact_id)
@@ -3094,6 +3311,26 @@ def review_page(base_url: str, artifact_id: str, service_version: str) -> str:
 <div class="rv-doc">
 <iframe id="rv-frame" title="artifact under review"
   sandbox="allow-scripts allow-popups"></iframe>
+<div class="rv-lock" id="rv-lock" hidden>
+<div class="rv-lock-card">
+<div class="rule">locked artifact</div>
+<div class="card">
+<h1>Password required</h1>
+<p>This document is password-protected. Enter its password to read it and to
+comment on it.</p>
+<p id="rv-lock-guest" hidden>Your invitation is fine — it is what lets you
+comment here without a Keboola account. The password is a separate lock on the
+document itself, so you need it as well; whoever invited you can pass it on.</p>
+<form id="rv-lock-form" autocomplete="off">
+<label for="rv-lock-password">Password</label>
+<input class="rv-field" type="password" id="rv-lock-password" name="password"
+  autocomplete="current-password" spellcheck="false">
+<button type="submit" class="btn btn-primary btn-wide" id="rv-lock-btn">Unlock</button>
+<p class="err" id="rv-lock-error" hidden></p>
+</form>
+</div>
+</div>
+</div>
 </div>
 <aside class="rv-side" id="rv-side">
 <h2>sign in</h2>
@@ -3160,6 +3397,9 @@ an older version may no longer match this text.</p>
 versions and no new comments.</p>
 <p class="rv-hint" id="rv-closed" hidden>Commenting is closed on this
 document.</p>
+<p class="rv-hint" id="rv-lock-side" hidden>The discussion is part of the
+protected document: unlock it on the left to read the threads and to add
+one.</p>
 <p class="err" id="rv-error" hidden></p>
 <p class="empty" id="rv-empty" hidden>No comments yet.</p>
 <ul class="rv-threads" id="rv-threads"></ul>

@@ -2642,6 +2642,147 @@ def test_review_page_of_a_protected_artifact_shows_the_unlock_form(api: Api) -> 
     assert api.client.get(f"/a/{artifact_id}/review").status_code == 200
 
 
+def test_review_page_ships_its_own_unlock_panel(api: Api) -> None:
+    """The review page must be able to ask for the reader password itself.
+
+    A guest invited to a password-protected document arrives on a link that
+    has never shown them the standalone unlock form, and every read and every
+    comment write answers 401 "password required". The page therefore carries
+    its own unlock panel: a password field, a form-encoded POST to the
+    existing /a/{id}/unlock endpoint, and a re-tried protected read that
+    decides whether the password was accepted.
+    """
+    artifact_id = _publish_markdown(api, "# Reviewed\n\nBody text")
+    text = api.client.get(f"/a/{artifact_id}/review").text
+
+    # The panel itself.
+    assert '<div class="rv-lock" id="rv-lock" hidden>' in text
+    assert 'id="rv-lock-form"' in text
+    assert 'type="password" id="rv-lock-password"' in text
+    assert 'autocomplete="current-password"' in text
+    assert 'id="rv-lock-btn"' in text
+    assert 'id="rv-lock-error"' in text
+    # An invitation grants a voice, not a key - and the panel says so instead
+    # of letting the guest think their invitation is broken.
+    assert 'id="rv-lock-guest"' in text
+    assert "Your invitation is fine" in text
+
+    # Locked state is told apart from every other failure: the gate's own 401
+    # payload, confirmed against /meta, which is public while /raw is not.
+    assert 'payload.error === "password required"' in text
+    assert 'PATH + "/meta"' in text
+    assert "data.protected" in text
+
+    # What submitting the panel does.
+    assert 'PATH + "/unlock"' in text
+    assert '"Content-Type": "application/x-www-form-urlencoded"' in text
+    assert 'body: "password=" + encodeURIComponent(value)' in text
+    assert 'credentials: "same-origin"' in text
+    # A 303 body is unreadable through fetch, so a protected read is re-tried
+    # to find out whether the cookie took.
+    assert 'await read("/comments")' in text
+    assert '"That password was not accepted."' in text
+    assert "Too many attempts" in text
+
+    # A comment write goes to /api/..., which the unlock cookie (scoped to
+    # /a/{id}) never reaches, so an unlocked tab re-states the password there.
+    assert '"X-Artifact-Password"' in text
+    # ...held in memory only: never storage, and never part of a URL. The one
+    # place the typed value travels is the unlock POST body.
+    assert re.search(r"Storage\s*\.\s*\w+\([^)]*readerPassword", text) is None
+    assert text.count("encodeURIComponent(value)") == 1
+
+    # A refused write parks itself and keeps what was typed, instead of
+    # printing "password required" at somebody with nowhere to type one.
+    assert "pendingWrite" in text
+    assert "unlock it on the left" in text
+
+
+def test_review_page_of_an_unprotected_artifact_is_unchanged(api: Api) -> None:
+    """No unlock panel on screen, and no extra request to find that out."""
+    artifact_id = _publish_markdown(api, "# Open\n\nBody text")
+    text = api.client.get(f"/a/{artifact_id}/review").text
+
+    # Every part of the lock is inert until a read is actually refused.
+    for marker in ('id="rv-lock" hidden', 'id="rv-lock-guest" hidden',
+                   'id="rv-lock-side" hidden'):
+        assert marker in text, marker
+    # /meta is fetched from one place, and only from behind the 401 check.
+    assert text.count('PATH + "/meta"') == 1
+    assert "if (!(await protectedArtifact()))" in text
+    assert text.count('PATH + "/unlock"') == 1
+
+    # ...and the page around it is the one that was always served.
+    assert 'sandbox="allow-scripts allow-popups"' in text
+    assert 'id="rv-composer"' in text
+    assert 'id="rv-guest"' in text
+    assert 'id="rv-signin-form"' in text
+    assert "ah-select" in text
+    assert "ah-anchors" in text
+    assert "ah-anchored" in text
+
+
+def test_unlock_then_guest_comment_is_the_flow_the_review_panel_drives(
+    api: Api,
+) -> None:
+    """End to end, the exact sequence the review page's unlock panel performs.
+
+    Both mechanisms appear here, because the page needs both. POST
+    /a/{id}/unlock sets the signed cookie, which is path-scoped to /a/{id} and
+    therefore rides on the protected *read* the panel re-tries - that re-try
+    is how the JavaScript tells a right password from a wrong one, since it
+    cannot read the 303. The cookie's path never covers
+    /api/artifacts/{id}/comments, so the *write* that follows exercises the
+    X-Artifact-Password header instead - which is why the page keeps the
+    password it just unlocked with in memory for the life of the tab.
+    """
+    artifact_id = _publish_markdown(
+        api, "# Secret\n\nBody text here.", password="hunter2"
+    )
+    review_url = _invite(api, artifact_id, "Jana").json()["review_url"]
+    share_id = review_url.split("/a/", 1)[1].split("/", 1)[0]
+    guest = _guest_headers(review_url)
+
+    # 1. The dead end: invited, but document, discussion and write are shut.
+    assert api.client.get(f"/a/{share_id}/raw").status_code == 401
+    assert api.client.get(f"/a/{share_id}/comments").status_code == 401
+    locked = _guest_comment(api, share_id, guest)
+    assert locked.status_code == 401
+    assert locked.json()["error"] == "password required"
+
+    # ...while /meta - what the panel checks to know this is a lock and not a
+    # bug - answers with no password at all.
+    meta = api.client.get(f"/a/{share_id}/meta")
+    assert meta.status_code == 200
+    assert meta.json()["protected"] is True
+
+    # 2. What the panel posts: the form-encoded 'password' field.
+    unlocked = api.client.post(
+        f"/a/{share_id}/unlock",
+        data={"password": "hunter2"},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        follow_redirects=False,
+    )
+    assert unlocked.status_code == 303
+
+    # 3. The re-tried read now goes through on the cookie alone - and so does
+    #    the invitation check, which was never the thing that was broken.
+    assert api.client.get(f"/a/{share_id}/comments").status_code == 200
+    assert api.client.get(f"/a/{share_id}/raw").status_code == 200
+    named = api.client.get(f"/a/{share_id}/guest", headers=guest)
+    assert named.status_code == 200
+    assert named.json()["name"] == "Jana"
+
+    # 4. The write still needs the password stated, because the cookie is
+    #    scoped to /a/{id} and this path is not under it.
+    assert _guest_comment(api, share_id, guest).status_code == 401
+    created = _guest_comment(
+        api, share_id, {**guest, "X-Artifact-Password": "hunter2"}
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["author"] == {"kind": "guest", "name": "Jana"}
+
+
 def test_versions_page_and_context_link_the_review_ui(api: Api) -> None:
     artifact_id = _publish_markdown(api, "# One")
     page = api.client.get(f"/a/{artifact_id}/versions?format=html")
