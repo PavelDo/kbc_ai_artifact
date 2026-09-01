@@ -38,9 +38,9 @@ content, source, or metadata over a small JSON API.
   never sent to or stored by the server) to review proposal diffs, promote or
   reject them, pin the head version, and toggle `accept_versions` — all by
   clicking
-- **Installable agent** (`/agent`): serves a ready-to-use Claude Code subagent
-  definition, distilled from `/skill`, that a user can drop straight into
-  `~/.claude/agents/`
+- **Installable agent** (`/agent`): serves the Claude Code subagent
+  definition this hub runs, distilled from `/skill`; install the attested
+  copy from the matching GitHub release (see *Install the agent / skill*)
 - **Inline comments and a review UI**: anyone with a Keboola token can leave
   threaded comments anchored to a quoted passage of a specific version
   (`GET/POST /a/{id}/comments`), and `GET /a/{id}/review` is a browser page
@@ -164,7 +164,7 @@ Public (no auth):
 | POST | `/` | Returns 200 (platform health check) |
 | GET | `/context` | Machine-readable manifest |
 | GET | `/skill` | SKILL.md (`text/markdown`) teaching agents how to publish |
-| GET | `/agent` | Ready-to-install Claude Code subagent definition (`text/markdown`) |
+| GET | `/agent` | The Claude Code subagent definition this hub runs (`text/markdown`, with `ETag`/`X-Content-SHA256`/`X-Hub-Version`); install the attested release copy instead |
 | GET | `/admin` | Browser moderation studio (owner pastes their Storage token client-side; never stored server-side) |
 | GET | `/docs` | Interactive Swagger UI for this API |
 | GET | `/openapi.json` | Machine-readable OpenAPI schema for this API |
@@ -329,25 +329,39 @@ still served from a public URL: the token protects the clone, not the result.
 
 ## Install the agent / skill
 
-Two ways to teach an AI agent this API, both served directly by the hub:
+Two files teach an AI agent this API: the Claude Code subagent (`AGENT.md`,
+self-contained) and the skill (`SKILL.md`). The hub serves the copies it runs
+at `/agent` and `/skill` — those are for *reading*. **Install from the
+release**, whose copies are attested: `gh attestation verify` proves a file
+was built by this repository's release workflow from the tagged commit, which
+no download from the hub itself can prove. The installed subagent grants
+Bash/Read/WebFetch authority, so that proof is the point.
 
 ```bash
-# Claude Code subagent — fully self-contained, no other skill needs to load
-install -d ~/.claude/agents && curl -fsSL "$HUB/agent" -o ~/.claude/agents/artifact-hub.md
-
-# SKILL.md — for a skills-based setup (e.g. skills/artifact-publisher/)
-install -d ~/.claude/skills/artifact-publisher && curl -fsSL "$HUB/skill" -o ~/.claude/skills/artifact-publisher/SKILL.md
+V=$(curl -fsSL "$HUB/health" | jq -r .version)          # the release this hub runs
+D=$(mktemp -d)
+gh release download "v$V" --repo padak/kbc_ai_artifact -p AGENT.md -p SKILL.md -p SHA256SUMS -D "$D"
+( cd "$D" && shasum -a 256 -c SHA256SUMS )                                 # integrity against the release
+gh attestation verify "$D/AGENT.md" --repo padak/kbc_ai_artifact           # provenance: this repo's release workflow
+gh attestation verify "$D/SKILL.md" --repo padak/kbc_ai_artifact
+install -d ~/.claude/agents && install -m 0644 "$D/AGENT.md" ~/.claude/agents/artifact-hub.md
+install -d ~/.claude/skills/artifact-publisher && install -m 0644 "$D/SKILL.md" ~/.claude/skills/artifact-publisher/SKILL.md
 ```
 
-**Before you install:** both files are fetched over TLS from the same hub you
-already trust with your data, but neither endpoint is version-pinned, signed,
-or digest-checked — each is a mutable document that can change between one
-download and the next. Review the downloaded file before your agent loads it
-(the `/agent` file in particular grants Bash/Read/WebFetch tool access once
-installed), and re-review it any time you re-run either command. Treat it
-like any other code you install: where possible, pin to a released version
-from the project's GitHub releases and keep that copy under your own version
-control, rather than always tracking the live endpoint.
+What each line proves: the sums check catches a corrupted or swapped
+download; the attestation check catches a release asset that was not
+produced by this repository's workflow (a compromised account uploading a
+"fixed" file, say); installing from `$D` rather than from `$HUB` means the
+hub's own state never decides what your agent is allowed to do. Review the
+file before the first load and whenever you upgrade — verification proves
+origin, not intent.
+
+To also catch a hub that is not serving its own release, compare
+`X-Content-SHA256` on `GET $HUB/agent` (also listed under `documents` in
+`GET $HUB/context`) with the digest in `SHA256SUMS`: they must match. Without
+`gh`, download the same assets from
+`https://github.com/padak/kbc_ai_artifact/releases/download/v$V/` and run the
+sums check — integrity only, no provenance.
 
 ## Local development
 

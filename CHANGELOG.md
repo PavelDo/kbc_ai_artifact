@@ -61,6 +61,14 @@ your side.**
   unreachable record behind forever. Startup now reaps such records once they
   are old enough that they cannot be a publish still in progress
   (`HUB_REAP_ABORTED_PUBLISH_AFTER_S`).
+- Installing the AI agent definition is now a verified step. Each release
+  publishes `AGENT.md`, `SKILL.md` and their checksums as attested assets, and
+  the documented install downloads that copy, checks it and proves with
+  `gh attestation verify` that this project's release process produced it —
+  instead of copying whatever the live server happens to serve. `/agent` and
+  `/skill` now report their own digest and version, and `/context` points at
+  the matching release, so a server not running its own release can be
+  spotted before anything is installed.
 - Every documented API example now calls the service through a small shell
   function instead of passing the token as a command-line argument, where it
   was visible to anyone who could list processes on the machine for as long

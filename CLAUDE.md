@@ -120,6 +120,13 @@ isn't, that's a bug**, not a case to special-case around with local state.
 - Logs: `kbagent data-app logs --project artifacts --app-id 1304628444`.
 - **Version single source of truth is `pyproject.toml`** (`[project].version`,
   read at runtime via `importlib.metadata` with a `tomllib` fallback for local
-  dev). Bump it, tag the commit, and cut a GitHub release for any
-  user-visible change — don't let the reported `/health`/`/context` version
-  drift from what's actually deployed.
+  dev). Bump it and push a `vX.Y.Z` tag for any user-visible change — don't
+  let the reported `/health`/`/context` version drift from what's actually
+  deployed. **The release itself is made by CI** (`.github/workflows/release.yml`,
+  on the tag push): it refuses a tag that disagrees with `pyproject.toml` or
+  the changelog head, runs the suite, then creates the GitHub release with
+  `AGENT.md`, `SKILL.md` and `SHA256SUMS` as assets and attests them
+  (`gh attestation verify <file> --repo padak/kbc_ai_artifact`). Users
+  install the agent from those assets, never from the live `/agent`; keep
+  that true in the docs. Edit the release title/notes afterwards if needed,
+  don't create the release by hand first.

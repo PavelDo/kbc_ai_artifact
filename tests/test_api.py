@@ -6432,3 +6432,80 @@ class TestCommentRoutesShareTheArtifactLock:
         resolve.join(timeout=5)
         trash.join(timeout=5)
         assert box_resolve == [200] and box_trash == [200], (box_resolve, box_trash)
+
+
+# --------------------------------------------------------------------------
+# SEC-075-003: verifiable agent instructions
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path,filename", [("/agent", "AGENT.md"), ("/skill", "SKILL.md")])
+def test_served_documents_carry_their_digest_and_version(api: Api, path: str, filename: str) -> None:
+    """A hub says what it serves, so an installer can spot drift before trusting it."""
+    resp = api.client.get(path)
+    assert resp.status_code == 200
+    digest = hashlib.sha256(resp.content).hexdigest()
+    assert resp.headers["x-content-sha256"] == digest
+    assert resp.headers["etag"] == f'"sha256:{digest}"'
+    assert resp.headers["x-hub-version"] == main.SERVICE_VERSION
+
+    unchanged = api.client.get(path, headers={"If-None-Match": resp.headers["etag"]})
+    assert unchanged.status_code == 304
+    assert unchanged.content == b""
+    assert unchanged.headers["etag"] == resp.headers["etag"]
+
+
+def test_context_lists_the_documents_with_digests_and_release_assets(api: Api) -> None:
+    body = api.client.get("/context").json()
+    docs = body["documents"]
+    for key, path, filename in (("agent", "/agent", "AGENT.md"), ("skill", "/skill", "SKILL.md")):
+        served = api.client.get(path)
+        entry = docs[key]
+        assert entry["sha256"] == hashlib.sha256(served.content).hexdigest()
+        assert entry["bytes"] == len(served.content)
+        assert entry["version"] == main.SERVICE_VERSION
+        assert entry["url"] == f"https://testserver{path}"
+        assert entry["release_asset"] == (
+            f"{main.GITHUB_REPO_URL}/releases/download/v{main.SERVICE_VERSION}/{filename}"
+        )
+    assert docs["sums"] == f"{main.GITHUB_REPO_URL}/releases/download/v{main.SERVICE_VERSION}/SHA256SUMS"
+
+
+def test_install_instructions_verify_a_release_not_the_live_endpoint(api: Api) -> None:
+    """The documented install must come from the signed release, not from /agent.
+
+    The live endpoint is the right thing to *read* -- it describes the hub you
+    are talking to -- and the wrong thing to *install*: a file that grants
+    Bash/Read/WebFetch authority must be the reviewed, attested release copy.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for name, text in (
+        ("README.md", (root / "README.md").read_text(encoding="utf-8")),
+        ("/skill", api.client.get("/skill").text),
+    ):
+        code = _code_lines(text)
+        installs_live = [l for l in code if "$HUB/agent" in l and " -o " in l]
+        assert installs_live == [], (name, installs_live)
+        assert any("gh release download" in l for l in code), name
+        assert any("gh attestation verify" in l for l in code), name
+
+
+def test_release_workflow_gates_tests_and_attests_the_documents() -> None:
+    import yaml
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    wf = yaml.safe_load((root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8"))
+    triggers = wf.get("on") or wf.get(True)  # PyYAML reads a bare `on:` key as True
+    assert triggers["push"]["tags"] == ["v*"]
+
+    (job,) = wf["jobs"].values()
+    perms = job["permissions"]
+    assert perms["id-token"] == "write" and perms["attestations"] == "write"
+    assert perms["contents"] == "write"
+    steps = job["steps"]
+    uses = [s.get("uses", "") for s in steps]
+    runs = "\n".join(s.get("run", "") for s in steps)
+    assert any(u.startswith("actions/attest-build-provenance@") for u in uses)
+    assert "uv run pytest tests/" in runs, "the release must be gated on the suite"
+    assert "SHA256SUMS" in runs
+    assert "gh release" in runs

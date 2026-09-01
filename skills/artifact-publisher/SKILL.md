@@ -31,24 +31,27 @@ current truth — re-fetch them rather than trusting a cached copy of this file.
 For what changed in the hub service itself, see `GET /changelog` (rendered
 page) or `GET /changelog.md` (raw source).
 
-`GET /agent` serves a ready-to-install Claude Code subagent that knows this
-entire API (auth, publishing, versioning, moderation) without needing this
-skill loaded at all. Install it with:
+`GET /agent` serves the Claude Code subagent that knows this entire API
+(auth, publishing, versioning, moderation) without needing this skill loaded
+at all — the copy this hub runs, with `ETag`, `X-Content-SHA256` and
+`X-Hub-Version` so you can tell which. That endpoint is for *reading*. To
+**install** it, take the attested copy from the GitHub release of the version
+the hub reports; the installed file grants Bash/Read/WebFetch authority, and
+only the release copy can prove where it came from:
 
 ```bash
-install -d ~/.claude/agents && curl -fsSL "$HUB/agent" -o ~/.claude/agents/artifact-hub.md
+V=$(curl -fsSL "$HUB/health" | jq -r .version)
+D=$(mktemp -d)
+gh release download "v$V" --repo padak/kbc_ai_artifact -p AGENT.md -p SHA256SUMS -D "$D"
+( cd "$D" && grep ' AGENT.md$' SHA256SUMS | shasum -a 256 -c )   # integrity against the release
+gh attestation verify "$D/AGENT.md" --repo padak/kbc_ai_artifact  # built by this repo's release workflow
+install -d ~/.claude/agents && install -m 0644 "$D/AGENT.md" ~/.claude/agents/artifact-hub.md
 ```
 
-**Before you install: this file is fetched over TLS from the same hub you
-already trust with your data, but it is a mutable, unsigned, unpinned
-document** — there is no version pin, digest, or signature on this endpoint,
-and it can change between one download and the next. Review the downloaded
-file before your agent runner first loads it, and re-review it any time you
-re-run the install command, the same way you would review any other code you
-install. Where possible, pin to a released version — fetch a specific tagged
-copy from the project's GitHub releases instead of the always-current `/agent`
-endpoint, and keep that copy under your own version control so a change
-upstream doesn't silently change what your agent does.
+If the hub's `X-Content-SHA256` differs from the digest in `SHA256SUMS`, the
+hub is not serving its own release — do not install from it either way.
+Review the file before its first load; verification proves origin, not
+intent.
 
 ## Authentication
 

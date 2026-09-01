@@ -2771,7 +2771,9 @@ def health(request: Request) -> dict:
     responses={
         200: {
             "description": (
-                "The manifest: 'service', 'version', 'base_url', 'auth', "
+                "The manifest: 'service', 'version', 'base_url', 'documents' "
+                "(the /agent and /skill files with their SHA-256 and the "
+                "attested release asset to install from), 'auth', "
                 "'endpoints', 'publish_body', 'versioning', 'limits', 'notes'."
             )
         }
@@ -2785,6 +2787,7 @@ def context(request: Request) -> dict:
         "version": SERVICE_VERSION,
         "base_url": base,
         "repository": GITHUB_REPO_URL,
+        "documents": _documents_manifest(base),
         "description": (
             "Public hosting for self-contained HTML artifacts, backed by "
             "Keboola Storage. Any Keboola Storage API token from any stack can "
@@ -3565,16 +3568,83 @@ def context(request: Request) -> dict:
         404: {"description": "SKILL.md is not readable on this deployment."},
     },
 )
-def skill() -> Response:
+def skill(request: Request) -> Response:
     """Serve the agent-facing SKILL.md."""
+    return _serve_document(request, SKILL_PATH, "skill document")
+
+
+def _read_document(path: Path) -> tuple[bytes, str] | None:
+    """The document's bytes and their SHA-256, fresh from disk; None if unreadable.
+
+    Read on every request, like the changelog: the hash has to describe what
+    is actually sent, and a copy cached at import time could not promise that.
+    """
     try:
-        text = SKILL_PATH.read_text(encoding="utf-8")
+        raw = path.read_bytes()
     except OSError:
-        logger.error("SKILL.md not readable at %s", SKILL_PATH)
-        return JSONResponse(
-            status_code=404, content={"error": "skill document not available"}
-        )
-    return Response(content=text, media_type="text/markdown; charset=utf-8")
+        logger.error("%s not readable", path)
+        return None
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
+def _serve_document(request: Request, path: Path, what: str) -> Response:
+    """Serve one of the instruction documents with its digest attached.
+
+    The digest headers exist so an installer can compare what a hub serves
+    with what the project released -- and refuse to install if they differ.
+    They are a consistency check, not a trust anchor: a digest from the same
+    origin as the content proves nothing about who wrote it. Provenance comes
+    from the release assets and their attestation, which /context points at.
+    """
+    document = _read_document(path)
+    if document is None:
+        return JSONResponse(status_code=404, content={"error": f"{what} not available"})
+    raw, digest = document
+    etag = f'"sha256:{digest}"'
+    headers = {
+        "ETag": etag,
+        "X-Content-SHA256": digest,
+        "X-Hub-Version": SERVICE_VERSION,
+    }
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+    return Response(
+        content=raw, media_type="text/markdown; charset=utf-8", headers=headers
+    )
+
+
+def _release_asset_url(filename: str) -> str:
+    """Where the attested copy of a document lives for the running version."""
+    return f"{GITHUB_REPO_URL}/releases/download/v{SERVICE_VERSION}/{filename}"
+
+
+def _documents_manifest(base: str) -> dict[str, Any]:
+    """The /context entry describing the instruction documents this hub serves."""
+    manifest: dict[str, Any] = {}
+    for key, route, path, filename in (
+        ("agent", "/agent", AGENT_PATH, "AGENT.md"),
+        ("skill", "/skill", SKILL_PATH, "SKILL.md"),
+    ):
+        document = _read_document(path)
+        entry: dict[str, Any] = {
+            "url": f"{base.rstrip('/')}{route}",
+            "version": SERVICE_VERSION,
+            "release_asset": _release_asset_url(filename),
+        }
+        if document is not None:
+            raw, digest = document
+            entry["sha256"] = digest
+            entry["bytes"] = len(raw)
+        manifest[key] = entry
+    manifest["sums"] = _release_asset_url("SHA256SUMS")
+    manifest["verify"] = (
+        "Install from the release asset, not from the live endpoint: download "
+        "the asset and SHA256SUMS for this version, check the sum, and run "
+        f"'gh attestation verify <file> --repo padak/kbc_ai_artifact'. The "
+        "sha256 here is what this hub serves; if it differs from the release, "
+        "the hub is not running its own release."
+    )
+    return manifest
 
 
 @app.get(
@@ -3599,16 +3669,9 @@ def skill() -> Response:
         404: {"description": "AGENT.md is not readable on this deployment."},
     },
 )
-def agent() -> Response:
-    """Serve the ready-to-install Claude Code subagent definition."""
-    try:
-        text = AGENT_PATH.read_text(encoding="utf-8")
-    except OSError:
-        logger.error("AGENT.md not readable at %s", AGENT_PATH)
-        return JSONResponse(
-            status_code=404, content={"error": "agent definition not available"}
-        )
-    return Response(content=text, media_type="text/markdown; charset=utf-8")
+def agent(request: Request) -> Response:
+    """Serve the Claude Code subagent definition this hub runs."""
+    return _serve_document(request, AGENT_PATH, "agent definition")
 
 
 def _read_changelog() -> str | None:
