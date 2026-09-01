@@ -953,20 +953,33 @@ class ArtifactStore:
     ) -> None:
         """Delete meta records that have no version and are too old to be in flight.
 
+        Two aborted operations leave this shape, and both want the same
+        treatment.
+
         Publish writes the meta record first, so that a failed canonical
         upload can be rolled back by deleting it; if the process dies between
         that write and the version write, the record stays. It is inert --
         every read answers 404 for it, because there is no head -- but it is
-        also invisible to every API and accumulates forever. Nothing else can
-        have this shape: a purge removes everything, the last live version
-        cannot be deleted, and a legacy envelope counts as a version.
+        also invisible to every API and accumulates forever.
 
-        Age is the whole safety argument. Right after a restart this very
-        shape is also what a publish looks like between its two writes, so
-        only a record older than ``reap_aborted_after_s`` is touched -- an
-        hour by default, against a request that takes seconds. A timestamp
-        that cannot be read is treated as young. Runs only from
-        :meth:`hydrate`, never from the lazy per-artifact fallback.
+        Since REL-100-001, :meth:`delete` produces it too: a purge deletes
+        every child before the authorizing meta record, so a process death in
+        that last gap leaves a meta whose versions are all gone. **The
+        deliberate choice is to keep such a record rather than treat it as
+        garbage the moment it is seen**, because it is exactly what makes the
+        purge finishable: the meta is the file ``_owner_only`` authorizes
+        against, so while it exists the owner can retry and complete the
+        erasure, and there is no content left for it to expose in the
+        meantime. It shows up in the owner's listing as an artifact with zero
+        versions -- visible, empty, and removable -- and never publicly.
+
+        Age is the whole safety argument for eventually reaping it. Right
+        after a restart this very shape is also what a publish looks like
+        between its two writes, so only a record older than
+        ``reap_aborted_after_s`` is touched -- an hour by default, against a
+        request that takes seconds. A timestamp that cannot be read is treated
+        as young. Runs only from :meth:`hydrate`, never from the lazy
+        per-artifact fallback.
         """
         if self._reap_aborted_after_s <= 0:
             return
@@ -1562,6 +1575,14 @@ class ArtifactStore:
         delete fails the file still exists, so the index keeps pointing at it
         and this returns ``False`` — never a success claim over a file that is
         still there.
+
+        ``False`` deliberately has exactly two meanings — "policy says no" and
+        "the backend did not confirm" — because the API layer needs to tell a
+        409 from a 502. The other destructive policy (COR-075-006: a version
+        the head is pinned to may not be deleted, since that would leave the
+        stored head naming a version that no longer exists) is therefore
+        enforced in ``src.main.delete_version``, where it can carry its own
+        409 and an explanation, rather than folded into this ``False``.
         """
         entry = self._resolve(artifact_id)
         if entry is None:
@@ -1702,29 +1723,67 @@ class ArtifactStore:
         delete fails, the residual files stay in Storage, so the index/cache are
         left intact and this returns ``False`` — the caller must not report a
         full deletion. An unknown artifact (no files) also returns ``False``.
+
+        **REL-100-001: children first, the meta record strictly last.** The tag
+        search answers in no order the caller may rely on, and this used to walk
+        it as it came. When a version delete failed *after* the meta file was
+        already gone, the artifact lost the only record that
+        :func:`src.main._owner_only` can authorize against: the route answered
+        502 "retry the purge", the retry found no artifact and 404ed, and the
+        surviving version file became unreachable and undeletable forever.
+
+        So the files are classified (:meth:`_classify_for_delete`) and deleted
+        in two phases. Every child — version files, a schema-1 legacy envelope,
+        anything else tagged for this artifact — goes first; the meta record is
+        touched only once every child is confirmed gone. The guarantee that buys
+        is the one that matters: **whenever any child survives, its meta
+        survives too**, so the purge stays authorizable and a retry (in this
+        process or after a restart with an empty disk) resumes rather than
+        strands. Deleting an already-deleted file is a no-op for the backend, so
+        the retry is idempotent by construction.
+
+        Superseded meta files (an interrupted :meth:`save_meta` can leave one)
+        are deleted oldest-first, so the *authorizing* record — the highest file
+        ID, which is what :func:`_absorb_file` elects — is the very last file to
+        go.
         """
         files: list[FileInfo] = self._backend.search_by_tag(tag_for_id(artifact_id))
         if not files:
             return False
+        children, metas = self._classify_for_delete(files)
+
+        # Phase 1: every child. A failure here does not abort the phase — the
+        # other children are independent files and clearing them is real
+        # progress for the retry — but it does veto phase 2 entirely.
         all_ok = True
-        for info in files:
-            try:
-                self._backend.delete(info.id)
-            except BackendError as exc:
-                all_ok = False
-                logger.warning(
-                    "Cannot delete file %s of artifact %s: %s",
-                    info.id,
-                    artifact_id,
-                    exc,
-                )
+        for info in children:
+            all_ok = self._delete_file_confirmed(artifact_id, info.id) and all_ok
 
         if not all_ok:
             logger.warning(
                 "Partial delete of artifact %s: some Storage files remain; "
-                "keeping the index entry to avoid a false 'deleted' claim",
+                "keeping its meta record and index entry so the purge stays "
+                "authorized and can be retried",
                 artifact_id,
             )
+            self._resync_after_partial_delete(artifact_id)
+            return False
+
+        # Phase 2: the authorizing record, now that nothing it authorizes is
+        # left. A failure here leaves a meta with no version — inert (every read
+        # answers 404), still purgeable by the owner, and reaped by
+        # :meth:`_reap_aborted_publishes` once it is too old to be in flight.
+        for info in metas:
+            all_ok = self._delete_file_confirmed(artifact_id, info.id) and all_ok
+
+        if not all_ok:
+            logger.warning(
+                "Partial delete of artifact %s: its meta record could not be "
+                "removed; the artifact has no content left and the purge can "
+                "be retried",
+                artifact_id,
+            )
+            self._resync_after_partial_delete(artifact_id)
             return False
 
         with self._lock:
@@ -1734,6 +1793,55 @@ class ArtifactStore:
             self._forget_share_locked(artifact_id)
         self._purge_disk_cache(artifact_id)
         return True
+
+    def _resync_after_partial_delete(self, artifact_id: str) -> None:
+        """Re-read an artifact's tags after a delete that only partly landed.
+
+        Some of its files are gone but the index still names them, so a read
+        would try to download a file that no longer exists. Re-running the tag
+        search leaves the index describing what is actually in Storage — the
+        meta record included, which is exactly what the retry needs to
+        authenticate. Best effort: a failure here only costs accuracy of an
+        entry the caller is already being told is incomplete.
+        """
+        try:
+            self.refresh(artifact_id)
+        except BackendError as exc:
+            logger.warning(
+                "Cannot refresh artifact %s after a partial delete: %s",
+                artifact_id,
+                exc,
+            )
+
+    @staticmethod
+    def _classify_for_delete(
+        files: list[FileInfo],
+    ) -> tuple[list[FileInfo], list[FileInfo]]:
+        """Split an artifact's files into (children, meta records) for REL-100-001.
+
+        The split follows the Storage model exactly as documented in the module
+        docstring and in CLAUDE.md: a meta record is the file tagged
+        :data:`TAG_META`, a version file is tagged ``artifact-ver-{n}``, and a
+        file with neither tag is a schema-1 legacy envelope (or some other
+        record an older build wrote). Only the meta tag is treated as special —
+        everything else is a child and goes first — because getting the
+        classification wrong in the *other* direction is what created the
+        unreachable orphan this fixes.
+
+        Children come back newest-first (highest file ID), which is how the
+        backend answers anyway; meta records come back oldest-first, so the
+        authorizing one is deleted last of all.
+        """
+        children: list[FileInfo] = []
+        metas: list[FileInfo] = []
+        for info in files:
+            if TAG_META in (info.tags or []):
+                metas.append(info)
+            else:
+                children.append(info)
+        children.sort(key=lambda info: info.id, reverse=True)
+        metas.sort(key=lambda info: info.id)
+        return children, metas
 
     # ----------------------------------------------------------------- list
 

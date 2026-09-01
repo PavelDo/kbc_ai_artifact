@@ -610,8 +610,11 @@ hub -X DELETE "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/versions/2"
 ```
 
 The owner may delete any version except the last live one (409 — an artifact
-must keep one). A contributor may delete only their own proposal, which is how
-you withdraw a submission.
+must keep one) and the version the head is currently pinned to (409 — the
+stored head would be left naming a version that no longer exists; pin the head
+to another live version or switch it back to `latest`, then delete). A
+contributor may delete only their own proposal, which is how you withdraw a
+submission.
 
 ### Pin the head
 
@@ -628,8 +631,9 @@ hub -X PUT "$HUB/api/artifacts/aBcD3fGhIjKlMnOpQrStUvWx/head" \
 ```
 
 Owner only. The pinned version must exist and be live (422 otherwise), and it
-is protected from retention pruning. The response reports
-`head_version_served`.
+is protected from retention pruning *and* from deletion — `DELETE
+.../versions/{n}` on the pinned version answers 409 until the head moves. The
+response reports `head_version_served`.
 
 ### Limits
 
@@ -1097,7 +1101,7 @@ mind:
 | 401 | Storage token rejected by the stack, wrong artifact password, or an unknown/revoked/malformed `X-Artifact-Guest` credential (the three guest cases are deliberately indistinguishable) |
 | 403 | Token is valid but not from the owning project (update, trash, restore, purge, rotate-link, stats, invitations, promote, head); the artifact does not accept versions from other projects; you asked for a proposal you did not author; or comments are closed (`comments_mode: "off"`) or you are not on the `contributors` allowlist |
 | 404 | Unknown artifact id (identical response whether it never existed, was purged, or its share id was rotated away), or no such version, comment thread, or invitation |
-| 409 | Promoting a version that is already live; deleting the only live version of an artifact; submitting a version, a comment, or a new invitation on an artifact whose `status` is `"final"` or that is trashed (the detail names which, and the way out — reopen vs. restore); resolving/reopening a thread already in that state; or restoring an artifact that is not in the trash |
+| 409 | Promoting a version that is already live; deleting the only live version of an artifact; deleting the version the head is pinned to (re-pin or switch the head to `latest` first); submitting a version, a comment, or a new invitation on an artifact whose `status` is `"final"` or that is trashed (the detail names which, and the way out — reopen vs. restore); resolving/reopening a thread already in that state; or restoring an artifact that is not in the trash |
 | 413 | Built HTML over the size limit, a diff side over `HUB_DIFF_MAX_BYTES` (for `format=visual`, the rendered HTML of the larger side) |
 | 422 | Build failure — bad git repo, no entry file found, markdown render error, `git_token`/`git_username` sent without `git_url`, `markdown_source` sent without `html`, a `title` sent without content, pinning the head to a version that does not exist or is not live, a `base_version` naming a version that does not exist, an invalid/blocked webhook URL or too many of them, or an empty/over-long/over-quota invitation name |
 | 429 | Your project reached the daily version-submission cap for this artifact, the daily `HUB_MAX_COMMENTS_PER_DAY` comment/reply cap (per project or per guest invitation), or too many wrong unlock-password attempts from your address this hour |
