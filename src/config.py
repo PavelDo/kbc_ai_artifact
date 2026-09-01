@@ -11,6 +11,12 @@ from pathlib import Path
 
 REQUIRED_ENV = ["HUB_STORAGE_TOKEN", "HUB_STACK_URL", "HUB_SECRET_KEY"]
 
+#: Shortest accepted ``HUB_SECRET_KEY``. That value is the HMAC key behind
+#: every unlock cookie, so a short (therefore low-entropy) one is brute-forcible
+#: offline and would let anybody mint their own unlock cookies. Rejected at
+#: startup rather than silently accepted.
+MIN_SECRET_KEY_CHARS = 32
+
 
 def _int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
@@ -68,6 +74,17 @@ class Settings:
     # above this are pruned (env HUB_MAX_PROPOSED_VERSIONS). Proposals are never
     # served as head, so pruning the oldest is always safe.
     max_proposed_versions: int = 50
+    # Trust X-Forwarded-Host / X-Forwarded-Proto to name the public origin.
+    # Off by default: a direct client can forge those headers, and the
+    # deployed hub always sets HUB_PUBLIC_BASE_URL (which wins outright)
+    # anyway. Local development behind a proxy opts in with
+    # HUB_TRUST_FORWARDED_HEADERS=1.
+    trust_forwarded_headers: bool = False
+    # Failed unlock attempts allowed per (artifact, client IP) per UTC hour
+    # before the password gate answers 429 (env
+    # HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR). Each attempt costs a full PBKDF2
+    # verification, so this bounds both brute force and the CPU it can burn.
+    max_unlock_attempts_per_hour: int = 30
 
 
 def load_settings() -> Settings:
@@ -75,6 +92,15 @@ def load_settings() -> Settings:
     if missing:
         raise RuntimeError(
             f"Missing required environment variables: {', '.join(missing)}"
+        )
+    secret_key = os.environ["HUB_SECRET_KEY"]
+    if len(secret_key) < MIN_SECRET_KEY_CHARS:
+        raise RuntimeError(
+            f"HUB_SECRET_KEY is too short ({len(secret_key)} characters). It "
+            "is the HMAC key for every unlock cookie and must be at least "
+            f"{MIN_SECRET_KEY_CHARS} characters of high-entropy random data. "
+            "Generate one with: python -c "
+            "'import secrets; print(secrets.token_urlsafe(48))'"
         )
     extra = tuple(
         s.strip().rstrip("/")
@@ -103,4 +129,8 @@ def load_settings() -> Settings:
         extra_stacks=extra,
         max_envelope_bytes=_int_env("HUB_MAX_ENVELOPE_BYTES", 20 * 1024 * 1024),
         max_proposed_versions=_int_env("HUB_MAX_PROPOSED_VERSIONS", 50),
+        trust_forwarded_headers=_bool_env("HUB_TRUST_FORWARDED_HEADERS", False),
+        max_unlock_attempts_per_hour=_int_env(
+            "HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR", 30
+        ),
     )

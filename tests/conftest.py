@@ -9,7 +9,12 @@ import os
 
 os.environ.setdefault("HUB_STORAGE_TOKEN", "test-token")
 os.environ.setdefault("HUB_STACK_URL", "https://connection.keboola.com")
-os.environ.setdefault("HUB_SECRET_KEY", "test-secret")
+os.environ.setdefault(
+    # At least MIN_SECRET_KEY_CHARS (32) characters — load_settings rejects a
+    # shorter signing key, since it is the HMAC key for every unlock cookie.
+    "HUB_SECRET_KEY",
+    "test-secret-key-for-tests-only-0123456789",
+)
 
 import pytest
 

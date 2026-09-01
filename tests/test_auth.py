@@ -122,3 +122,80 @@ class TestVerifyToken:
             mock.get(VERIFY_URL).mock(return_value=httpx.Response(200, json={"owner": {}}))
             with pytest.raises(AuthError):
                 verify_token("https://connection.keboola.com", "some-token")
+
+    def test_owner_as_a_list_raises_autherror(self):
+        """A 200 with a schema-drifting body must not crash the request."""
+        with respx.mock as mock:
+            mock.get(VERIFY_URL).mock(
+                return_value=httpx.Response(200, json={"owner": [{"id": 1}]})
+            )
+            with pytest.raises(AuthError):
+                verify_token("https://connection.keboola.com", "some-token")
+
+    def test_owner_id_non_numeric_string_raises_autherror(self):
+        with respx.mock as mock:
+            mock.get(VERIFY_URL).mock(
+                return_value=httpx.Response(200, json={"owner": {"id": "abc"}})
+            )
+            with pytest.raises(AuthError):
+                verify_token("https://connection.keboola.com", "some-token")
+
+    def test_owner_id_as_an_int_string_is_accepted(self):
+        """Some stacks serialize the project id as a decimal string."""
+        with respx.mock as mock:
+            mock.get(VERIFY_URL).mock(
+                return_value=httpx.Response(
+                    200, json={"owner": {"id": "123", "name": "Proj"}}
+                )
+            )
+            owner = verify_token("https://connection.keboola.com", "some-token")
+        assert owner.project_id == 123
+
+    def test_owner_id_boolean_raises_autherror(self):
+        with respx.mock as mock:
+            mock.get(VERIFY_URL).mock(
+                return_value=httpx.Response(200, json={"owner": {"id": True}})
+            )
+            with pytest.raises(AuthError):
+                verify_token("https://connection.keboola.com", "some-token")
+
+    def test_json_null_body_raises_autherror(self):
+        with respx.mock as mock:
+            mock.get(VERIFY_URL).mock(
+                return_value=httpx.Response(
+                    200, content=b"null", headers={"content-type": "application/json"}
+                )
+            )
+            with pytest.raises(AuthError):
+                verify_token("https://connection.keboola.com", "some-token")
+
+    def test_non_json_body_raises_stack_unreachable(self):
+        """A captive portal answering 200 with HTML is an upstream problem."""
+        with respx.mock as mock:
+            mock.get(VERIFY_URL).mock(
+                return_value=httpx.Response(
+                    200, text="<html>login here</html>",
+                    headers={"content-type": "text/html"},
+                )
+            )
+            with pytest.raises(StackUnreachableError):
+                verify_token("https://connection.keboola.com", "some-token")
+
+    def test_non_scalar_owner_name_raises_autherror(self):
+        with respx.mock as mock:
+            mock.get(VERIFY_URL).mock(
+                return_value=httpx.Response(
+                    200, json={"owner": {"id": 1, "name": {"en": "Proj"}}}
+                )
+            )
+            with pytest.raises(AuthError):
+                verify_token("https://connection.keboola.com", "some-token")
+
+    def test_missing_owner_name_defaults_to_empty(self):
+        with respx.mock as mock:
+            mock.get(VERIFY_URL).mock(
+                return_value=httpx.Response(200, json={"owner": {"id": 7}})
+            )
+            owner = verify_token("https://connection.keboola.com", "some-token")
+        assert owner.project_id == 7
+        assert owner.project_name == ""

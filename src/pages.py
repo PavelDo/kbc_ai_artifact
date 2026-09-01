@@ -1456,6 +1456,46 @@ reload keeps you signed in and closing the tab forgets the token.
     )
 
 
+def artifact_frame_page(title: str, artifact_html: str) -> str:
+    """Wrap one artifact's built HTML in a zero-chrome sandboxed iframe.
+
+    Published artifacts are publisher-controlled documents that may run
+    arbitrary JavaScript. Serving them directly on the hub's own origin put
+    that script in the same origin as ``/admin`` and ``/a/{id}/review``, whose
+    ``sessionStorage`` holds a visitor's Keboola Storage token — one artifact
+    could read another visitor's credential. Here the document is handed to
+    the browser as the ``srcdoc`` of an iframe sandboxed *without*
+    ``allow-same-origin``, so it runs in an opaque origin: no access to this
+    origin's storage, cookies or DOM, while scripts, forms, popups and
+    downloads inside the document keep working.
+
+    ``srcdoc`` carries the whole document as an attribute *value*, so it is
+    escaped with ``quote=True`` — an unescaped ``"`` in the artifact would
+    otherwise close the attribute and put artifact markup back at top level.
+
+    Visually this is a no-op: the frame has no border and fills the viewport,
+    so a reader sees exactly what they saw before. Machines that want the
+    bytes themselves keep using ``/a/{id}/raw``.
+    """
+    safe_title = html.escape(title or "Artifact", quote=True)
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n<head>\n'
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"<title>{safe_title}</title>\n"
+        "<style>html,body{margin:0;padding:0;border:0;width:100%;height:100%;"
+        "overflow:hidden}"
+        "iframe{margin:0;padding:0;border:0;width:100%;height:100vh;"
+        "display:block}</style>\n"
+        "</head>\n<body>\n"
+        f'<iframe title="{safe_title}" '
+        'sandbox="allow-scripts allow-popups allow-forms allow-downloads" '
+        f'srcdoc="{html.escape(artifact_html, quote=True)}"></iframe>\n'
+        "</body>\n</html>\n"
+    )
+
+
 def unlock_page(artifact_id: str, error: str | None) -> str:
     """Render the password form for a protected artifact."""
     safe_id = html.escape(artifact_id)

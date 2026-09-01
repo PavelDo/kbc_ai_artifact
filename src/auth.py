@@ -96,12 +96,58 @@ def verify_token(stack_url: str, token: str, timeout_s: int = 15) -> Owner:
         raise StackUnreachableError(
             f"Unexpected {response.status_code} from {stack_url}"
         )
-    data = response.json()
-    owner = data.get("owner") or {}
-    if "id" not in owner:
+    # A 200 is not a promise of a well-formed body: a captive portal, a
+    # misrouted proxy or a schema drift can all answer 200 with something else
+    # entirely. Validate the shape before indexing into it, so a surprise
+    # becomes a stable AuthError/StackUnreachableError instead of a 500.
+    try:
+        data = response.json()
+    except ValueError as exc:
+        logger.warning("Non-JSON token-verify response from %s: %s", stack_url, exc)
+        raise StackUnreachableError(
+            f"{stack_url} answered 200 with a non-JSON token-verify body"
+        ) from exc
+    if not isinstance(data, dict):
+        raise AuthError("Token verify response is not a JSON object")
+    owner = data.get("owner")
+    if not isinstance(owner, dict):
         raise AuthError("Token verify response has no owner project")
     return Owner(
         stack_url=stack_url,
-        project_id=int(owner["id"]),
-        project_name=str(owner.get("name", "")),
+        project_id=_owner_project_id(owner.get("id")),
+        project_name=_owner_project_name(owner.get("name")),
     )
+
+
+def _owner_project_id(raw: object) -> int:
+    """The owner project id as an int, or ``AuthError`` when unusable.
+
+    Keboola stacks return a JSON number, but some return the id as a decimal
+    string; both are accepted. Anything else (missing, bool, list, dict,
+    non-numeric string) is an authentication failure, never a crash.
+    """
+    if isinstance(raw, bool) or raw is None:
+        raise AuthError("Token verify response has no owner project")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return int(raw.strip())
+        except ValueError as exc:
+            raise AuthError(
+                "Token verify response has a non-numeric owner project id"
+            ) from exc
+    raise AuthError("Token verify response has a non-numeric owner project id")
+
+
+def _owner_project_name(raw: object) -> str:
+    """The owner project name, normalized to a string ("" when absent)."""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return str(raw)
+    # A structured name is schema drift, not a name — do not stringify a dict
+    # or list into the identity we hand every caller.
+    raise AuthError("Token verify response has a non-scalar owner project name")

@@ -24,6 +24,7 @@ transient Storage outage cannot put the app into a crash loop.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sys
@@ -36,7 +37,7 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
 from fastapi import Path as PathParam
@@ -67,6 +68,7 @@ from src.diff import DiffError, compute_diff
 from src.kbc import BackendError, KbcFilesBackend
 from src.pages import (
     admin_page,
+    artifact_frame_page,
     landing_page,
     review_page,
     unlock_page,
@@ -168,7 +170,9 @@ PASSWORD_GATE_NOTE = (
     "When the artifact is password-protected, machine clients send the "
     "password in the X-Artifact-Password header (Swagger UI cannot send it "
     "from this page); browsers use the unlock form at POST /a/{id}/unlock, "
-    "which sets a signed cookie scoped to the artifact path."
+    "which sets a signed cookie scoped to the artifact path and to the "
+    "current password. Failed attempts are rate-limited per artifact and "
+    "client address, so a wrong password may answer 429 instead of 401."
 )
 
 #: Reused ``responses`` entries, so the same failure never gets two wordings.
@@ -186,6 +190,18 @@ RESP_HUB_502 = {
     )
 }
 RESP_NOT_FOUND = {"description": "No artifact exists with this id."}
+RESP_UNLOCK_429 = {
+    "description": (
+        "Too many failed password attempts for this artifact from this "
+        "client address in the current hour (HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR)."
+    )
+}
+RESP_VERSIONS_429 = {
+    "description": (
+        "This project reached HUB_MAX_VERSIONS_PER_DAY submitted versions for "
+        "this artifact today; owner updates that add content count too."
+    )
+}
 RESP_THREAD_404 = {
     "description": "No artifact with this id, or no such comment thread."
 }
@@ -213,14 +229,33 @@ class MarkdownResponse(Response):
 
     media_type = "text/markdown; charset=utf-8"
 
-logging.basicConfig(
-    stream=sys.stdout,
-    level=logging.INFO,
-    format=(
-        '{"time": "%(asctime)s", "level": "%(levelname)s", '
-        '"logger": "%(name)s", "message": "%(message)s"}'
-    ),
-)
+class JSONFormatter(logging.Formatter):
+    """Render each log record as one real JSON object.
+
+    The previous format string interpolated ``%(message)s`` straight into a
+    JSON-shaped template, so any log line carrying user-controlled text (an
+    artifact id, a stack URL, a backend error) could inject a quote or a
+    newline and either forge an extra record or make the line unparseable.
+    ``json.dumps`` escapes quotes, backslashes and control characters,
+    including newlines, so a message is always exactly one JSON string in
+    exactly one line.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "time": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(JSONFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
 logger = logging.getLogger(__name__)
 
 
@@ -267,6 +302,12 @@ _submission_lock = threading.Lock()
 _comment_counts: dict[tuple[str, str, str], int] = {}
 _comment_lock = threading.Lock()
 
+#: Failed unlock attempts, ``{(artifact id, client ip, UTC hour): count}``.
+#: Only *failures* are counted, and the hour in the key makes the window reset
+#: itself. In-memory and therefore per-replica, like the counters above.
+_unlock_failures: dict[tuple[str, str, str], int] = {}
+_unlock_lock = threading.Lock()
+
 #: Above this many live buckets, stale days are swept on the next submission.
 _SUBMISSION_SWEEP_AT = 1000
 
@@ -279,6 +320,11 @@ def _now() -> str:
 def _utc_day() -> str:
     """Current UTC calendar day, used as the rate-limit bucket."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _utc_hour() -> str:
+    """Current UTC hour, used as the unlock-throttle bucket."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
 
 
 def _claim_slot(
@@ -329,6 +375,60 @@ def _claim_comment_slot(artifact_id: str, contributor_key: str) -> bool:
     )
 
 
+def _unlock_throttled(artifact_id: str, client_ip: str) -> bool:
+    """True when this (artifact, client) burnt its failed-attempt budget.
+
+    Verifying an artifact password runs a full PBKDF2 (200k iterations), so an
+    unthrottled gate is both a password oracle and a cheap way to burn the
+    hub's CPU. Only failures are counted, so a legitimate reader who types the
+    password correctly is never affected, and the hour in the bucket key makes
+    the window reset on its own.
+    """
+    with _unlock_lock:
+        count = _unlock_failures.get((artifact_id, client_ip, _utc_hour()), 0)
+    return count >= settings.max_unlock_attempts_per_hour
+
+
+def _record_unlock_failure(artifact_id: str, client_ip: str) -> None:
+    """Count one *failed* password attempt against the hourly budget."""
+    hour = _utc_hour()
+    bucket = (artifact_id, client_ip, hour)
+    with _unlock_lock:
+        if len(_unlock_failures) > _SUBMISSION_SWEEP_AT:
+            for stale in [key for key in _unlock_failures if key[2] != hour]:
+                del _unlock_failures[stale]
+        _unlock_failures[bucket] = _unlock_failures.get(bucket, 0) + 1
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client address, used only as a rate-limit bucket key.
+
+    ``X-Real-IP`` is what our own nginx sets. It is deliberately *not* trusted
+    for anything but bucketing: a forged value can only split an attacker's
+    own budget, never grant access or identify anybody.
+    """
+    real_ip = _first_forwarded(request.headers.get("x-real-ip"))
+    if real_ip:
+        return real_ip
+    client = request.client
+    return client.host if client is not None else "unknown"
+
+
+def _version_rate_limited() -> JSONResponse:
+    """429 shared by every route that adds a version (owner updates included)."""
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "too many versions today",
+            "detail": (
+                f"Your project may submit {settings.max_versions_per_day} "
+                "versions of one artifact per UTC day."
+            ),
+            "limit": settings.max_versions_per_day,
+        },
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Build both stores and try (but do not require) an initial hydration."""
@@ -342,6 +442,8 @@ async def lifespan(app: FastAPI):
         settings.cache_dir,
         settings.cache_max_entries,
         settings.max_versions,
+        settings.max_envelope_bytes,
+        settings.max_proposed_versions,
     )
     app.state.comments = CommentStore(
         backend,
@@ -559,6 +661,17 @@ def _first_forwarded(raw: str | None) -> str:
     return raw.split(",", 1)[0].strip()
 
 
+def _forwarded_trusted() -> bool:
+    """True when ``X-Forwarded-Host``/``-Proto`` may name the public origin.
+
+    Only when no explicit ``HUB_PUBLIC_BASE_URL`` is configured (that one wins
+    outright) *and* the deployment opted in with
+    ``HUB_TRUST_FORWARDED_HEADERS``. Otherwise the headers are client-supplied
+    and unverifiable, so they are ignored entirely.
+    """
+    return not settings.public_base_url and settings.trust_forwarded_headers
+
+
 @lru_cache(maxsize=8)
 def _public_origin(public_base_url: str | None) -> tuple[str, str] | None:
     """``(scheme, netloc)`` of ``HUB_PUBLIC_BASE_URL``, or None when unusable.
@@ -616,20 +729,28 @@ async def public_origin(request: Request, call_next):
     the forwarded headers itself, which is why JSON payload URLs were correct
     while redirects were not.
 
-    Precedence: an explicitly configured ``HUB_PUBLIC_BASE_URL`` wins, then the
-    forwarded headers; when neither yields a usable value the scope is left
-    exactly as it arrived.
+    Precedence: an explicitly configured ``HUB_PUBLIC_BASE_URL`` wins, then —
+    *only* when ``HUB_TRUST_FORWARDED_HEADERS`` is on — the forwarded headers;
+    when neither yields a usable value the scope is left exactly as it
+    arrived. Forwarded headers are off by default because any direct client
+    can send them: honoring them unconditionally let an attacker choose the
+    host in our redirects and generated links. Production sets
+    HUB_PUBLIC_BASE_URL, so nothing changes there; a developer running behind
+    a local proxy opts in.
     """
     origin = _public_origin(settings.public_base_url)
     if origin is not None:
         scheme, host = origin
-    else:
+    elif _forwarded_trusted():
         scheme = _first_forwarded(request.headers.get("x-forwarded-proto")).lower()
         host = _first_forwarded(request.headers.get("x-forwarded-host"))
         if scheme not in _PUBLIC_SCHEMES:
             scheme = ""
         if not _PUBLIC_HOST.match(host):
             host = ""
+    else:
+        scheme = ""
+        host = ""
     if scheme:
         request.scope["scheme"] = scheme
     if host:
@@ -663,11 +784,19 @@ async def backend_error_handler(request: Request, exc: BackendError) -> Response
 
 
 def base_url(request: Request) -> str:
-    """Absolute base URL of this service as seen by the client."""
+    """Absolute base URL of this service as seen by the client.
+
+    Same precedence as the :func:`public_origin` middleware: the configured
+    public base URL, then the forwarded headers but only when they are trusted
+    (see :func:`_forwarded_trusted`), then the request as it arrived.
+    """
     if settings.public_base_url:
         return settings.public_base_url
-    scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
-    host = request.headers.get("x-forwarded-host") or request.url.netloc
+    scheme = request.url.scheme
+    host = request.url.netloc
+    if _forwarded_trusted():
+        scheme = request.headers.get("x-forwarded-proto") or scheme
+        host = request.headers.get("x-forwarded-host") or host
     return f"{scheme.split(',')[0].strip()}://{host.split(',')[0].strip()}"
 
 
@@ -730,18 +859,56 @@ def optional_caller(request: Request) -> Owner | None:
         return None
 
 
+def password_scope(meta: ArtifactMeta) -> str:
+    """Cookie scope binding an unlock cookie to the *current* password record.
+
+    A cookie signed under the previous password no longer verifies once the
+    owner replaces or clears the password, because the scope mixed into the
+    signature changed. Only a prefix of the stored PBKDF2 digest is used: it
+    is already a one-way hash, never leaves the server, and a prefix is enough
+    to change whenever the record does.
+    """
+    record = meta.password
+    if not isinstance(record, dict):
+        return "open"
+    digest = record.get("hash")
+    if not isinstance(digest, str) or not digest:
+        return "open"
+    return digest[:16]
+
+
 def reader_allowed(meta: ArtifactMeta, request: Request) -> bool:
-    """True when the caller may read a (possibly password-protected) artifact."""
+    """True when the caller may read a (possibly password-protected) artifact.
+
+    Raises ``HTTPException`` 429 when this client has burnt its hourly budget
+    of failed password attempts on this artifact — a wrong password is cheap
+    to send and expensive (PBKDF2) to check.
+    """
     if not meta.password:
         return True
-    supplied = request.headers.get("x-artifact-password")
-    if supplied and check_password(supplied, meta.password):
-        return True
+    # The cookie is checked first: it is a cheap HMAC, and a reader who
+    # already unlocked must never be caught by the brute-force throttle.
     cookie = request.cookies.get(f"art_{meta.id}")
     if cookie and request.app.state.signer.check(
-        meta.id, cookie, settings.unlock_cookie_max_age_s
+        meta.id, cookie, settings.unlock_cookie_max_age_s, password_scope(meta)
     ):
         return True
+    supplied = request.headers.get("x-artifact-password")
+    if not supplied:
+        return False
+    client_ip = _client_ip(request)
+    if _unlock_throttled(meta.id, client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "too many wrong passwords for this artifact from your "
+                f"address; at most {settings.max_unlock_attempts_per_hour} "
+                "failed attempts are allowed per hour"
+            ),
+        )
+    if check_password(supplied, meta.password):
+        return True
+    _record_unlock_failure(meta.id, client_ip)
     return False
 
 
@@ -785,6 +952,24 @@ def health_headers(request: Request) -> dict[str, Any]:
     custom headers (which would silently break header-based authentication).
     """
     return {"received_header_names": sorted(request.headers.keys())}
+
+
+def _framed(envelope: Envelope) -> HTMLResponse:
+    """One version, wrapped in the zero-chrome sandboxed-iframe page.
+
+    The browser-facing read paths never hand a publisher's document to the
+    hub's own origin any more: the artifact runs inside an iframe sandboxed
+    without ``allow-same-origin``, i.e. in an opaque origin, so its scripts
+    cannot reach the ``sessionStorage`` that ``/admin`` and ``/a/{id}/review``
+    use for a visitor's Storage token. ``frame-ancestors 'self'`` keeps the
+    wrapper itself from being embedded elsewhere; no other CSP directive is
+    set, because the artifact inside ``srcdoc`` must keep rendering exactly as
+    published. Machines that need the bytes use ``/a/{id}/raw``.
+    """
+    return HTMLResponse(
+        artifact_frame_page(envelope.title, envelope.html),
+        headers={"Content-Security-Policy": "frame-ancestors 'self'"},
+    )
 
 
 def _not_found(artifact_id: str) -> JSONResponse:
@@ -1279,17 +1464,44 @@ def _content_fields(body: PublishBody | UpdateBody | VersionBody) -> list[str]:
     ]
 
 
-def _check_git_credentials(body: PublishBody | UpdateBody | VersionBody) -> None:
-    """Reject clone credentials that were sent without a ``git_url``.
+def strip_git_userinfo(git_url: str) -> str:
+    """Remove ``user:password@`` userinfo from a git URL.
 
-    Silently ignoring them would leave the caller believing a token was used
-    when it was not, so this is a hard 422.
+    A submitted ``https://user:token@github.com/org/repo`` used to be stored
+    verbatim in the version envelope and echoed back through public metadata
+    and version history, leaking the credential to every capability-URL
+    holder. The builder already scrubs it out of clone output, but the
+    envelope kept the original — so it is stripped here, before validation,
+    storage or any response. Private clones do not need it: they authenticate
+    with the separate, request-scoped ``git_token``/``git_username`` fields.
+    """
+    parsed = urlsplit(git_url)
+    if not parsed.netloc or "@" not in parsed.netloc:
+        return git_url
+    host = parsed.netloc.rsplit("@", 1)[1]
+    return urlunsplit(
+        (parsed.scheme, host, parsed.path, parsed.query, parsed.fragment)
+    )
+
+
+def _normalize_git_url(body: PublishBody | UpdateBody | VersionBody) -> None:
+    """Strip userinfo from ``body.git_url`` in place, before anything uses it."""
+    if body.git_url is not None:
+        body.git_url = strip_git_userinfo(str(body.git_url))
+
+
+def _check_git_credentials(body: PublishBody | UpdateBody | VersionBody) -> None:
+    """Reject git-only fields that were sent without a ``git_url``.
+
+    Covers both the clone credentials and ``git_ref``/``git_path``: silently
+    ignoring any of them would leave the caller believing a token was used, or
+    a branch checked out, when it was not. So this is a hard 422.
     """
     if body.git_url is not None:
         return
     stray = [
         name
-        for name in ("git_username", "git_token")
+        for name in ("git_ref", "git_path", "git_username", "git_token")
         if getattr(body, name) is not None
     ]
     if stray:
@@ -1438,7 +1650,10 @@ def _build(
             git_token=body.git_token,
         )
         # Deliberately only url/ref/path/commit: the clone credentials are
-        # transient and must not reach the stored envelope.
+        # transient and must not reach the stored envelope. "private" records
+        # *that* a credential was needed (never the credential itself), so the
+        # public read path can withhold the repository URL — the name of a
+        # private repo is itself information its owner did not publish.
         source = {
             "git": {
                 "url": str(body.git_url),
@@ -1447,6 +1662,8 @@ def _build(
                 "commit": built.git_commit,
             }
         }
+        if body.git_token:
+            source["git"]["private"] = True
         return built, source
     except BuildError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1482,6 +1699,21 @@ def _identity(owner: Owner) -> dict[str, Any]:
         "project_name": owner.project_name,
         "key": owner.key,
     }
+
+
+def _public_version_meta(row: dict) -> dict:
+    """One version's public metadata with a private repo's URL withheld.
+
+    ``Envelope.public_meta`` lives in the store and hands out the whole ``git``
+    dict; it cannot tell a public repository from one that needed a token. A
+    private repository's URL names infrastructure its owner never published,
+    so it is dropped here, at response time, while ref/path/commit and the
+    ``private`` flag itself stay — provenance without the address.
+    """
+    git = row.get("git")
+    if not isinstance(git, dict) or not git.get("private"):
+        return row
+    return {**row, "git": {k: v for k, v in git.items() if k != "url"}}
 
 
 def _head_version_of(request: Request, artifact_id: str) -> int | None:
@@ -1675,6 +1907,16 @@ def context(request: Request) -> dict:
             },
             {
                 "method": "GET",
+                "path": "/health/headers",
+                "auth": "none",
+                "purpose": (
+                    "diagnostic: the names (never the values) of the request "
+                    "headers that reached the app, to detect a proxy that "
+                    "strips X-StorageApi-Token or X-Storage-Stack"
+                ),
+            },
+            {
+                "method": "GET",
                 "path": "/context",
                 "auth": "none",
                 "purpose": "this manifest",
@@ -1745,7 +1987,11 @@ def context(request: Request) -> dict:
                 "method": "GET",
                 "path": "/a/{id}",
                 "auth": "url capability; password form when protected",
-                "purpose": "rendered head version",
+                "purpose": (
+                    "rendered head version, inside a full-viewport iframe "
+                    "sandboxed without allow-same-origin (the document runs "
+                    "in an opaque origin); use /a/{id}/raw for the bytes"
+                ),
             },
             {
                 "method": "POST",
@@ -1937,8 +2183,10 @@ def context(request: Request) -> dict:
             ),
             "rules": [
                 "exactly one of html, markdown, git_url",
-                "git_token and git_username are only valid together with git_url "
-                "(422 otherwise)",
+                "git_ref, git_path, git_token and git_username are only valid "
+                "together with git_url (422 otherwise)",
+                "userinfo in git_url (https://user:pass@host/...) is stripped "
+                "before the URL is validated, cloned, stored or returned",
                 "PUT accepts the same fields, all optional, plus clear_password, "
                 "accept_versions/accept_versions_mode, contributors, "
                 "comments_mode and status; a title is only valid together "
@@ -1984,7 +2232,9 @@ def context(request: Request) -> dict:
             ),
             "rate_limit": (
                 f"{settings.max_versions_per_day} submitted versions per "
-                "contributor project per artifact per UTC day (429 afterwards)"
+                "project per artifact per UTC day (429 afterwards); owner "
+                "content updates through PUT /api/artifacts/{id} count "
+                "against the same budget"
             ),
             "deletion": (
                 "The owner may delete any version except the last live one "
@@ -2048,8 +2298,24 @@ def context(request: Request) -> dict:
             "max_note_chars": MAX_NOTE_CHARS,
             "max_comments_per_day": settings.max_comments_per_day,
             "max_contributors": MAX_CONTRIBUTORS,
+            "max_unlock_attempts_per_hour": settings.max_unlock_attempts_per_hour,
         },
         "notes": [
+            "GET /a/{id} and /a/{id}/v/{n} return a wrapper page whose "
+            "full-viewport iframe carries the artifact as srcdoc, sandboxed "
+            "without allow-same-origin: the document runs in an opaque origin "
+            "and cannot touch this origin's storage or cookies. "
+            "GET /a/{id}/raw returns the same bytes unwrapped, for machines — "
+            "anything that renders them does so in its own context.",
+            "The reader password gate is throttled: after "
+            f"{settings.max_unlock_attempts_per_hour} failed attempts per "
+            "artifact per client address per hour it answers 429. Successful "
+            "unlocks never count. An unlock cookie is bound to the password "
+            "that issued it, so changing or clearing the password revokes "
+            "every cookie immediately.",
+            "A version published from a private repository (one that needed "
+            "git_token) reports git.private true in public metadata and "
+            "history, and its git.url is withheld.",
             "Artifact URLs are capabilities: the unguessable id is the only "
             "access control by default, there is no public listing, and every "
             "/a/* response carries X-Robots-Tag: noindex, nofollow.",
@@ -2246,16 +2512,25 @@ def admin(request: Request) -> HTMLResponse:
     response_class=HTMLResponse,
     summary="Rendered artifact page (head version)",
     description=(
-        "Serves the head version's built HTML as-is — the newest live "
-        "version, or the one the owner pinned. No token is needed: the "
-        "unguessable id in the URL is the access control.\n\n"
+        "Serves the head version — the newest live version, or the one the "
+        "owner pinned. No token is needed: the unguessable id in the URL is "
+        "the access control.\n\n"
+        "The document is returned inside a minimal wrapper page: a "
+        "full-viewport iframe carrying the artifact as srcdoc, sandboxed "
+        "without allow-same-origin, so the artifact's own scripts run in an "
+        "opaque origin and cannot reach this origin's storage or cookies. "
+        "Readers see no difference; machines that want the bytes themselves "
+        "use GET /a/{id}/raw.\n\n"
         + PASSWORD_GATE_NOTE
         + "\n\nUntil the caller is unlocked, this returns 401 with the unlock "
         "form as HTML rather than the artifact."
     ),
     responses={
         200: {
-            "description": "The head version's HTML document.",
+            "description": (
+                "The wrapper page embedding the head version's HTML document "
+                "in a sandboxed iframe."
+            ),
             "content": CONTENT_HTML,
         },
         401: {
@@ -2269,6 +2544,7 @@ def admin(request: Request) -> HTMLResponse:
                 "No artifact exists with this id, or it has no live version."
             )
         },
+        429: RESP_UNLOCK_429,
         502: RESP_HUB_502,
     },
 )
@@ -2276,7 +2552,7 @@ def read_artifact(
     request: Request,
     artifact_id: str = PathParam(..., description=ARTIFACT_ID_DESC),
 ) -> Response:
-    """Serve the head version, or the unlock form when protected."""
+    """Serve the head version sandboxed, or the unlock form when protected."""
     meta = _meta_of(request, artifact_id)
     if meta is None:
         return _not_found(artifact_id)
@@ -2285,7 +2561,7 @@ def read_artifact(
     envelope = request.app.state.store.get_head(artifact_id)
     if envelope is None:
         return _not_found(artifact_id)
-    return HTMLResponse(envelope.html)
+    return _framed(envelope)
 
 
 @app.post(
@@ -2298,8 +2574,14 @@ def read_artifact(
         "application/x-www-form-urlencoded 'password' field. On a correct "
         "password this responds 303 to the artifact page and sets a signed, "
         "HttpOnly cookie scoped to /a/{id}, so later visits from that browser "
-        "skip the form until the cookie expires. Machine clients do not need "
-        "this endpoint at all — they send X-Artifact-Password on each read."
+        "skip the form until the cookie expires. The cookie is bound to the "
+        "password that issued it: changing or clearing the artifact's "
+        "password revokes every cookie already handed out.\n\n"
+        "Failed attempts are throttled per artifact and client address "
+        "(HUB_MAX_UNLOCK_ATTEMPTS_PER_HOUR per hour, 429 afterwards); a "
+        "correct password never counts against the budget. Machine clients do "
+        "not need this endpoint at all — they send X-Artifact-Password on "
+        "each read, under the same throttle."
     ),
     responses={
         303: {
@@ -2316,6 +2598,10 @@ def read_artifact(
             "content": CONTENT_HTML,
         },
         404: RESP_NOT_FOUND,
+        429: {
+            **RESP_UNLOCK_429,
+            "content": CONTENT_HTML,
+        },
         502: RESP_HUB_502,
     },
 )
@@ -2330,14 +2616,30 @@ def unlock_artifact(
     meta = _meta_of(request, artifact_id)
     if meta is None:
         return _not_found(artifact_id)
-    if meta.password and not check_password(password, meta.password):
-        return HTMLResponse(
-            unlock_page(artifact_id, "Wrong password"), status_code=401
-        )
+    if meta.password:
+        # Each attempt costs a full PBKDF2, so the budget is checked *before*
+        # the hash runs; only failures are counted, so a reader who gets it
+        # right on the first try is never throttled.
+        client_ip = _client_ip(request)
+        if _unlock_throttled(artifact_id, client_ip):
+            return HTMLResponse(
+                unlock_page(
+                    artifact_id,
+                    "Too many attempts — wait an hour and try again",
+                ),
+                status_code=429,
+            )
+        if not check_password(password, meta.password):
+            _record_unlock_failure(artifact_id, client_ip)
+            return HTMLResponse(
+                unlock_page(artifact_id, "Wrong password"), status_code=401
+            )
     response = RedirectResponse(f"/a/{artifact_id}", status_code=303)
     response.set_cookie(
         key=f"art_{artifact_id}",
-        value=request.app.state.signer.make(artifact_id),
+        # Bound to the current password record: changing or clearing the
+        # password invalidates every cookie issued under the old one.
+        value=request.app.state.signer.make(artifact_id, password_scope(meta)),
         path=f"/a/{artifact_id}",
         httponly=True,
         secure=True,
@@ -2354,8 +2656,11 @@ def unlock_artifact(
     summary="Raw artifact HTML (head version)",
     description=(
         "The exact built HTML of the head version, with no unlock-form "
-        "fallback — meant for machine consumption. Identical bytes to what "
-        "GET /a/{id} serves.\n\n" + PASSWORD_GATE_NOTE + "\n\nA protected "
+        "fallback — meant for machine consumption. These are the bytes GET "
+        "/a/{id} embeds in its sandboxed iframe; served here unwrapped, so "
+        "anything that renders them does so in its own context.\n\n"
+        + PASSWORD_GATE_NOTE
+        + "\n\nA protected "
         "artifact without a valid password answers 401 as JSON, never as a "
         "form."
     ),
@@ -2375,6 +2680,7 @@ def unlock_artifact(
                 "No artifact exists with this id, or it has no live version."
             )
         },
+        429: RESP_UNLOCK_429,
         502: RESP_HUB_502,
     },
 )
@@ -2425,6 +2731,7 @@ def read_raw(
                 "source was not retained (git-sourced Markdown)."
             )
         },
+        429: RESP_UNLOCK_429,
         502: RESP_HUB_502,
     },
 )
@@ -2500,7 +2807,7 @@ def read_meta(
     versions = store.list_versions(artifact_id)
     return JSONResponse(
         {
-            **head.public_meta(is_head=True),
+            **_public_version_meta(head.public_meta(is_head=True)),
             "id": artifact_id,
             "protected": bool(meta.password),
             "accept_versions": meta.accept_versions,
@@ -2522,7 +2829,8 @@ def read_meta(
     response_class=HTMLResponse,
     summary="One specific version",
     description=(
-        "Serves the built HTML of a single version, live or proposed. A "
+        "Serves a single version, live or proposed, in the same sandboxed "
+        "wrapper page as GET /a/{id}. A "
         "*proposed* version is private: only the artifact owner and the "
         "version's own author may read it, and they identify themselves by "
         "sending the two management headers (X-StorageApi-Token and "
@@ -2548,6 +2856,7 @@ def read_meta(
         },
         404: {"description": "No artifact, or no such version."},
         422: {"description": "'version' is not an integer."},
+        429: RESP_UNLOCK_429,
         502: RESP_HUB_502,
     },
 )
@@ -2567,7 +2876,7 @@ def read_version(
         return _version_not_found(artifact_id, version)
     if not may_see(meta, envelope, optional_caller(request)):
         return _proposal_hidden(artifact_id, version)
-    return HTMLResponse(envelope.html)
+    return _framed(envelope)
 
 
 @app.get(
@@ -2603,6 +2912,7 @@ def read_version(
             )
         },
         404: RESP_NOT_FOUND,
+        429: RESP_UNLOCK_429,
         502: RESP_HUB_502,
     },
 )
@@ -2633,7 +2943,9 @@ def read_versions(
         return _password_required()
 
     store = request.app.state.store
-    versions = store.list_versions(artifact_id)
+    versions = [
+        _public_version_meta(row) for row in store.list_versions(artifact_id)
+    ]
     head_version = _head_version_of(request, artifact_id)
     base = base_url(request)
 
@@ -2711,6 +3023,7 @@ def read_versions(
                 "One side is larger than the configured HUB_DIFF_MAX_BYTES."
             )
         },
+        429: RESP_UNLOCK_429,
         502: RESP_HUB_502,
     },
 )
@@ -2803,6 +3116,7 @@ def read_diff(
             )
         },
         404: RESP_NOT_FOUND,
+        429: RESP_UNLOCK_429,
         502: RESP_HUB_502,
     },
 )
@@ -2856,6 +3170,7 @@ def read_comments(
                 "No artifact exists with this id, or it has no live version."
             )
         },
+        429: RESP_UNLOCK_429,
         502: RESP_HUB_502,
     },
 )
@@ -2908,6 +3223,7 @@ def export_markdown(
             )
         },
         404: RESP_NOT_FOUND,
+        429: RESP_UNLOCK_429,
         502: RESP_HUB_502,
     },
 )
@@ -2923,10 +3239,14 @@ def export_vault(
         return _password_required()
 
     store = request.app.state.store
+    # Proposals are moderated content: the public vault must not leak them.
+    # Only the owner or a proposal's author (authenticated via the standard
+    # token headers) gets them included in their download.
+    caller = optional_caller(request)
     envelopes: list[Envelope] = []
     for row in store.list_versions(artifact_id):
         envelope = store.get_version(artifact_id, row["version"])
-        if envelope is not None:
+        if envelope is not None and may_see(meta, envelope, caller):
             envelopes.append(envelope)
     threads = request.app.state.comments.list_for(artifact_id)
 
@@ -2967,6 +3287,7 @@ def export_vault(
             "content": CONTENT_HTML,
         },
         404: RESP_NOT_FOUND,
+        429: RESP_UNLOCK_429,
         502: RESP_HUB_502,
     },
 )
@@ -3033,12 +3354,12 @@ def publish_artifact(
     owner, token = auth
     ensure_hydrated(request.app)
 
+    _normalize_git_url(body)
     _check_git_credentials(body)
     _require_exactly_one_content(body)
 
     built, source = _build(body)
     artifact_id = new_artifact_id()
-    canonical_file_id = _store_canonical(owner, token, artifact_id, built.html)
 
     now = _now()
     identity = _identity(owner)
@@ -3052,6 +3373,42 @@ def publish_artifact(
         created_at=now,
         updated_at=now,
     )
+    store = request.app.state.store
+    # Ordering, and what it buys:
+    #
+    #   1. the hub-side meta record — the thing store.delete() can roll back,
+    #   2. the canonical copy in the *caller's* project, which only needs the
+    #      artifact id, and
+    #   3. the version envelope, which needs the canonical file id.
+    #
+    # Uploading the canonical copy first (as this used to) meant a later
+    # failure left a stray artifact-* file in someone else's project with
+    # nothing on the hub pointing at it. Now a failed canonical upload rolls
+    # the meta record back, so nothing half-published survives the request.
+    #
+    # Residual risk, deliberately not solved here: if the rollback delete
+    # itself fails (logged at ERROR below), or the process dies between steps
+    # 1 and 3, a meta record with no version can be left behind. It is inert —
+    # every read path answers 404 for it, because get_head finds nothing — but
+    # it does need reaping by hand. Real transactionality needs a two-phase
+    # marker in the store and is out of scope.
+    store.save_meta(meta)
+    try:
+        canonical_file_id = _store_canonical(owner, token, artifact_id, built.html)
+    except Exception:
+        rolled_back = False
+        try:
+            rolled_back = store.delete(artifact_id)
+        except Exception:  # noqa: BLE001 - the original failure must win
+            rolled_back = False
+        if not rolled_back:
+            logger.error(
+                "Rollback of artifact %s failed after its canonical upload "
+                "failed; a meta record with no version may remain in Storage "
+                "and needs to be reaped by hand",
+                artifact_id,
+            )
+        raise
     envelope = Envelope(
         id=artifact_id,
         version=1,
@@ -3064,7 +3421,7 @@ def publish_artifact(
         canonical_file_id=canonical_file_id,
         created_at=now,
     )
-    request.app.state.store.create(meta, envelope)
+    store.add_version(envelope)
     logger.info(
         "Published artifact %s (owner project %s, source %s, %d bytes, "
         "protected=%s, accept_versions=%s, canonical file %s)",
@@ -3123,6 +3480,7 @@ def publish_artifact(
                 "failure."
             )
         },
+        429: RESP_VERSIONS_429,
         502: {
             "description": (
                 "The caller's Keboola stack could not be reached to verify "
@@ -3148,6 +3506,7 @@ def update_artifact(
         return _not_found(artifact_id)
     _owner_only(meta, owner)
 
+    _normalize_git_url(body)
     _check_git_credentials(body)
     present = _content_fields(body)
     if len(present) > 1:
@@ -3172,7 +3531,22 @@ def update_artifact(
     if present and meta.is_final() and body.status != ARTIFACT_DRAFT:
         return _document_is_final(artifact_id, "new versions")
 
+    # An owner update that carries content is a version submission like any
+    # other, so it draws on the same per-project daily budget contributors
+    # have. Checked before anything is persisted, so a throttled call changes
+    # nothing at all.
+    if present and not _claim_submission_slot(artifact_id, owner.key):
+        return _version_rate_limited()
+
     now = _now()
+    # Build first. A 413/422 from _build used to arrive *after* the settings
+    # change had already been saved, leaving an update the caller was told
+    # failed but which had half happened. Nothing is persisted until the new
+    # content actually exists.
+    built = source = None
+    if present:
+        built, source = _build(body)
+
     if body.clear_password:
         meta.password = None
     elif body.password:
@@ -3181,22 +3555,27 @@ def update_artifact(
     meta.updated_at = now
     store.save_meta(meta)
 
-    if present:
-        built, source = _build(body)
+    if built is not None:
+        # Residual risk (documented, not fixed here): the settings above are
+        # already committed, so a failure in the canonical upload or the
+        # version write leaves them applied while the content update did not
+        # land. The call answers 502, and the artifact stays readable at its
+        # previous version — no half-written version is ever served.
         canonical_file_id = _store_canonical(owner, token, artifact_id, built.html)
         envelope = Envelope(
             id=artifact_id,
-            version=store.next_version(artifact_id),
+            # Replaced by add_version_next, which allocates atomically.
+            version=0,
             title=built.title,
             html=built.html,
             source_type=built.source_type,
-            source=source,
+            source=source or {},
             author=_identity(owner),
             status=STATUS_LIVE,
             canonical_file_id=canonical_file_id,
             created_at=now,
         )
-        store.add_version(envelope)
+        envelope.version = store.add_version_next(envelope)
     else:
         envelope = store.get_head(artifact_id)
         if envelope is None:
@@ -3292,7 +3671,10 @@ def list_artifacts(
         502: {
             "description": (
                 "The caller's Keboola stack could not be reached to verify "
-                "the token, or the hub's own Storage is unavailable."
+                "the token, the hub's own Storage is unavailable, or the "
+                "delete only partially succeeded — some stored files could "
+                "not be removed, so the artifact is still readable and the "
+                "call must be retried."
             )
         },
     },
@@ -3312,7 +3694,26 @@ def delete_artifact(
         return _not_found(artifact_id)
     _owner_only(meta, owner)
 
-    store.delete(artifact_id)
+    if not store.delete(artifact_id):
+        # store.delete only reports success when *every* authoritative file is
+        # confirmed gone; on a partial failure it keeps the index so the
+        # artifact stays readable. Reporting "deleted": true here would tell an
+        # owner their content is unreachable while it is still being served.
+        logger.error(
+            "Partial delete of artifact %s: some Storage files remain",
+            artifact_id,
+        )
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "artifact not fully deleted",
+                "detail": (
+                    "Some stored files could not be removed; the artifact is "
+                    "still readable. Retry the delete."
+                ),
+                "id": artifact_id,
+            },
+        )
     # Comment threads live in their own files; without this they would outlive
     # the artifact as orphaned Storage files nothing can ever reach again.
     threads = request.app.state.comments.delete_all_for(artifact_id)
@@ -3376,12 +3777,7 @@ def delete_artifact(
                 "without git_url, an over-long note, or a build failure."
             )
         },
-        429: {
-            "description": (
-                "This project reached HUB_MAX_VERSIONS_PER_DAY submissions "
-                "for this artifact today."
-            )
-        },
+        429: RESP_VERSIONS_429,
         502: {
             "description": (
                 "The caller's Keboola stack could not be reached, the "
@@ -3423,21 +3819,12 @@ def submit_version(
             ),
         )
 
+    _normalize_git_url(body)
     _check_git_credentials(body)
     _require_exactly_one_content(body)
 
     if not _claim_submission_slot(artifact_id, caller.key):
-        return JSONResponse(
-            status_code=429,
-            content={
-                "error": "too many versions today",
-                "detail": (
-                    f"Your project may submit {settings.max_versions_per_day} "
-                    "versions of one artifact per UTC day."
-                ),
-                "limit": settings.max_versions_per_day,
-            },
-        )
+        return _version_rate_limited()
 
     built, source = _build(body)
     # The canonical copy always goes to the *submitter's* project: whoever
@@ -3447,7 +3834,8 @@ def submit_version(
     status = STATUS_LIVE if is_owner else STATUS_PROPOSED
     envelope = Envelope(
         id=artifact_id,
-        version=store.next_version(artifact_id),
+        # Replaced by add_version_next, which allocates atomically.
+        version=0,
         title=built.title,
         html=built.html,
         source_type=built.source_type,
@@ -3458,7 +3846,7 @@ def submit_version(
         canonical_file_id=canonical_file_id,
         created_at=_now(),
     )
-    store.add_version(envelope)
+    envelope.version = store.add_version_next(envelope)
     logger.info(
         "Artifact %s got version %d (%s) from project %s",
         artifact_id,
@@ -3581,7 +3969,10 @@ def promote_version(
         502: {
             "description": (
                 "The caller's Keboola stack could not be reached to verify "
-                "the token, or the hub's own Storage is unavailable."
+                "the token, the hub's own Storage is unavailable, or the "
+                "delete only partially succeeded — the stored file could not "
+                "be removed, so the version is still readable and the call "
+                "must be retried."
             )
         },
     },
@@ -3615,7 +4006,16 @@ def delete_version(
             ),
         )
 
-    if not store.delete_version(artifact_id, version):
+    # store.delete_version answers False for two very different reasons: the
+    # policy refusal below, and a backend delete that did not confirm. The
+    # refusal is decided here so the remaining False can only mean "the files
+    # are still in Storage", which is a 502, not a 409.
+    other_live = [
+        row
+        for row in store.list_versions(artifact_id)
+        if row.get("status") == STATUS_LIVE and row.get("version") != version
+    ]
+    if envelope.status == STATUS_LIVE and not other_live:
         return JSONResponse(
             status_code=409,
             content={
@@ -3623,6 +4023,26 @@ def delete_version(
                 "detail": (
                     "An artifact must keep at least one live version. Publish "
                     "a replacement first, or delete the whole artifact."
+                ),
+                "id": artifact_id,
+                "version": version,
+            },
+        )
+
+    if not store.delete_version(artifact_id, version):
+        logger.error(
+            "Partial delete of version %d of artifact %s: the Storage file "
+            "could not be removed",
+            version,
+            artifact_id,
+        )
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "version not fully deleted",
+                "detail": (
+                    "Some stored files could not be removed; the version is "
+                    "still readable. Retry the delete."
                 ),
                 "id": artifact_id,
                 "version": version,

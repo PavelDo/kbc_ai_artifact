@@ -75,24 +75,39 @@ def check_password(password: str, record: dict) -> bool:
 
 
 class CookieSigner:
-    """Signs and verifies unlock cookies scoped to a single artifact ID."""
+    """Signs and verifies unlock cookies scoped to a single artifact ID.
+
+    An optional ``scope`` is mixed into the signed payload so a cookie can be
+    bound to state that must revoke it. The unlock flow passes a short digest
+    of the artifact's *current* password record: replacing or clearing the
+    password changes the scope, and every cookie issued under the previous
+    password stops verifying immediately instead of living on until it
+    expires.
+    """
 
     def __init__(self, secret_key: str) -> None:
         self._signer = TimestampSigner(secret_key, salt=_COOKIE_SALT)
 
-    def make(self, artifact_id: str) -> str:
-        """Produce a signed cookie value for the given artifact ID."""
-        return self._signer.sign(artifact_id).decode("utf-8")
+    @staticmethod
+    def _payload(artifact_id: str, scope: str) -> str:
+        """The string that actually gets signed."""
+        return f"{artifact_id}.{scope}" if scope else artifact_id
 
-    def check(self, artifact_id: str, value: str, max_age_s: int) -> bool:
-        """Verify a cookie value was signed for ``artifact_id`` and is fresh.
+    def make(self, artifact_id: str, scope: str = "") -> str:
+        """Produce a signed cookie value for an artifact ID and scope."""
+        return self._signer.sign(self._payload(artifact_id, scope)).decode("utf-8")
+
+    def check(
+        self, artifact_id: str, value: str, max_age_s: int, scope: str = ""
+    ) -> bool:
+        """Verify a cookie value was signed for this ID/scope and is fresh.
 
         Returns True only if the signature is valid, unexpired, and the
-        unsigned payload matches ``artifact_id`` exactly. Any exception
-        (bad signature, expired, malformed input) yields False.
+        unsigned payload matches ``artifact_id`` and ``scope`` exactly. Any
+        exception (bad signature, expired, malformed input) yields False.
         """
         try:
             payload = self._signer.unsign(value, max_age=max_age_s)
         except Exception:
             return False
-        return payload.decode("utf-8") == artifact_id
+        return payload.decode("utf-8") == self._payload(artifact_id, scope)

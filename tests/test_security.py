@@ -108,3 +108,40 @@ class TestCookieSigner:
         signer_b = CookieSigner("secret-b")
         value = signer_a.make("artifact-1")
         assert signer_b.check("artifact-1", value, max_age_s=3600) is False
+
+    def test_scope_round_trip(self):
+        signer = CookieSigner("secret-key")
+        value = signer.make("artifact-1", "pwhash-abc")
+        assert signer.check("artifact-1", value, max_age_s=3600, scope="pwhash-abc")
+
+    def test_a_different_scope_is_false(self):
+        """A password change changes the scope, revoking every old cookie."""
+        signer = CookieSigner("secret-key")
+        value = signer.make("artifact-1", "pwhash-abc")
+        assert (
+            signer.check("artifact-1", value, max_age_s=3600, scope="pwhash-xyz")
+            is False
+        )
+
+    def test_scoped_cookie_is_not_accepted_unscoped(self):
+        signer = CookieSigner("secret-key")
+        value = signer.make("artifact-1", "pwhash-abc")
+        assert signer.check("artifact-1", value, max_age_s=3600) is False
+
+    def test_unscoped_cookie_is_not_accepted_with_a_scope(self):
+        signer = CookieSigner("secret-key")
+        value = signer.make("artifact-1")
+        assert (
+            signer.check("artifact-1", value, max_age_s=3600, scope="pwhash-abc")
+            is False
+        )
+
+    def test_the_separator_cannot_occur_in_a_real_artifact_id(self):
+        """Why "{id}.{scope}" is unambiguous in practice.
+
+        Splitting on "." would be ambiguous if an artifact id could contain a
+        dot — "a.b" with no scope signs the same payload as "a" with scope
+        "b". It cannot: ids come from ``new_artifact_id`` (base64url), whose
+        alphabet has no ".", so the two payload spaces never overlap.
+        """
+        assert all("." not in new_artifact_id() for _ in range(200))

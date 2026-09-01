@@ -26,7 +26,10 @@ log.
 from __future__ import annotations
 
 import dataclasses
+import html
 import io
+import json
+import logging
 import re
 import zipfile
 from typing import Any, NamedTuple
@@ -38,7 +41,8 @@ import src.main as main
 from src.auth import STACK_ALIASES, AuthError, Owner
 from src.builder import BuiltArtifact
 from src.comments import CommentStore
-from src.kbc import InMemoryFilesBackend
+from src.config import load_settings
+from src.kbc import BackendError, InMemoryFilesBackend
 from src.store import ArtifactStore
 
 AUTH_HEADERS = {"X-StorageApi-Token": "good-token", "X-Kbc-Stack": "us"}
@@ -114,6 +118,7 @@ def api(tmp_path, settings, monkeypatch):
     # inherit another test's tally.
     main._submission_counts.clear()
     main._comment_counts.clear()
+    main._unlock_failures.clear()
 
     with TestClient(main.app, base_url="https://testserver") as client:
         yield Api(
@@ -211,6 +216,7 @@ def test_context_lists_all_endpoints_and_stack_aliases(api: Api) -> None:
         ("GET", "/"),
         ("POST", "/"),
         ("GET", "/health"),
+        ("GET", "/health/headers"),
         ("GET", "/context"),
         ("GET", "/skill"),
         ("GET", "/agent"),
@@ -529,8 +535,47 @@ PROXY_HEADERS = {
 }
 
 
-def test_trailing_slash_redirect_uses_the_forwarded_origin(api: Api) -> None:
+@pytest.fixture
+def trusted_proxy(api: Api, monkeypatch) -> Api:
+    """``api`` with HUB_TRUST_FORWARDED_HEADERS on.
+
+    Forwarded headers are ignored by default (any client can forge them), so
+    every test that expects them to name the public origin has to opt in the
+    way a proxied deployment does.
+    """
+    monkeypatch.setattr(
+        main,
+        "settings",
+        dataclasses.replace(api.settings, trust_forwarded_headers=True),
+    )
+    return api
+
+
+def test_forwarded_headers_are_ignored_unless_trusted(api: Api) -> None:
+    """Default deployment: a forged X-Forwarded-Host must not be honored."""
+    artifact_id = _publish_markdown(api, "# Hello")
+    resp = api.client.get(
+        f"/a/{artifact_id}/", headers=PROXY_HEADERS, follow_redirects=False
+    )
+    assert resp.status_code == 307
+    assert resp.headers["location"] == f"https://testserver/a/{artifact_id}"
+
+    published = api.client.post(
+        "/api/artifacts",
+        json={"markdown": "# Hello"},
+        headers={**AUTH_HEADERS, **PROXY_HEADERS},
+    )
+    assert published.status_code == 201
+    body = published.json()
+    assert body["url"] == f"https://testserver/a/{body['id']}"
+    assert "artifact-hub.example.com" not in published.text
+
+
+def test_trailing_slash_redirect_uses_the_forwarded_origin(
+    trusted_proxy: Api,
+) -> None:
     """The 307 must not leak the internal cluster hostname (see issue)."""
+    api = trusted_proxy
     artifact_id = _publish_markdown(api, "# Hello")
     resp = api.client.get(
         f"/a/{artifact_id}/", headers=PROXY_HEADERS, follow_redirects=False
@@ -542,7 +587,10 @@ def test_trailing_slash_redirect_uses_the_forwarded_origin(api: Api) -> None:
     assert "testserver" not in location
 
 
-def test_api_trailing_slash_redirect_uses_the_forwarded_origin(api: Api) -> None:
+def test_api_trailing_slash_redirect_uses_the_forwarded_origin(
+    trusted_proxy: Api,
+) -> None:
+    api = trusted_proxy
     resp = api.client.get(
         "/api/artifacts/",
         headers={**AUTH_HEADERS, **PROXY_HEADERS},
@@ -561,7 +609,11 @@ def test_public_base_url_wins_over_forwarded_headers_in_redirects(
     monkeypatch.setattr(
         main,
         "settings",
-        dataclasses.replace(api.settings, public_base_url="https://hub.example.org"),
+        dataclasses.replace(
+            api.settings,
+            public_base_url="https://hub.example.org",
+            trust_forwarded_headers=True,
+        ),
     )
     artifact_id = _publish_markdown(api, "# Hello")
     resp = api.client.get(
@@ -581,8 +633,9 @@ def test_redirect_without_forwarded_headers_is_unchanged(api: Api) -> None:
     assert resp.headers["location"] == f"https://testserver/a/{artifact_id}"
 
 
-def test_malformed_forwarded_host_is_ignored(api: Api) -> None:
+def test_malformed_forwarded_host_is_ignored(trusted_proxy: Api) -> None:
     """A broken forwarded value must never become the redirect target."""
+    api = trusted_proxy
     artifact_id = _publish_markdown(api, "# Hello")
     resp = api.client.get(
         f"/a/{artifact_id}/",
@@ -593,8 +646,9 @@ def test_malformed_forwarded_host_is_ignored(api: Api) -> None:
     assert resp.headers["location"] == f"https://testserver/a/{artifact_id}"
 
 
-def test_payload_urls_still_use_the_forwarded_host(api: Api) -> None:
+def test_payload_urls_still_use_the_forwarded_host(trusted_proxy: Api) -> None:
     """Regression: the JSON URLs that were already correct stay correct."""
+    api = trusted_proxy
     resp = api.client.post(
         "/api/artifacts",
         json={"markdown": "# Hello"},
@@ -644,12 +698,46 @@ def test_read_artifact_renders_html_with_no_index_headers(api: Api) -> None:
     assert "Body text" in resp.text
 
 
-def test_raw_returns_exact_same_html_as_rendered_page(api: Api) -> None:
+def test_read_artifact_sandboxes_the_document_in_an_iframe(api: Api) -> None:
+    """The artifact must never execute on the hub's own origin (sec-web)."""
+    artifact_id = _publish_markdown(api, "# Title\n\nBody text")
+    raw = api.client.get(f"/a/{artifact_id}/raw")
+    page = api.client.get(f"/a/{artifact_id}")
+    assert page.status_code == 200
+
+    # A sandbox without allow-same-origin: the document gets an opaque origin.
+    assert 'sandbox="allow-scripts allow-popups allow-forms allow-downloads"' in (
+        page.text
+    )
+    assert "allow-same-origin" not in page.text
+    assert page.headers["content-security-policy"] == "frame-ancestors 'self'"
+
+    # The whole document is inside srcdoc, html-escaped...
+    assert f'srcdoc="{html.escape(raw.text, quote=True)}"' in page.text
+    # ...so none of the artifact's own markup is live at top level.
+    assert "<script" not in page.text
+    assert "<h1" not in page.text
+    assert "&lt;h1" in page.text
+
+
+def test_read_version_is_sandboxed_too(api: Api) -> None:
+    artifact_id = _publish_markdown(api, "# Only version")
+    page = api.client.get(f"/a/{artifact_id}/v/1")
+    assert page.status_code == 200
+    assert "sandbox=" in page.text
+    assert "allow-same-origin" not in page.text
+    assert "<script" not in page.text
+
+
+def test_raw_is_unchanged_byte_exact_html(api: Api) -> None:
+    """/raw stays the artifact itself: machines get the bytes, not a wrapper."""
     artifact_id = _publish_markdown(api, "# Title\n\nRaw check")
-    rendered = api.client.get(f"/a/{artifact_id}")
+    envelope = main.app.state.store.get_head(artifact_id)
+    assert envelope is not None
     raw = api.client.get(f"/a/{artifact_id}/raw")
     assert raw.status_code == 200
-    assert raw.text == rendered.text
+    assert raw.text == envelope.html
+    assert "srcdoc" not in raw.text
 
 
 def test_source_returns_original_markdown(api: Api) -> None:
@@ -873,6 +961,8 @@ def test_publish_private_git_never_stores_or_echoes_the_token(
         "ref": None,
         "path": None,
         "commit": "0123456789abcdef0123456789abcdef01234567",
+        # Records *that* a credential was needed, never the credential.
+        "private": True,
     }
 
     # The same for every public read surface of the artifact.
@@ -2045,12 +2135,20 @@ def test_export_vault_is_a_zip_holding_the_whole_story(api: Api) -> None:
         assert "q3-review/INDEX.md" in names
         assert "q3-review/document.md" in names
         assert "q3-review/reasoning.md" in names
-        # Every version, the pending proposal included.
+        # Live versions only: the anonymous export must not leak the
+        # still-moderated proposal (v3).
         assert "q3-review/versions/v1.md" in names
         assert "q3-review/versions/v2.md" in names
-        assert "q3-review/versions/v3.md" in names
+        assert "q3-review/versions/v3.md" not in names
         assert any(name.startswith("q3-review/comments/") for name in names)
         assert "New line" in archive.read("q3-review/document.md").decode("utf-8")
+
+    # The owner's authenticated download carries the proposal as well.
+    owner_resp = api.client.get(
+        f"/a/{artifact_id}/export/vault", headers=AUTH_HEADERS
+    )
+    with zipfile.ZipFile(io.BytesIO(owner_resp.content)) as archive:
+        assert "q3-review/versions/v3.md" in archive.namelist()
 
 
 def test_exports_honour_the_password_gate(api: Api) -> None:
@@ -2176,3 +2274,571 @@ def test_comment_threads_survive_a_restart(api: Api, tmp_path) -> None:
     threads = second.list_for(artifact_id)
     assert [t.id for t in threads] == [thread_id]
     assert threads[0].selector.exact == "Body text"
+
+
+# --------------------------------------------------------------------------
+# Hardening: unlock-cookie revocation and password-attempt throttling
+# --------------------------------------------------------------------------
+
+
+def test_unlock_cookie_is_revoked_by_a_password_change(api: Api) -> None:
+    """A cookie issued under the old password must stop working (sec-authn)."""
+    artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
+
+    unlocked = api.client.post(
+        f"/a/{artifact_id}/unlock",
+        data={"password": "hunter2"},
+        follow_redirects=False,
+    )
+    assert unlocked.status_code == 303
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+
+    changed = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"password": "new-password"},
+        headers=AUTH_HEADERS,
+    )
+    assert changed.status_code == 200
+
+    # Same browser, same cookie — no longer valid for the new password.
+    assert api.client.get(f"/a/{artifact_id}").status_code == 401
+    # ...and the new password still unlocks normally.
+    again = api.client.post(
+        f"/a/{artifact_id}/unlock",
+        data={"password": "new-password"},
+        follow_redirects=False,
+    )
+    assert again.status_code == 303
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+
+
+def test_unlock_cookie_is_revoked_by_clearing_the_password(api: Api) -> None:
+    """Clearing then re-setting a password must not resurrect an old cookie."""
+    artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
+    assert (
+        api.client.post(
+            f"/a/{artifact_id}/unlock",
+            data={"password": "hunter2"},
+            follow_redirects=False,
+        ).status_code
+        == 303
+    )
+
+    assert (
+        api.client.put(
+            f"/api/artifacts/{artifact_id}",
+            json={"clear_password": True},
+            headers=AUTH_HEADERS,
+        ).status_code
+        == 200
+    )
+    # No password at all: readable by anyone, cookie or not.
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+
+    assert (
+        api.client.put(
+            f"/api/artifacts/{artifact_id}",
+            json={"password": "hunter2"},
+            headers=AUTH_HEADERS,
+        ).status_code
+        == 200
+    )
+    # The re-set password produces a different record, so the old cookie —
+    # even for the very same password string — does not verify.
+    assert api.client.get(f"/a/{artifact_id}").status_code == 401
+
+
+def _low_unlock_limit(api: Api, monkeypatch, limit: int = 2) -> None:
+    monkeypatch.setattr(
+        main,
+        "settings",
+        dataclasses.replace(api.settings, max_unlock_attempts_per_hour=limit),
+    )
+
+
+def test_unlock_form_throttles_failed_attempts(api: Api, monkeypatch) -> None:
+    artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
+    _low_unlock_limit(api, monkeypatch, limit=2)
+
+    for _ in range(2):
+        wrong = api.client.post(
+            f"/a/{artifact_id}/unlock",
+            data={"password": "nope"},
+            follow_redirects=False,
+        )
+        assert wrong.status_code == 401
+
+    blocked = api.client.post(
+        f"/a/{artifact_id}/unlock",
+        data={"password": "nope"},
+        follow_redirects=False,
+    )
+    assert blocked.status_code == 429
+    assert "Too many attempts" in blocked.text
+
+    # The throttle covers the correct password too, once the budget is gone.
+    correct = api.client.post(
+        f"/a/{artifact_id}/unlock",
+        data={"password": "hunter2"},
+        follow_redirects=False,
+    )
+    assert correct.status_code == 429
+
+
+def test_unlock_succeeds_while_the_budget_lasts(api: Api, monkeypatch) -> None:
+    """Only failures count, so an honest reader is never throttled."""
+    artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
+    _low_unlock_limit(api, monkeypatch, limit=2)
+
+    assert (
+        api.client.post(
+            f"/a/{artifact_id}/unlock",
+            data={"password": "nope"},
+            follow_redirects=False,
+        ).status_code
+        == 401
+    )
+    for _ in range(5):
+        ok = api.client.post(
+            f"/a/{artifact_id}/unlock",
+            data={"password": "hunter2"},
+            follow_redirects=False,
+        )
+        assert ok.status_code == 303
+
+
+def test_password_header_path_is_throttled_too(api: Api, monkeypatch) -> None:
+    artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
+    _low_unlock_limit(api, monkeypatch, limit=2)
+
+    for _ in range(2):
+        assert (
+            api.client.get(
+                f"/a/{artifact_id}/raw", headers={"X-Artifact-Password": "wrong"}
+            ).status_code
+            == 401
+        )
+
+    blocked = api.client.get(
+        f"/a/{artifact_id}/raw", headers={"X-Artifact-Password": "wrong"}
+    )
+    assert blocked.status_code == 429
+    assert "too many wrong passwords" in blocked.json()["detail"]
+
+
+def test_unlock_throttle_buckets_per_client_address(api: Api, monkeypatch) -> None:
+    """A different client address gets its own budget (X-Real-IP from nginx)."""
+    artifact_id = _publish_markdown(api, "# Secret", password="hunter2")
+    _low_unlock_limit(api, monkeypatch, limit=1)
+
+    assert (
+        api.client.get(
+            f"/a/{artifact_id}/raw",
+            headers={"X-Artifact-Password": "wrong", "X-Real-IP": "10.0.0.1"},
+        ).status_code
+        == 401
+    )
+    assert (
+        api.client.get(
+            f"/a/{artifact_id}/raw",
+            headers={"X-Artifact-Password": "wrong", "X-Real-IP": "10.0.0.1"},
+        ).status_code
+        == 429
+    )
+    # A second address is unaffected.
+    assert (
+        api.client.get(
+            f"/a/{artifact_id}/raw",
+            headers={"X-Artifact-Password": "wrong", "X-Real-IP": "10.0.0.2"},
+        ).status_code
+        == 401
+    )
+
+
+# --------------------------------------------------------------------------
+# Hardening: configuration and logging
+# --------------------------------------------------------------------------
+
+
+def test_load_settings_rejects_a_short_secret_key(monkeypatch) -> None:
+    monkeypatch.setenv("HUB_SECRET_KEY", "too-short")
+    with pytest.raises(RuntimeError, match="HUB_SECRET_KEY"):
+        load_settings()
+
+
+def test_load_settings_accepts_a_long_secret_key(monkeypatch) -> None:
+    monkeypatch.setenv("HUB_SECRET_KEY", "x" * 32)
+    assert load_settings().secret_key == "x" * 32
+
+
+def test_json_log_formatter_cannot_be_forged_by_a_log_message() -> None:
+    """Newlines and quotes in user-controlled text must not forge a record."""
+    hostile = 'evil", "level": "CRITICAL", "note": "x\nfake line'
+    record = logging.LogRecord(
+        name="src.main",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="published artifact %s",
+        args=(hostile,),
+        exc_info=None,
+    )
+    line = main.JSONFormatter().format(record)
+
+    assert "\n" not in line
+    parsed = json.loads(line)
+    assert parsed["level"] == "INFO"
+    assert parsed["logger"] == "src.main"
+    assert parsed["message"] == f"published artifact {hostile}"
+
+
+# --------------------------------------------------------------------------
+# Hardening: git URL handling
+# --------------------------------------------------------------------------
+
+
+def test_publish_strips_userinfo_from_the_git_url(api: Api, monkeypatch) -> None:
+    captured = _stub_build_from_git(monkeypatch)
+    resp = api.client.post(
+        "/api/artifacts",
+        json={"git_url": "https://someone:s3cr3t@github.com/org/repo"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    assert "s3cr3t" not in resp.text
+
+    # Stripped before the builder ever sees it...
+    assert captured["git_url"] == "https://github.com/org/repo"
+
+    artifact_id = resp.json()["id"]
+    envelope = main.app.state.store.get_head(artifact_id)
+    assert envelope is not None
+    # ...before storage...
+    assert envelope.source["git"]["url"] == "https://github.com/org/repo"
+    assert "s3cr3t" not in envelope.to_json().decode("utf-8")
+    # ...and in every public read surface.
+    for path in (f"/a/{artifact_id}/meta", f"/a/{artifact_id}/versions"):
+        read = api.client.get(path)
+        assert "s3cr3t" not in read.text, path
+        assert "someone" not in read.text, path
+
+
+def test_update_and_version_strip_userinfo_from_the_git_url(
+    api: Api, monkeypatch
+) -> None:
+    captured = _stub_build_from_git(monkeypatch)
+    artifact_id = _publish_markdown(api, "# One")
+
+    updated = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"git_url": "https://bot:tok3n@gitlab.com/org/repo"},
+        headers=AUTH_HEADERS,
+    )
+    assert updated.status_code == 200, updated.text
+    assert captured["git_url"] == "https://gitlab.com/org/repo"
+    assert "tok3n" not in updated.text
+
+    submitted = api.client.post(
+        f"/api/artifacts/{artifact_id}/versions",
+        json={"git_url": "https://bot:tok3n@gitlab.com/org/other"},
+        headers=AUTH_HEADERS,
+    )
+    assert submitted.status_code == 201, submitted.text
+    assert captured["git_url"] == "https://gitlab.com/org/other"
+    assert "tok3n" not in submitted.text
+    assert "tok3n" not in api.client.get(f"/a/{artifact_id}/versions").text
+
+
+def test_private_git_url_is_withheld_from_public_metadata(
+    api: Api, monkeypatch
+) -> None:
+    """A private repo's address is not public provenance (sec-authz)."""
+    _stub_build_from_git(monkeypatch)
+    resp = api.client.post(
+        "/api/artifacts",
+        json={
+            "git_url": "https://github.com/org/private-repo",
+            "git_ref": "main",
+            "git_token": GIT_TOKEN,
+        },
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    artifact_id = resp.json()["id"]
+
+    meta = api.client.get(f"/a/{artifact_id}/meta").json()
+    assert meta["git"]["private"] is True
+    assert "url" not in meta["git"]
+    assert meta["git"]["ref"] == "main"
+    assert meta["git"]["commit"]
+    assert "private-repo" not in api.client.get(f"/a/{artifact_id}/meta").text
+
+    listing = api.client.get(f"/a/{artifact_id}/versions")
+    row = listing.json()["versions"][0]
+    assert row["git"]["private"] is True
+    assert "url" not in row["git"]
+    assert "private-repo" not in listing.text
+
+
+def test_public_git_url_is_still_reported(api: Api, monkeypatch) -> None:
+    """Regression: only *private* provenance is redacted."""
+    _stub_build_from_git(monkeypatch)
+    resp = api.client.post(
+        "/api/artifacts",
+        json={"git_url": "https://github.com/org/public-repo"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    artifact_id = resp.json()["id"]
+
+    meta = api.client.get(f"/a/{artifact_id}/meta").json()
+    assert meta["git"]["url"] == "https://github.com/org/public-repo"
+    assert "private" not in meta["git"]
+
+    row = api.client.get(f"/a/{artifact_id}/versions").json()["versions"][0]
+    assert row["git"]["url"] == "https://github.com/org/public-repo"
+
+
+@pytest.mark.parametrize("field", ["git_ref", "git_path"])
+def test_publish_rejects_git_fields_without_a_git_url(api: Api, field: str) -> None:
+    resp = api.client.post(
+        "/api/artifacts",
+        json={"markdown": "# Hi", field: "whatever"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert field in resp.json()["detail"]
+    assert "git_url" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("field", ["git_ref", "git_path"])
+def test_update_rejects_git_fields_without_a_git_url(api: Api, field: str) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    resp = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={field: "whatever"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert field in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("field", ["git_ref", "git_path"])
+def test_version_submission_rejects_git_fields_without_a_git_url(
+    api: Api, field: str
+) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    resp = api.client.post(
+        f"/api/artifacts/{artifact_id}/versions",
+        json={"markdown": "# Two", field: "whatever"},
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert field in resp.json()["detail"]
+
+
+# --------------------------------------------------------------------------
+# Hardening: write-path limits, ordering and partial failures
+# --------------------------------------------------------------------------
+
+
+def test_owner_content_updates_count_against_the_daily_budget(
+    api: Api, monkeypatch
+) -> None:
+    """sec-abuse-limits: PUT with content is a submission like any other."""
+    artifact_id = _publish_markdown(api, "# One")
+    monkeypatch.setattr(
+        main,
+        "settings",
+        dataclasses.replace(api.settings, max_versions_per_day=1),
+    )
+
+    first = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"markdown": "# Two"},
+        headers=AUTH_HEADERS,
+    )
+    assert first.status_code == 200, first.text
+
+    second = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={"markdown": "# Three"},
+        headers=AUTH_HEADERS,
+    )
+    assert second.status_code == 429
+    assert second.json()["limit"] == 1
+
+    # Nothing was persisted by the throttled call.
+    assert "Three" not in api.client.get(f"/a/{artifact_id}/raw").text
+    # A settings-only update is not a submission and still goes through.
+    assert (
+        api.client.put(
+            f"/api/artifacts/{artifact_id}",
+            json={"accept_versions": True},
+            headers=AUTH_HEADERS,
+        ).status_code
+        == 200
+    )
+
+
+def test_update_does_not_apply_settings_when_the_build_fails(
+    api: Api, monkeypatch
+) -> None:
+    """concept-error-handling: no half-applied update."""
+    artifact_id = _publish_markdown(api, "# One")
+    monkeypatch.setattr(
+        main, "settings", dataclasses.replace(api.settings, max_html_bytes=10)
+    )
+
+    resp = api.client.put(
+        f"/api/artifacts/{artifact_id}",
+        json={
+            "html": "<html><body>" + "x" * 500 + "</body></html>",
+            "title": "t",
+            # Settings carried by the *same* call, which used to be saved
+            # before the build ran and therefore survived its failure.
+            "accept_versions": True,
+            "password": "should-not-stick",
+            "comments_mode": "off",
+        },
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 413
+
+    meta = main.app.state.store.get_meta(artifact_id)
+    assert meta is not None
+    assert meta.accept_versions is False
+    assert meta.comments_mode == "anyone"
+    assert meta.password is None
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+
+
+def test_publish_rolls_back_when_the_canonical_upload_fails(
+    api: Api, monkeypatch
+) -> None:
+    """concept-error-handling: no artifact survives a failed canonical copy."""
+    monkeypatch.setattr(main, "new_artifact_id", lambda: "rollback-probe-id")
+    hub_backend = api.backend
+
+    class _FailingCanonical:
+        def upload(self, name: str, content: bytes, tags: list[str]) -> int:
+            raise BackendError("the caller's project storage is down")
+
+    def factory(stack_url: str, token: str):
+        if (
+            stack_url == api.settings.hub_stack_url
+            and token == api.settings.hub_storage_token
+        ):
+            return hub_backend
+        return _FailingCanonical()
+
+    monkeypatch.setattr(main, "KbcFilesBackend", factory)
+
+    resp = api.client.post(
+        "/api/artifacts", json={"markdown": "# Doomed"}, headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 502
+    assert "canonical" in resp.json()["detail"]
+
+    assert api.client.get("/a/rollback-probe-id").status_code == 404
+    assert api.backend.search_by_tag("artifact-hub") == []
+    assert main.app.state.store.count() == 0
+
+
+def _break_backend_delete(api: Api, monkeypatch) -> None:
+    def failing_delete(file_id: int) -> None:
+        raise BackendError("storage refused the delete")
+
+    monkeypatch.setattr(api.backend, "delete", failing_delete)
+
+
+def test_delete_artifact_reports_partial_failure_as_502(
+    api: Api, monkeypatch
+) -> None:
+    """Never claim 'deleted' over files that are still being served."""
+    artifact_id = _publish_markdown(api, "# Mine")
+    _break_backend_delete(api, monkeypatch)
+
+    resp = api.client.delete(f"/api/artifacts/{artifact_id}", headers=AUTH_HEADERS)
+    assert resp.status_code == 502
+    assert resp.json()["error"] == "artifact not fully deleted"
+    assert "retry" in resp.json()["detail"].lower()
+
+    # The artifact really is still there, which is exactly why 200 would lie.
+    assert api.client.get(f"/a/{artifact_id}").status_code == 200
+
+
+def test_delete_version_reports_partial_failure_as_502(
+    api: Api, monkeypatch
+) -> None:
+    artifact_id = _publish_markdown(api, "# One")
+    assert _submit_version(api, artifact_id, "# Two").status_code == 201
+    _break_backend_delete(api, monkeypatch)
+
+    resp = api.client.delete(
+        f"/api/artifacts/{artifact_id}/versions/1", headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 502
+    assert resp.json()["error"] == "version not fully deleted"
+    assert api.client.get(f"/a/{artifact_id}/v/1").status_code == 200
+
+
+def test_delete_only_live_version_is_still_409(api: Api) -> None:
+    """Regression: the policy refusal must not be confused with a 502."""
+    artifact_id = _publish_markdown(api, "# Only one")
+    resp = api.client.delete(
+        f"/api/artifacts/{artifact_id}/versions/1", headers=AUTH_HEADERS
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"] == "cannot delete the only live version"
+
+
+def test_context_documents_the_health_headers_diagnostic(api: Api) -> None:
+    by_path = {e["path"]: e for e in api.client.get("/context").json()["endpoints"]}
+    entry = by_path["/health/headers"]
+    assert entry["method"] == "GET"
+    assert entry["auth"] == "none"
+    assert "header" in entry["purpose"].lower()
+    # It really exists, and OpenAPI knows about it too.
+    assert api.client.get("/health/headers").status_code == 200
+    assert "/health/headers" in api.client.get("/openapi.json").json()["paths"]
+
+
+class TestVaultProposalPrivacy:
+    """The public vault export must not leak moderated proposals."""
+
+    def _seed(self, api):
+        r = api.client.post(
+            "/api/artifacts",
+            json={"markdown": "# Doc\n\nbody\n", "accept_versions": True},
+            headers=AUTH_HEADERS,
+        )
+        aid = r.json()["id"]
+        r = api.client.post(
+            f"/api/artifacts/{aid}/versions",
+            json={"markdown": "# Doc\n\nproposed change\n", "note": "outside idea"},
+            headers=OTHER_AUTH_HEADERS,
+        )
+        assert r.json()["status"] == "proposed"
+        return aid
+
+    def test_anonymous_vault_excludes_proposals(self, api):
+        aid = self._seed(api)
+        import io
+        import zipfile
+
+        payload = api.client.get(f"/a/{aid}/export/vault").content
+        names = zipfile.ZipFile(io.BytesIO(payload)).namelist()
+        assert any(n.endswith("versions/v1.md") for n in names)
+        assert not any(n.endswith("versions/v2.md") for n in names)
+
+    def test_owner_vault_includes_proposals(self, api):
+        aid = self._seed(api)
+        import io
+        import zipfile
+
+        payload = api.client.get(
+            f"/a/{aid}/export/vault", headers=AUTH_HEADERS
+        ).content
+        names = zipfile.ZipFile(io.BytesIO(payload)).namelist()
+        assert any(n.endswith("versions/v2.md") for n in names)
