@@ -438,6 +438,18 @@ RESP_OWNER_403 = {
     )
 }
 
+#: SEC-075-011. The destructive routes answer 403 for a second reason the
+#: non-destructive owner routes never do: the token belongs to the owning
+#: project but does not satisfy this hub's HUB_DESTRUCTIVE_TOKEN_POLICY.
+RESP_DESTRUCTIVE_403 = {
+    "description": (
+        "Token is valid but not from the project that owns this artifact; or "
+        "it is, but this hub's destructive_token_policy (see GET /context, "
+        "'limits') requires an admin or allowlisted token for destructive "
+        "operations and this token is neither. The response detail says which."
+    )
+}
+
 #: ``content`` blocks for the non-JSON responses, so /docs stops implying JSON.
 CONTENT_HTML = {"text/html": {"schema": {"type": "string"}}}
 CONTENT_MARKDOWN = {"text/markdown": {"schema": {"type": "string"}}}
@@ -2244,6 +2256,73 @@ def _owner_only(meta: ArtifactMeta, caller: Owner) -> None:
         raise HTTPException(
             status_code=403, detail="this artifact belongs to another project"
         )
+
+
+def _destructive_authority(owner: Owner) -> None:
+    """Raise 403 unless this token may run a *destructive* route.
+
+    SEC-075-011. ``_owner_only`` above answers "is this the owning project?",
+    which is a project-level question: every Storage token of that project —
+    including a read-only or single-purpose one — passes it. That is fine for
+    a route that changes a setting and reversible for one that moves an
+    artifact to the trash, but it also meant any such token could purge an
+    artifact outright, rotate its public link, or delete a version, with no
+    way for an operator to narrow that.
+
+    ``HUB_DESTRUCTIVE_TOKEN_POLICY`` is that narrowing, and it is opt-in:
+
+    * ``project`` (default) — the historical behaviour, unchanged. Every token
+      of the owning project keeps full destructive authority.
+    * ``admin`` — the token must additionally be a master token or belong to a
+      project user whose ``admin.role`` is ``admin``.
+    * ``allowlist`` — the token's own id must appear in
+      ``HUB_DESTRUCTIVE_TOKEN_IDS``.
+
+    This gate applies to the irreversible or link-breaking routes only: soft
+    delete, purge, rotate-link, version delete, and webhook key rotation.
+    **Non-destructive owner routes are deliberately not affected** — update,
+    head pin, promote, settings, invitations, stats and trash restore stay
+    project-authorized under every policy, because narrowing them would turn a
+    security control into a workflow blocker without removing anything an
+    attacker could not simply do again.
+
+    The 403 detail names the active policy and what the credential lacked. It
+    never echoes the token, and never the allowlist either: an outsider must
+    not learn which token ids would work.
+    """
+    policy = settings.destructive_token_policy
+    if policy == "project":
+        return
+    if policy == "admin":
+        if owner.is_project_admin:
+            return
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "this hub runs destructive_token_policy=admin: a destructive "
+                "operation needs a master token, or a token belonging to a "
+                "project user with the admin role. This token is neither."
+            ),
+        )
+    if policy == "allowlist":
+        if owner.token_id and owner.token_id in settings.destructive_token_ids:
+            return
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "this hub runs destructive_token_policy=allowlist: a "
+                "destructive operation needs a token whose id the operator "
+                "listed in HUB_DESTRUCTIVE_TOKEN_IDS. This token's id is not "
+                "listed."
+            ),
+        )
+    # Unreachable: load_settings rejects any other value at startup. Refusing
+    # rather than falling through keeps a future third policy from defaulting
+    # to "allow everything" if somebody adds it here and forgets this branch.
+    raise HTTPException(
+        status_code=403,
+        detail="destructive operations are disabled by this hub's token policy",
+    )
 
 
 def _emit_webhook(
@@ -4306,6 +4385,11 @@ def context(request: Request) -> dict:
             "max_invitation_name_chars": MAX_INVITATION_NAME_CHARS,
             "export_max_bytes": settings.export_max_bytes,
             "max_exports_per_hour": settings.max_exports_per_hour,
+            # SEC-075-011: which tokens of the owning project may run a
+            # destructive route on this deployment. The name only — never the
+            # allowlist's contents, which would tell an outsider exactly which
+            # token ids to go looking for.
+            "destructive_token_policy": settings.destructive_token_policy,
         },
         "notes": [
             "GET /a/{id} and /a/{id}/v/{n} return a wrapper page whose "
@@ -4344,6 +4428,20 @@ def context(request: Request) -> dict:
             "after POST /api/artifacts/{id}/rotate-link only the new share id "
             "resolves publicly, and the old link — plus the bare artifact id — "
             "answers 404 from the next request on.",
+            "Destructive routes — DELETE /api/artifacts/{id}, "
+            ".../purge, .../versions/{n} (as owner), "
+            "POST .../rotate-link and POST .../webhooks/{receiver_id}"
+            "/rotate-key — are additionally governed by this hub's "
+            f"destructive_token_policy, currently "
+            f"'{settings.destructive_token_policy}'. Under 'project' every "
+            "token of the owning project may run them; under 'admin' the "
+            "token must be a master token or belong to a project user with "
+            "the admin role; under 'allowlist' its token id must be one the "
+            "operator listed. A token that fails the policy gets 403 with a "
+            "detail naming it. Non-destructive owner routes (update, head "
+            "pin, promote, settings, invitations, stats, trash restore) are "
+            "never affected, and a contributor withdrawing their own "
+            "proposal is not a destructive operation.",
             "DELETE /api/artifacts/{id} moves an artifact to the trash "
             "(reversible with POST /api/artifacts/{id}/restore); DELETE "
             "/api/artifacts/{id}/purge is the irreversible erase. A trashed "
@@ -6627,7 +6725,7 @@ def list_artifacts(
         },
         400: RESP_STACK_400,
         401: RESP_TOKEN_401,
-        403: RESP_OWNER_403,
+        403: RESP_DESTRUCTIVE_403,
         404: RESP_NOT_FOUND,
         502: {
             "description": (
@@ -6653,6 +6751,7 @@ def delete_artifact(
     if meta is None:
         return _not_found(artifact_id)
     _owner_only(meta, owner)
+    _destructive_authority(owner)
 
     now = _now()
     if not store.trash(artifact_id, now):
@@ -6794,7 +6893,7 @@ def restore_artifact(
         },
         400: RESP_STACK_400,
         401: RESP_TOKEN_401,
-        403: RESP_OWNER_403,
+        403: RESP_DESTRUCTIVE_403,
         404: RESP_NOT_FOUND,
         502: {
             "description": (
@@ -6828,6 +6927,7 @@ def purge_artifact(
     if meta is None:
         return _not_found(artifact_id)
     _owner_only(meta, owner)
+    _destructive_authority(owner)
 
     # Children first, the authorizing record last. The order is the whole
     # design of this route: the meta record is what _owner_only reads, so
@@ -7080,7 +7180,7 @@ def read_webhook_keys(
         },
         400: RESP_STACK_400,
         401: RESP_TOKEN_401,
-        403: RESP_OWNER_403,
+        403: RESP_DESTRUCTIVE_403,
         404: {
             "description": (
                 "No artifact with this id, or it has no registered receiver "
@@ -7118,6 +7218,7 @@ def rotate_webhook_key(
     if meta is None:
         return _not_found(artifact_id)
     _owner_only(meta, owner)
+    _destructive_authority(owner)
 
     url = next(
         (u for u in meta.webhooks or [] if receiver_id_for(u) == receiver_id), None
@@ -7209,7 +7310,7 @@ def rotate_webhook_key(
         },
         400: RESP_STACK_400,
         401: RESP_TOKEN_401,
-        403: RESP_OWNER_403,
+        403: RESP_DESTRUCTIVE_403,
         404: RESP_NOT_FOUND,
         502: {
             "description": (
@@ -7235,6 +7336,7 @@ def rotate_link(
     if meta is None:
         return _not_found(artifact_id)
     _owner_only(meta, owner)
+    _destructive_authority(owner)
 
     previous = meta.share_id
     new_share = store.rotate_share(artifact_id, when_iso=_now())
@@ -7910,7 +8012,13 @@ def promote_version(
         400: RESP_STACK_400,
         401: RESP_TOKEN_401,
         403: {
-            "description": "Not the owner, and not the author of this proposal."
+            "description": (
+                "Not the owner, and not the author of this proposal; or the "
+                "owner, but without the admin/allowlisted token this hub's "
+                "destructive_token_policy requires (see GET /context, "
+                "'limits'). Withdrawing your own proposal is never gated by "
+                "that policy."
+            )
         },
         404: {"description": "No artifact, or no such version."},
         409: {
@@ -7951,9 +8059,10 @@ def delete_version(
     if envelope is None:
         return _version_not_found(artifact_id, version)
 
-    if meta.owner_key != caller.key and not (
+    withdrawing_own_proposal = (
         envelope.status == STATUS_PROPOSED and envelope.author_key == caller.key
-    ):
+    )
+    if meta.owner_key != caller.key and not withdrawing_own_proposal:
         raise HTTPException(
             status_code=403,
             detail=(
@@ -7961,6 +8070,13 @@ def delete_version(
                 "contributor may withdraw their own proposal"
             ),
         )
+    if not withdrawing_own_proposal:
+        # SEC-075-011: only the *owner authority* path is gated. Withdrawing
+        # a proposal you yourself submitted is removing your own contribution,
+        # not exercising project-wide destructive power over someone else's
+        # history, so no hub policy should stand between a contributor and
+        # their own draft.
+        _destructive_authority(caller)
 
     # store.delete_version answers False for two very different reasons: the
     # policy refusal below, and a backend delete that did not confirm. The

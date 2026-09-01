@@ -199,3 +199,126 @@ class TestVerifyToken:
             owner = verify_token("https://connection.keboola.com", "some-token")
         assert owner.project_id == 7
         assert owner.project_name == ""
+
+
+class TestVerifyTokenClaims:
+    """SEC-075-011: the token-level claims the destructive-token policy reads.
+
+    Every one of them is optional and must degrade to the least-privileged
+    value. A stack that omits a claim, renames it, or answers with a type
+    nobody expected has to leave the caller an ordinary token — never fail
+    their request, and never promote them.
+    """
+
+    def _verify(self, body: dict):
+        with respx.mock as mock:
+            mock.get(VERIFY_URL).mock(return_value=httpx.Response(200, json=body))
+            return verify_token("https://connection.keboola.com", "some-token")
+
+    def test_full_claim_set_is_parsed(self):
+        owner = self._verify(
+            {
+                "id": "9876",
+                "description": "CI publisher",
+                "isMasterToken": False,
+                "canManageBuckets": True,
+                "canManageTokens": True,
+                "canPurgeTrash": True,
+                "canReadAllFileUploads": True,
+                "admin": {"role": "admin", "id": 42},
+                "owner": {"id": 123, "name": "Proj"},
+            }
+        )
+        assert owner.token_id == "9876"
+        assert owner.is_master_token is False
+        assert owner.admin_role == "admin"
+        assert owner.can_purge_trash is True
+        assert owner.can_manage_tokens is True
+        assert owner.is_project_admin is True
+
+    def test_a_body_without_claims_is_least_privileged(self):
+        owner = self._verify({"owner": {"id": 123, "name": "Proj"}})
+        assert owner.token_id is None
+        assert owner.is_master_token is False
+        assert owner.admin_role is None
+        assert owner.can_purge_trash is False
+        assert owner.can_manage_tokens is False
+        assert owner.is_project_admin is False
+
+    def test_master_token_flag_is_parsed(self):
+        owner = self._verify(
+            {"isMasterToken": True, "owner": {"id": 1, "name": "P"}}
+        )
+        assert owner.is_master_token is True
+        assert owner.is_project_admin is True
+
+    def test_a_numeric_token_id_is_normalized_to_a_string(self):
+        """HUB_DESTRUCTIVE_TOKEN_IDS is a list of strings, so the id must be one."""
+        owner = self._verify({"id": 9876, "owner": {"id": 1, "name": "P"}})
+        assert owner.token_id == "9876"
+
+    @pytest.mark.parametrize(
+        "raw", [None, True, False, "", "   ", [], {}, {"id": 1}, 1.5]
+    )
+    def test_an_unusable_token_id_becomes_none(self, raw):
+        owner = self._verify({"id": raw, "owner": {"id": 1, "name": "P"}})
+        assert owner.token_id is None
+
+    @pytest.mark.parametrize(
+        "raw", ["true", "True", 1, 0, None, [], {}, "yes", "1"]
+    )
+    def test_only_a_real_json_true_grants_a_boolean_claim(self, raw):
+        """A stringly-typed 'true' is an unverified shape, so it grants nothing."""
+        owner = self._verify(
+            {
+                "isMasterToken": raw,
+                "canPurgeTrash": raw,
+                "canManageTokens": raw,
+                "owner": {"id": 1, "name": "P"},
+            }
+        )
+        assert owner.is_master_token is False
+        assert owner.can_purge_trash is False
+        assert owner.can_manage_tokens is False
+        assert owner.is_project_admin is False
+
+    @pytest.mark.parametrize("role", ["guest", "readOnly", "share"])
+    def test_a_non_admin_role_is_kept_but_grants_nothing(self, role):
+        owner = self._verify(
+            {"admin": {"role": role}, "owner": {"id": 1, "name": "P"}}
+        )
+        assert owner.admin_role == role
+        assert owner.is_project_admin is False
+
+    def test_an_unknown_role_is_reported_and_grants_nothing(self):
+        owner = self._verify(
+            {"admin": {"role": "superuser"}, "owner": {"id": 1, "name": "P"}}
+        )
+        assert owner.admin_role == "superuser"
+        assert owner.is_project_admin is False
+
+    @pytest.mark.parametrize(
+        "admin",
+        [None, "admin", ["admin"], {}, {"role": None}, {"role": 1}, {"role": "  "}],
+    )
+    def test_an_unusable_admin_object_becomes_no_role(self, admin):
+        """Including the string "admin" in the admin *slot* — shape matters."""
+        owner = self._verify({"admin": admin, "owner": {"id": 1, "name": "P"}})
+        assert owner.admin_role is None
+        assert owner.is_project_admin is False
+
+    def test_malformed_claims_never_fail_a_valid_identity(self):
+        """The project identity rules are unchanged: claims cannot 401 anyone."""
+        owner = self._verify(
+            {
+                "id": {"nested": "nonsense"},
+                "isMasterToken": "perhaps",
+                "admin": 7,
+                "canPurgeTrash": [],
+                "canManageTokens": {},
+                "owner": {"id": 123, "name": "Proj"},
+            }
+        )
+        assert owner.project_id == 123
+        assert owner.project_name == "Proj"
+        assert owner.is_project_admin is False

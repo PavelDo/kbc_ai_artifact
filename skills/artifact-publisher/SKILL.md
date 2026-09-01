@@ -104,20 +104,27 @@ for one call, prefix the environment: `KBC_TOKEN="$CONTRIBUTOR_TOKEN" hub …`.
 **Never put the token in a URL, query string, or the request body.** It only
 ever belongs in the `X-StorageApi-Token` header.
 
-**Known boundary: ownership is the project, not the individual token.** The
-hub authorizes owner-only operations (update, trash, restore, purge,
-rotate-link, invitations, stats, promote, head) by checking only that a
-token verifies to the same `(stack, project)` pair that originally published
-the artifact — it does not inspect the token's scope or role. This means
-**any** valid Storage token belonging to the owning project — including a
-read-only, single-purpose, or otherwise restricted one — carries full
-destructive owner authority over every artifact that project owns. This is
-intentional in the current design, not an oversight: use a project for
-artifact administration whose *every* token holder you would trust with
-purge/rotate/promote power, not one where you hand out narrowly-scoped
-tokens expecting them to be denied these actions. A future release may add
-token-scope or SSO-based finer-grained control; today, the project boundary
-is the whole boundary.
+**Ownership is the project, not the individual token.** The hub authorizes
+owner-only operations (update, trash, restore, purge, rotate-link,
+invitations, stats, promote, head) by checking that a token verifies to the
+same `(stack, project)` pair that originally published the artifact. It does
+not ask *which* token of that project you used — so by default **any** valid
+Storage token belonging to the owning project, including a read-only or
+single-purpose one, carries full owner authority over every artifact that
+project owns.
+
+A hub operator can narrow this for the *destructive* operations alone (soft
+delete, purge, owner version delete, rotate-link, webhook key rotation) with
+`HUB_DESTRUCTIVE_TOKEN_POLICY`: `project` (the default, as described above),
+`admin` (a master token or a project user with the `admin` role), or
+`allowlist` (specific token ids). Check `GET /context` → `limits.
+destructive_token_policy` to see what the hub you are talking to runs; under
+a stricter policy a destructive call answers 403 with a `detail` saying so,
+and no amount of retrying will change it. Non-destructive owner operations
+are never affected, and withdrawing a proposal you yourself submitted is
+never gated. Regardless of policy, pick a project for artifact
+administration whose token holders you would trust with purge/rotate/promote
+power.
 
 ## Workflows
 
@@ -1137,7 +1144,7 @@ mind:
 |---|---|
 | 400 | Unknown or disallowed `X-Storage-Stack` value, a malformed diff spec (use `{older}..{newer}`), or an unknown diff `format` |
 | 401 | Storage token rejected by the stack, wrong artifact password, or an unknown/revoked/malformed `X-Artifact-Guest` credential (the three guest cases are deliberately indistinguishable) |
-| 403 | Token is valid but not from the owning project (update, trash, restore, purge, rotate-link, stats, invitations, promote, head); the artifact does not accept versions from other projects; you asked for a proposal you did not author; or comments are closed (`comments_mode: "off"`) or you are not on the `contributors` allowlist |
+| 403 | Token is valid but not from the owning project (update, trash, restore, purge, rotate-link, stats, invitations, promote, head); the artifact does not accept versions from other projects; you asked for a proposal you did not author; or comments are closed (`comments_mode: "off"`) or you are not on the `contributors` allowlist. **Also**: the *destructive* routes (soft delete, purge, owner version delete, rotate-link, webhook key rotation) can require more than a token of the owning project — this hub's `destructive_token_policy` (reported by `GET /context` under `limits`) may additionally demand a master/admin token or one whose id the operator allowlisted. The `detail` names the policy and what your token lacked. Non-destructive owner routes are never affected |
 | 404 | Unknown artifact id (identical response whether it never existed, was purged, or its share id was rotated away), or no such version, comment thread, or invitation |
 | 409 | Promoting a version that is already live; deleting the only live version of an artifact; deleting the version the head is pinned to (re-pin or switch the head to `latest` first); submitting a version, a comment, or a new invitation on an artifact whose `status` is `"final"` or that is trashed (the detail names which, and the way out — reopen vs. restore); resolving/reopening a thread already in that state; or restoring an artifact that is not in the trash |
 | 413 | The request body itself is over the inbound ceiling for that route — the document routes (publish, update, submit a version) accept a whole document, every other route (comments and replies included) accepts `HUB_MAX_SMALL_REQUEST_BYTES`, 256 KB by default — or the built HTML is over the size limit, or a diff side is over `HUB_DIFF_MAX_BYTES` (for `format=visual`, the rendered HTML of the larger side) |

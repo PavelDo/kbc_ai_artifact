@@ -67,6 +67,17 @@ _OWNER_PROJECTS: dict[str, tuple[int, str]] = {
     "other-token": (999, "Other"),
 }
 
+#: token -> extra ``Owner`` claim keyword arguments, mirroring the token-level
+#: fields a real ``/v2/storage/tokens/verify`` body carries (SEC-075-011).
+#: A token absent from this mapping gets the least-privileged defaults, which
+#: is what every test written before the destructive-token policy expects. The
+#: two standard tokens are master tokens, so the whole existing suite keeps
+#: full authority under any HUB_DESTRUCTIVE_TOKEN_POLICY.
+_TOKEN_CLAIMS: dict[str, dict[str, Any]] = {
+    "good-token": {"token_id": "tok-good", "is_master_token": True},
+    "other-token": {"token_id": "tok-other", "is_master_token": True},
+}
+
 
 class Api(NamedTuple):
     client: TestClient
@@ -134,7 +145,10 @@ def api(tmp_path, settings, monkeypatch):
             raise AuthError("Storage token rejected by the stack")
         project_id, project_name = project
         return Owner(
-            stack_url=stack_url, project_id=project_id, project_name=project_name
+            stack_url=stack_url,
+            project_id=project_id,
+            project_name=project_name,
+            **_TOKEN_CLAIMS.get(token, {}),
         )
 
     monkeypatch.setattr(main, "KbcFilesBackend", fake_kbc_files_backend)

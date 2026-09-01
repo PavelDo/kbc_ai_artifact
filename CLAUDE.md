@@ -150,13 +150,24 @@ and keep the README/comment cross-references intact.
   container (see the "Network egress" part of README.md's *Security model*).
   Do not attempt to "fix" this with more application-side re-checks; another
   re-check only narrows the window, it does not close it.
-- **`SEC-075-011` — any valid token of the owning project has full
-  destructive authority.** `require_owner`/`_owner_only` (`src/auth.py`,
-  `src/main.py`) check only that a token resolves to the same
-  `(stack, project)` pair as the artifact's owner — never the token's scope
-  or role. This is intentional: see README.md's *Security model* "Known
-  boundary" paragraph for the accepted design and the mitigation advice
-  (use a dedicated project or a narrowly issued token for publishing).
+- **`SEC-075-011` — project-wide destructive authority is the *default*, not
+  the only option.** `require_owner`/`_owner_only` (`src/auth.py`,
+  `src/main.py`) resolve ownership as a `(stack, project)` pair and
+  deliberately still do: identity is the project. What used to follow from
+  that — every token of the project, read-only ones included, could purge —
+  is now an opt-in policy, `HUB_DESTRUCTIVE_TOKEN_POLICY`
+  (`project` | `admin` | `allowlist`, **default `project`**, i.e. the
+  historical behaviour), enforced by `_destructive_authority` in
+  `src/main.py` on the destructive routes only: soft delete, purge, owner
+  version delete, rotate-link and webhook key rotation. `Owner` carries the
+  non-secret token claims the policy reads (`token_id`, `is_master_token`,
+  `admin_role`, `can_purge_trash`, `can_manage_tokens`), parsed defensively —
+  a missing or odd-shaped claim degrades to least privilege and never raises,
+  and none of them is ever persisted or logged. **Do not extend the gate to
+  non-destructive owner routes** (update, head pin, promote, settings,
+  invitations, stats, trash restore) or to a contributor withdrawing their
+  own proposal; that split is the design, documented in README.md's *Security
+  model*, and `tests/test_review100_destructive_policy.py` pins it.
 - **`SEC-100-005` — git redirects are disabled, not eliminated as an SSRF
   vector.** `_clone` (`src/builder.py`) runs with
   `-c http.followRedirects=false`, so a redirect to an unvalidated host now

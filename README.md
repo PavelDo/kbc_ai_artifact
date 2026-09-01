@@ -444,6 +444,8 @@ are missing. Everything else has a documented default, overridable via env.
 | `HUB_CACHE_MAX_ENTRIES` | `200` | Max number of envelopes kept in the disk LRU cache |
 | `HUB_UNLOCK_COOKIE_MAX_AGE_S` | `43200` (12 h) | Lifetime of a signed password-unlock cookie |
 | `HUB_TOKEN_VERIFY_TIMEOUT_S` | `15` | Timeout for the `token verify` call to a caller's stack |
+| `HUB_DESTRUCTIVE_TOKEN_POLICY` | `project` | Which tokens of the owning project may run a *destructive* route (soft delete, purge, owner version delete, rotate-link, webhook key rotation). `project` = any token of that project (the historical behaviour); `admin` = a master token or a project user with the `admin` role; `allowlist` = only ids in `HUB_DESTRUCTIVE_TOKEN_IDS`. Any other value fails at startup. Non-destructive owner routes are never affected. See *Security model* |
+| `HUB_DESTRUCTIVE_TOKEN_IDS` | empty | Comma-separated Storage token **ids** (not tokens — an id is an identifier, not a secret) allowed to run destructive routes under `HUB_DESTRUCTIVE_TOKEN_POLICY=allowlist`. Required non-empty in that mode (an empty allowlist would refuse the operator their own routes, so it fails at startup); ignored in the other modes. Read a token's id from `GET {stack}/v2/storage/tokens/verify` |
 | `HUB_MAX_VERSIONS` | `50` | Live versions kept per artifact; older non-head, non-pinned ones are pruned (this rule never counts or removes a proposal — proposals have their own cap, `HUB_MAX_PROPOSED_VERSIONS`) |
 | `HUB_MAX_VERSIONS_PER_DAY` | `20` | Versions one project may submit for one artifact per UTC day |
 | `HUB_MAX_COMMENTS_PER_DAY` | `100` | Comment threads plus replies one project (or one guest invitation) may submit for one artifact per UTC day |
@@ -582,26 +584,50 @@ to the current password's own hash, so a cookie signed under a since-changed
 password no longer verifies, and an unlock on one artifact does not unlock
 another.
 
-**Known boundary: ownership is the project, not the individual token.**
+**Ownership is the project; destructive authority is configurable.**
 Every owner-only route (update, trash, restore, purge, rotate-link,
 invitations, stats, promote, head) authorizes by verifying the caller's
 Storage token against the stack and checking that it resolves to the same
-`(stack, project)` pair that originally published the artifact — it does not
-inspect the token's scope, role, or whether it was meant to be read-only.
-Concretely: **any** valid Storage token belonging to the owning project
-carries full destructive owner authority over every artifact that project
-owns, regardless of what that particular token's permissions were intended
-to allow. This is a known, intentional boundary of the current design, not
-an oversight (tracked as `SEC-075-011`) — pick a project for artifact
-administration whose *every* token holder you would trust with
-purge/rotate/promote power, rather than handing out a narrowly-scoped token
-expecting the hub to enforce that narrower scope on its own. A future
-release may add token-scope or SSO-based finer-grained control; today, the
-project boundary is the whole boundary. **Mitigation:** use a dedicated
+`(stack, project)` pair that originally published the artifact. That check
+is project-level by design and stays that way: it does not ask which token
+of the project you used.
+
+By itself that meant **any** valid Storage token of the owning project —
+including a read-only or single-purpose one — could purge an artifact,
+rotate its public link or delete a version (tracked as `SEC-075-011`).
+`HUB_DESTRUCTIVE_TOKEN_POLICY` now lets an operator narrow exactly that,
+using the token-level claims the same `tokens/verify` call already returns:
+
+| Policy | Who may run a destructive route |
+|---|---|
+| `project` *(default)* | Any token of the owning project — the historical behaviour, unchanged |
+| `admin` | A master token, or one belonging to a project user whose `admin.role` is `admin` |
+| `allowlist` | Only tokens whose id is listed in `HUB_DESTRUCTIVE_TOKEN_IDS` |
+
+The gate covers the irreversible and link-breaking routes only: `DELETE
+/api/artifacts/{id}` (soft delete), `DELETE /api/artifacts/{id}/purge`,
+`DELETE /api/artifacts/{id}/versions/{n}` when run as the owner, `POST
+/api/artifacts/{id}/rotate-link` and `POST
+/api/artifacts/{id}/webhooks/{receiver_id}/rotate-key`. **Non-destructive
+owner routes are deliberately untouched** by every policy — update, head
+pin, promote, settings, invitations, stats and trash restore stay
+project-authorized, and a contributor withdrawing their *own* proposal is
+never gated. A token that fails the policy gets `403` whose `detail` names
+the active policy and what the credential lacked; the detail never echoes
+the token and never reveals the allowlist's contents. The active policy
+*name* (not its contents) is reported in `GET /context` under `limits`.
+
+The default stays `project` so that upgrading cannot silently lock an
+operator out of artifacts they already own — but **for a shared project,
+set `HUB_DESTRUCTIVE_TOKEN_POLICY=admin`**. Use `allowlist` when even
+project administrators should not be able to purge, and destructive work is
+meant to run from one specific automation token.
+
+**Mitigation without the policy, or in addition to it:** use a dedicated
 Keboola project for artifact publishing (or a token issued only for that
 purpose, in a project that holds nothing else sensitive) rather than
-reusing a broadly-scoped production project's token — any token of that
-project can purge every artifact it owns.
+reusing a broadly-scoped production project's token — under the default
+policy any token of that project can purge every artifact it owns.
 
 **Network egress: git and webhook hostname checks are best-effort, not a
 guarantee (`SEC-075-005`, `SEC-075-006`).** Before cloning a `git_url` and
