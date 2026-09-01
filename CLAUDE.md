@@ -51,8 +51,22 @@ consequences baked into `src/main.py`:
    correct **only** under it. Do not add HA, replicas or `--workers`; if that
    ever changes, the state layer needs shared compare-and-swap, which Storage
    Files cannot provide (immutable, no create-if-absent) — that is a redesign,
-   not a flag. `StateDB._retire_older_snapshots` detects a second writer and
-   logs an ERROR naming this rule.
+   not a flag.
+
+   The invariant is **enforced**, not merely documented (ARCH-100-001), and
+   both halves must keep working:
+   - `main.acquire_instance_lock` takes an exclusive non-blocking `flock` on
+     `HUB_CACHE_DIR/instance.lock` in the lifespan and holds it for the life
+     of the process. A second process on the same cache directory raises
+     `SingleInstanceError` and fails to start. Do not move this after the
+     stores are built, and do not make it best-effort.
+   - `StateDB._retire_older_snapshots` catches the case the lock cannot see
+     (two processes, two disks, one Storage project): it latches the
+     process-wide flag in `src/statedb.py`, every `StateDB` write and snapshot
+     then raises `ForeignWriterError` / no-ops, the foreign snapshot is left
+     in place rather than deleted, and `GET /health` answers 503. `POST /`
+     stays 200 (rule 3 above) — flipping it would only make the platform
+     restart the container into the same conflict.
 
 ## Storage model
 

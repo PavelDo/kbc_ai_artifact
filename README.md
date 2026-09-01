@@ -431,6 +431,7 @@ are missing. Everything else has a documented default, overridable via env.
 | `HUB_STATE_SNAPSHOT_INTERVAL_S` | `300` | Seconds between snapshots of the rate-limit/analytics sidecar into Storage Files; `0` disables the background thread (snapshots then need an explicit call, as the tests do) |
 | `HUB_STATE_MAX_SNAPSHOT_BYTES` | `52428800` (50 MB) | Largest state snapshot the hub will upload or restore; an oversized one is skipped with a warning rather than restored (`0` disables the bound) |
 | `HUB_STATE_DB_FILENAME` | `state.sqlite3` | File name of the SQLite sidecar holding rate-limit counters and view analytics, under `HUB_CACHE_DIR` |
+| `HUB_INSTANCE_LOCK_FILENAME` | `instance.lock` | File name, under `HUB_CACHE_DIR`, of the exclusive lock the process takes at startup and holds until it exits. A second process on the same cache directory fails to start (see *Deployment*, "One hub is one process") |
 | `HUB_WEBHOOK_TIMEOUT_S` | `10` | Per-request HTTP timeout for one webhook delivery attempt |
 | `HUB_WEBHOOK_MAX_ATTEMPTS` | `3` | Total POST attempts per (URL, event) before giving up; retries back off `2**n` seconds, capped at 60 |
 | `HUB_WEBHOOK_QUEUE_MAX` | `1000` | Queued-but-undelivered webhook deliveries kept at once; past this the newest is dropped with a log line rather than blocking the request that produced it |
@@ -448,7 +449,7 @@ release tag explicitly — `--git-branch` defaults to
 kbagent data-app create \
   --project artifacts \
   --git-repo https://github.com/padak/kbc_ai_artifact \
-  --git-branch v0.9.0 \
+  --git-branch v0.10.0 \
   --git-public
 ```
 
@@ -469,14 +470,32 @@ service's own `git_ref` has. To pin a specific commit, tag it first.
 Omitting `--git-branch` (tracking `main`) is fine for a development or
 staging app where following the branch is the point.
 
-**One hub is one container.** A Data App runs as a single container that
-suspends when idle and restarts on demand — never two instances side by
-side — and one hub serves one organisation. The service relies on that: its
-artifact index, its locks and its state snapshots are designed for exactly
-one writer, and Storage Files cannot coordinate two (they are immutable, with
-no create-if-absent). Do not put replicas or extra worker processes in front
-of it; each organisation runs its own app instead. If a second writer ever
-does appear, the state sidecar logs an ERROR saying so.
+**One hub is one process.** A Data App runs as a single container that
+suspends when idle and restarts on demand — never two side by side — and one
+hub serves one organisation. The service relies on that: its artifact index,
+its locks and its state snapshots are designed for exactly one writer, and
+Storage Files cannot coordinate two (they are immutable, with no
+create-if-absent). Do not run it with `--workers`, behind a second copy of
+itself, or with two containers sharing a cache directory; each organisation
+runs its own app instead.
+
+That is now enforced rather than assumed, in two places:
+
+- **A startup lock.** The process takes an exclusive `flock` on
+  `instance.lock` inside `HUB_CACHE_DIR` and holds it until it exits. A second
+  worker or a second container on the same disk fails to start, with an error
+  naming this rule, instead of starting successfully and quietly losing the
+  first one's writes.
+- **Readiness fails on a detected second writer.** Two processes on *different*
+  disks cannot see each other's lock, but they do see each other's state
+  snapshots in Storage. When the state sidecar finds a snapshot it did not
+  write, the process stops writing operational state altogether (rate-limit
+  counters fall back to per-process tallies, nothing is deleted, and both
+  snapshots are left in Storage for you to compare) and `GET /health` starts
+  answering **503** with a `detail` naming the invariant. `POST /` — the
+  platform's own startup check — keeps answering 200, so the container is not
+  restarted into the same broken situation; the fix is to stop the extra
+  process and restart the remaining one.
 
 Secrets are set with `kbagent data-app secrets-set` and never committed to
 the repository:
@@ -542,8 +561,11 @@ and `outdated` — is listed to anyone holding the capability URL, so treat
 notes as public. Submissions are capped per contributing project per artifact
 per day (`HUB_MAX_VERSIONS_PER_DAY`); since 0.7.0 that counter — and every
 other rate-limit and view-count counter — lives in a SQLite sidecar
-snapshotted into Storage Files rather than in process memory, so it survives a
-redeploy and is shared across replicas instead of resetting per instance.
+snapshotted into Storage Files rather than in process memory, so a budget
+survives a redeploy instead of resetting every time the container restarts.
+The sidecar is durable, not shared: this service runs as exactly one process
+(see *Deployment* above), and a second one writing the same snapshots is an
+error it detects and refuses to work through, not a supported topology.
 
 Since 0.6.0, `/a/{id}` and `/a/{id}/v/{n}` render an artifact inside a
 `srcdoc` iframe sandboxed without `allow-same-origin`, so a published

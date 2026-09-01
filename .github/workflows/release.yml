@@ -1,15 +1,27 @@
 name: Release
 
-# Fires on a version tag. Runs the whole suite and the version-parity check
-# first, so a tag that does not match pyproject.toml and the changelog never
-# becomes a release. Then publishes the two instruction documents as release
-# assets with SHA256SUMS, and attests them with GitHub artifact attestations:
-# anyone can later prove a downloaded AGENT.md was built by *this* workflow
-# from *this* tag with plain `gh attestation verify`. The live /agent endpoint
-# is for reading; installing is done from these assets (README, "Install").
+# Fires on a version tag. Runs the whole suite, the compile check, the
+# production dependency audit and the version-parity check first, so a tag
+# that does not match pyproject.toml and the changelog -- or that points at
+# code which never reached protected `main` -- never becomes a release. Then
+# publishes the two instruction documents as release assets with SHA256SUMS,
+# and attests them with GitHub artifact attestations: anyone can later prove a
+# downloaded AGENT.md was built by *this* workflow from *this* tag with plain
+# `gh attestation verify`. The live /agent endpoint is for reading; installing
+# is done from these assets (README, "Install").
+#
+# SUP-100-001: the gates below are deliberately re-run *here*, in the job that
+# holds the write and attestation permissions, instead of being trusted to
+# have run in CI. A tag can be pushed at any commit, and CI running green on
+# some other commit says nothing about this one. Third-party actions are
+# pinned to full commit SHAs so a retagged upstream release cannot change what
+# the privileged job executes.
 on:
   push:
     tags: ["v*"]
+
+# Deny by default; the one job that needs more says so explicitly.
+permissions: {}
 
 jobs:
   release:
@@ -19,15 +31,33 @@ jobs:
       id-token: write      # sign the attestation with the workflow's identity
       attestations: write  # store it in the repository's attestation store
     steps:
-      - uses: actions/checkout@v4
+      # Full history: the ancestry proof below needs real merge-base data, which
+      # the default shallow clone does not have.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
           python-version: "3.11"
 
       - name: Install dependencies
         run: uv sync --locked
+
+      # A `v*` tag can be created on any commit by anyone with write access.
+      # The attestation this workflow issues would then vouch for code that
+      # never passed review on `main`. Refuse unless the tagged commit is an
+      # ancestor of the protected branch.
+      - name: The tagged commit must be on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag ${GITHUB_REF_NAME} points at $GITHUB_SHA, which is not on origin/main. Releases are cut from merged, reviewed commits only."
+            exit 1
+          fi
+          echo "$GITHUB_SHA is on origin/main"
 
       - name: Tag, package version and changelog must agree
         run: |
@@ -41,6 +71,15 @@ jobs:
       - name: Test suite
         run: uv run pytest tests/ -q
 
+      - name: Compile on the deployed interpreter
+        run: uv run python -m py_compile src/*.py
+
+      - name: Export the production lock
+        run: uv export --no-dev --no-emit-project --format requirements-txt -o requirements-prod.txt
+
+      - name: Audit the production dependency graph
+        run: uv run pip-audit -r requirements-prod.txt --disable-pip
+
       - name: Assemble the release documents
         run: |
           set -euo pipefail
@@ -50,7 +89,7 @@ jobs:
           (cd dist && sha256sum AGENT.md SKILL.md > SHA256SUMS && cat SHA256SUMS)
 
       - name: Attest the documents
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
             dist/AGENT.md

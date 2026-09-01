@@ -25,10 +25,12 @@ transient Storage outage cannot put the app into a crash loop.
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import functools
 import hashlib
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -97,7 +99,7 @@ from src.security import (
     hash_password,
     new_artifact_id,
 )
-from src.statedb import StateDB
+from src.statedb import StateDB, foreign_writer_detected
 from src.store import (
     ACCEPT_MODES,
     ARTIFACT_DRAFT,
@@ -798,6 +800,80 @@ def _version_rate_limited() -> JSONResponse:
     )
 
 
+class SingleInstanceError(RuntimeError):
+    """Startup refused because another process already holds the hub's lock."""
+
+
+def acquire_instance_lock(path: Path):
+    """Take the process-wide exclusive lock, or raise :class:`SingleInstanceError`.
+
+    ARCH-100-001. Everything in this service that is correct at all is correct
+    only under one writer: the in-memory artifact index, the per-process locks
+    that serialize check-then-act mutations, the version-number allocator and
+    the StateDB whole-snapshot cycle. CLAUDE.md states that as a deployment
+    invariant ("Exactly one instance, ever"), and for a long time that was all
+    it was -- a sentence. ``uvicorn --workers 2``, a second container mounted
+    on the same cache directory, or a rolling deploy that overlapped would each
+    have started happily and begun losing the other's writes.
+
+    ``flock`` turns the sentence into a startup condition. The lock belongs to
+    the open file description rather than to the process, so every way of
+    ending up with two writers on one disk fails the same way: a uvicorn worker
+    (each runs its own lifespan and so its own ``open()``), a second container,
+    or a stray second interpreter. ``LOCK_NB`` means the loser fails fast with
+    an explanation instead of hanging at boot with no output.
+
+    The handle is returned rather than kept in a module global so tests can own
+    one directly; the caller must hold it for the life of the process, because
+    closing the file releases the lock.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # "a+" never truncates, so losing the race cannot destroy the winner's
+    # record of which pid holds the lock.
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        try:
+            handle.seek(0)
+            holder = handle.read(200).strip() or "unknown"
+        except OSError:  # pragma: no cover - reading the holder is a courtesy
+            holder = "unknown"
+        handle.close()
+        raise SingleInstanceError(
+            f"Another process already holds the hub instance lock {path} "
+            f"(holder: {holder}). This deployment is exactly one instance, "
+            "ever: one Keboola App is one organisation's hub, one container, "
+            "one uvicorn process, no --workers (CLAUDE.md, \"Exactly one "
+            "instance, ever\"). Two writers corrupt the artifact index, the "
+            "version-number allocator and the state snapshots. Stop the other "
+            "process, or give this one its own HUB_CACHE_DIR."
+        ) from exc
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\n")
+        handle.flush()
+    except OSError as exc:  # pragma: no cover - the lock is what matters
+        logger.warning("Could not record the pid in the instance lock: %s", exc)
+    return handle
+
+
+def release_instance_lock(handle) -> None:
+    """Drop the exclusive lock and close its handle. Never raises."""
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError as exc:  # noqa: BLE001 - shutdown must not raise
+        logger.warning("Could not release the instance lock: %s", exc)
+    finally:
+        try:
+            handle.close()
+        except OSError as exc:  # noqa: BLE001 - shutdown must not raise
+            logger.warning("Could not close the instance lock: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Build the stores and sidecars, and try (not require) an initial hydration.
@@ -811,6 +887,13 @@ async def lifespan(app: FastAPI):
     takes a final snapshot, so a clean shutdown loses nothing.
     """
     app.state.settings = settings
+    # ARCH-100-001: before anything touches Storage or the cache, prove this is
+    # the only process doing so. Failing here aborts startup, which is the
+    # point -- a second writer that starts successfully is far more expensive
+    # to notice than one that never starts.
+    app.state.instance_lock = acquire_instance_lock(
+        settings.cache_dir / settings.instance_lock_filename
+    )
     # One backend instance serves both stores: they read the same host project
     # and only differ in the tags they list (``artifact-hub`` vs.
     # ``artifact-hub-cmt``), so neither ever sees the other's files. The state
@@ -883,6 +966,8 @@ async def lifespan(app: FastAPI):
     finally:
         webhooks.stop()
         statedb.stop()
+        release_instance_lock(getattr(app.state, "instance_lock", None))
+        app.state.instance_lock = None
 
 
 def _hydrate(app_obj: FastAPI) -> tuple[int, int]:
@@ -2796,13 +2881,17 @@ def landing_probe() -> PlainTextResponse:
 @app.get(
     "/health",
     tags=["service"],
-    summary="Liveness and index statistics",
+    summary="Readiness, liveness and index statistics",
     description=(
         "Reports process liveness, the running service version, and whether "
         "the in-memory artifact index has finished hydrating from Storage. "
         "'hydrated': false means Storage was unreachable at startup and the "
         "hub is serving in degraded mode (individual artifacts still resolve, "
-        "one Storage lookup at a time). Unauthenticated."
+        "one Storage lookup at a time). This is also the readiness signal: it "
+        "answers 503 when the hub has detected a second instance writing the "
+        "same state, which breaks the exactly-one-instance invariant the "
+        "artifact index, the version allocator and the state snapshots all "
+        "depend on. Unauthenticated."
     ),
     responses={
         200: {
@@ -2810,17 +2899,43 @@ def landing_probe() -> PlainTextResponse:
                 "JSON with 'status', 'version', 'artifacts' (indexed count) "
                 "and 'hydrated'."
             )
-        }
+        },
+        503: {
+            "description": (
+                "Not ready: another instance was detected writing this hub's "
+                "state. The body carries 'status': 'unready' and a 'detail' "
+                "naming the invariant. Operational state is read-only until "
+                "one container is left running and restarted."
+            )
+        },
     },
 )
-def health(request: Request) -> dict:
-    """Liveness plus index statistics."""
-    return {
+def health(request: Request) -> JSONResponse:
+    """Readiness and liveness, plus index statistics.
+
+    ARCH-100-001: the readiness half. Detecting a second writer used to be a
+    log line nobody read, while the process carried on serving and overwriting.
+    Now the detection latches (see ``src.statedb``) and shows up here as a 503,
+    so a platform health probe, a load balancer or an operator sees the broken
+    invariant instead of having to grep for it.
+
+    ``POST /`` is deliberately *not* affected: that is the Keboola platform's
+    own startup check (CLAUDE.md rule 3) and must keep answering 200, or the
+    container is killed and restarted into exactly the same situation.
+    """
+    body = {
         "status": "ok",
         "version": SERVICE_VERSION,
         "artifacts": request.app.state.store.count(),
         "hydrated": bool(getattr(request.app.state, "hydrated", False)),
     }
+    foreign = foreign_writer_detected()
+    if foreign is not None:
+        return JSONResponse(
+            {**body, "status": "unready", "detail": foreign},
+            status_code=503,
+        )
+    return JSONResponse(body)
 
 
 @app.get(
@@ -2911,7 +3026,11 @@ def context(request: Request) -> dict:
                 "method": "GET",
                 "path": "/health",
                 "auth": "none",
-                "purpose": "liveness, service version and index statistics",
+                "purpose": (
+                    "readiness and liveness, service version and index "
+                    "statistics; 503 when a second writing instance was "
+                    "detected"
+                ),
             },
             {
                 "method": "GET",

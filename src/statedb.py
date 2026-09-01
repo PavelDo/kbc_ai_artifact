@@ -45,8 +45,60 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "SNAPSHOT_FILE_NAME",
     "TAG_STATE",
+    "ForeignWriterError",
     "StateDB",
+    "foreign_writer_detected",
+    "note_foreign_writer",
+    "reset_foreign_writer",
 ]
+
+
+class ForeignWriterError(RuntimeError):
+    """Raised by every :class:`StateDB` write once a second writer was seen.
+
+    ARCH-100-001. A foreign snapshot used to be logged and then retired,
+    which meant the two instances kept taking turns destroying each other's
+    counters while both went on serving. The log line was the only signal, and
+    nothing consumed it. Now the first detection latches the process into a
+    read-only state: writes raise this, snapshots stop, the foreign snapshot is
+    left alone for an operator to look at, and ``/health`` reports 503.
+
+    Callers in ``src/main.py`` already treat a sidecar failure as "degrade to
+    the per-process fallback counter", so raising here costs a request nothing
+    but its durable tally -- which is exactly the thing that is no longer
+    trustworthy.
+    """
+
+
+# The latch is deliberately module-level rather than per-instance: it describes
+# the *process*, not one database handle. A rebuilt StateDB in a process that
+# has already seen a second writer is no more entitled to write than the old
+# one was. ``reset_foreign_writer`` exists for tests, which need each case to
+# start from a clean process-wide state.
+_foreign_writer_lock = threading.Lock()
+_foreign_writer_detail: str | None = None
+
+
+def note_foreign_writer(detail: str) -> None:
+    """Latch "another instance is writing", recording why. First call wins."""
+    global _foreign_writer_detail
+    with _foreign_writer_lock:
+        if _foreign_writer_detail is None:
+            _foreign_writer_detail = detail
+
+
+def foreign_writer_detected() -> str | None:
+    """The reason this process stopped writing state, or ``None`` if it did not."""
+    with _foreign_writer_lock:
+        return _foreign_writer_detail
+
+
+def reset_foreign_writer() -> None:
+    """Clear the latch. For tests only -- a live process never un-detects."""
+    global _foreign_writer_detail
+    with _foreign_writer_lock:
+        _foreign_writer_detail = None
+
 
 #: Tag carried by every state snapshot in the host project. Disjoint from the
 #: ``artifact-hub`` / ``artifact-hub-cmt`` namespaces, so neither
@@ -183,6 +235,7 @@ class StateDB:
         By convention ``key`` starts with the artifact id (alone, or followed by
         ``":"`` and more) so :meth:`forget_artifact` can purge it.
         """
+        self._refuse_if_foreign()
         conn = self._require_conn()
         with self._lock:
             conn.execute(
@@ -203,6 +256,7 @@ class StateDB:
 
     def count(self, scope: str, key: str, bucket: str) -> int:
         """Current value of one counter; ``0`` when it was never bumped."""
+        self._refuse_if_foreign()
         conn = self._require_conn()
         with self._lock:
             row = conn.execute(
@@ -220,6 +274,7 @@ class StateDB:
         table (and therefore the snapshot) from growing without bound. Returns
         the number of rows removed.
         """
+        self._refuse_if_foreign()
         conn = self._require_conn()
         with self._lock:
             cursor = conn.execute(
@@ -242,6 +297,7 @@ class StateDB:
         ``"source"``, ... — kept as a free string so new surfaces need no schema
         change.
         """
+        self._refuse_if_foreign()
         conn = self._require_conn()
         with self._lock:
             conn.execute(
@@ -297,6 +353,7 @@ class StateDB:
         or begins with ``"{artifact_id}:"``. Matching is done with ``substr``
         rather than ``LIKE`` so ids containing ``%`` or ``_`` behave.
         """
+        self._refuse_if_foreign()
         conn = self._require_conn()
         prefix = f"{artifact_id}:"
         with self._lock:
@@ -320,9 +377,18 @@ class StateDB:
         nothing to do (no writes since the last snapshot) or the attempt failed.
         Failure is logged and swallowed: the next tick tries again, and the
         write counter is left untouched so no write is silently dropped.
+
+        A snapshot replaces the whole database, so once a second writer has
+        been detected (ARCH-100-001) uploading one would destroy that writer's
+        state -- which is precisely the damage the detector exists to stop.
+        This becomes a quiet no-op instead, and stays one for the life of the
+        process. It returns ``False`` rather than raising because ``stop()``
+        and the background thread both call it and neither may fail.
         """
         conn = self._conn
         if conn is None:
+            return False
+        if foreign_writer_detected() is not None:
             return False
         with self._lock:
             if self._writes == self._snapshotted_writes:
@@ -364,6 +430,23 @@ class StateDB:
         if conn is None:
             raise RuntimeError("StateDB.start() has not been called")
         return conn
+
+    @staticmethod
+    def _refuse_if_foreign() -> None:
+        """Raise once this process has seen a second writer (ARCH-100-001).
+
+        Reads go through here too, not only writes. A counter is a bump/read
+        pair: if the bump degraded to the per-process fallback dict while the
+        read still came from a database another instance is also editing, the
+        limit would be compared against a tally that never received the
+        increments -- worse than having no sidecar at all. Refusing both keeps
+        the pair on one consistent source. ``views()`` is exempt: it is pure
+        analytics, nothing enforces anything with it, and stale numbers are
+        better than an owner-facing error.
+        """
+        detail = foreign_writer_detected()
+        if detail is not None:
+            raise ForeignWriterError(detail)
 
     def _open(self) -> None:
         """Open (or re-create) the SQLite file and make sure the schema is there."""
@@ -469,10 +552,17 @@ class StateDB:
         writes -- the deployment invariant (one Keboola App per organisation,
         one container; see CLAUDE.md). Storage file ids are monotonic, so a
         snapshot newer than the one this instance last wrote, that is not the
-        one it just uploaded, was written by another instance. That cannot be
-        repaired here -- whichever snapshot wins, the other's counters are
-        gone -- so it is reported as loudly as a log allows and the retirement
-        proceeds unchanged rather than inventing a merge nobody specified.
+        one it just uploaded, was written by another instance.
+
+        ARCH-100-001: that discovery used to produce only a log line, and
+        the retirement went ahead anyway, so the two instances kept deleting
+        each other's state while both carried on serving. Now the discovery
+        latches the process read-only (:func:`note_foreign_writer`), which
+        stops every later write and snapshot and turns ``/health`` into a 503,
+        and **nothing is deleted** on that pass -- both snapshots are left in
+        Storage for an operator to inspect and choose between. There is still
+        no merge, because there is still no way to invent one correctly; what
+        changed is that the process stops making the situation worse.
         """
         try:
             found = self._backend.search_by_tag(TAG_STATE)
@@ -487,16 +577,25 @@ class StateDB:
                     if info.id != keep_id and info.id > previous_id
                 )
                 if foreign:
-                    logger.error(
-                        "State snapshot(s) %s were written by another instance "
-                        "since this instance's last snapshot %s. This "
-                        "deployment assumes exactly one replica per hub; with "
-                        "two, each overwrites the other's counters and the "
-                        "artifact index of a warm replica can serve a link "
-                        "that was rotated away elsewhere. Run one container.",
-                        foreign,
-                        previous_id,
+                    detail = (
+                        f"State snapshot(s) {foreign} were written by another "
+                        f"instance since this instance's last snapshot "
+                        f"{previous_id}. This deployment assumes exactly one "
+                        "replica per hub (CLAUDE.md, \"Exactly one instance, "
+                        "ever\"); with two, each overwrites the other's "
+                        "counters and the artifact index of a warm process can "
+                        "serve a link that was rotated away elsewhere. This "
+                        "process has stopped writing operational state and "
+                        "reports itself unready; run exactly one container and "
+                        "restart."
                     )
+                    logger.error("%s", detail)
+                    note_foreign_writer(detail)
+                    # Leave every snapshot in place, the foreign one included:
+                    # deleting it is the data loss this detector exists to
+                    # prevent, and an operator needs both to decide which
+                    # instance's counters to keep.
+                    return
         for file_id in stale:
             try:
                 self._backend.delete(file_id)

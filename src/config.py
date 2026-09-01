@@ -104,6 +104,12 @@ class Settings:
     # File name of the SQLite sidecar; main.py joins it with cache_dir, which is
     # the only writable (and ephemeral) path the container has.
     state_db_filename: str = "state.sqlite3"
+    # ARCH-100-001: file name of the exclusive startup lock, also under
+    # cache_dir (HUB_INSTANCE_LOCK_FILENAME). The lifespan takes a non-blocking
+    # flock on it and holds it for the life of the process, so a second uvicorn
+    # worker or a second container sharing the disk fails to start instead of
+    # quietly corrupting the state the whole design assumes only it writes.
+    instance_lock_filename: str = "instance.lock"
     # Outbound webhooks (phase 4, src/webhooks.py)
     # Per-request HTTP timeout for a webhook delivery (HUB_WEBHOOK_TIMEOUT_S).
     webhook_timeout_s: int = 10
@@ -181,6 +187,10 @@ def load_settings() -> Settings:
         ),
         state_db_filename=(
             os.environ.get("HUB_STATE_DB_FILENAME", "").strip() or "state.sqlite3"
+        ),
+        instance_lock_filename=(
+            os.environ.get("HUB_INSTANCE_LOCK_FILENAME", "").strip()
+            or "instance.lock"
         ),
         webhook_timeout_s=_int_env("HUB_WEBHOOK_TIMEOUT_S", 10),
         webhook_max_attempts=_int_env("HUB_WEBHOOK_MAX_ATTEMPTS", 3),

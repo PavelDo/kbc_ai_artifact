@@ -4,45 +4,110 @@ name: CI
 # advisory gate the v0.7.5 review asked for. Runs on 3.11 because that is
 # what the deployed Data App runs -- notably, f-string rules differ in 3.12+,
 # so a newer interpreter here would not catch what production rejects.
+#
+# SUP-100-001: every job here is meant to be a *required* status check on
+# `main`, so the job ids below (`tests`, `compile`, `audit`, `docs-parity`)
+# are the contract with the branch protection rule -- renaming one silently
+# removes a required check. Third-party actions are pinned to a full commit
+# SHA rather than a mutable major tag, so a compromised or retagged upstream
+# release cannot change what runs here without a visible diff.
 on:
   push:
     branches: [main]
   pull_request:
 
+# Nothing in CI writes to the repository; the release workflow is the only
+# privileged one. Declared once here and narrowed per job.
+permissions: {}
+
 jobs:
-  test:
+  tests:
+    name: tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
           python-version: "3.11"
 
       - name: Install dependencies
         run: uv sync --locked
 
-      - name: Tests
+      - name: Full test suite
         run: uv run pytest tests/ -q
 
-      - name: Compile on the deployed interpreter
-        run: uv run python -m compileall -q src/
-
-  audit:
+  compile:
+    name: compile
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
           python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # The exact command CLAUDE.md names, on the interpreter production runs:
+      # 3.11 rejects backslashes inside f-string expressions and 3.12+ does not,
+      # so this has to be 3.11 to be worth running at all.
+      - name: Compile on the deployed interpreter
+        run: uv run python -m py_compile src/*.py
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --locked
 
       # The *production* graph only: dev-only advisories must not fail a
       # release, and the project itself is not a published package.
       - name: Export the production lock
         run: uv export --no-dev --no-emit-project --format requirements-txt -o requirements-prod.txt
 
+      # pip-audit is a locked dev dependency rather than `uvx pip-audit`, so the
+      # auditor itself comes from uv.lock instead of whatever the index serves
+      # that minute (SUP-100-001).
       - name: Audit it
-        run: uvx pip-audit -r requirements-prod.txt --disable-pip
+        run: uv run pip-audit -r requirements-prod.txt --disable-pip
+
+  docs-parity:
+    name: docs-parity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # DOC-100-001: the release tag in README's production deploy command, the
+      # package version and the newest changelog heading must be the same
+      # version. A drifting README ships operators the previous release while
+      # telling them it is the current one.
+      - name: README deploy tag matches pyproject and the changelog
+        run: uv run pytest tests/test_review100_release_controls.py -q -k parity
