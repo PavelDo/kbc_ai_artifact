@@ -5367,10 +5367,14 @@ def restore_artifact(
     summary="Permanently erase an artifact",
     description=(
         "Owner-only, and **irreversible** — there is no undo and no trash to "
-        "fall back on. Deletes every version file, every comment thread and "
-        "the meta record from the hub's project, and forgets the artifact's "
-        "view statistics and rate-limit counters. All of its URLs stop "
-        "resolving for good.\n\n"
+        "fall back on. Deletes every comment thread, then every version file "
+        "and the meta record from the hub's project, and forgets the "
+        "artifact's view statistics and rate-limit counters. All of its URLs "
+        "stop resolving for good.\n\n"
+        "The call is idempotent and resumable: each step is safe to repeat, "
+        "and the record that authorizes the operation is erased last, so a "
+        "call that fails partway can simply be retried with the same "
+        "credentials.\n\n"
         "An artifact does not have to be in the trash first, but the gentler "
         "path is DELETE /api/artifacts/{id} (soft, reversible) followed by "
         "this once you are sure. The canonical copies in the authors' own "
@@ -5391,12 +5395,14 @@ def restore_artifact(
             "description": (
                 "The caller's Keboola stack could not be reached to verify "
                 "the token, the hub's own Storage is unavailable, or the "
-                "delete only partially succeeded — some stored files could "
+                "erasure only partially succeeded — some stored files could "
                 "not be removed, so the artifact is still readable and the "
-                "call must be retried. The same 502 covers a partial comment "
-                "erasure: the artifact went, but at least one comment thread "
-                "still has files in Storage ('comment_threads_failed' says "
-                "how many); retry the purge to finish the job."
+                "call must be retried. Comment threads are erased before the "
+                "artifact itself, so a partial comment erasure "
+                "('comment_threads_failed' says how many threads still have "
+                "files in Storage) leaves the artifact deliberately in place: "
+                "retrying the purge with the same credentials resumes it and "
+                "finishes the job."
             )
         },
     },
@@ -5416,6 +5422,47 @@ def purge_artifact(
         return _not_found(artifact_id)
     _owner_only(meta, owner)
 
+    # Children first, the authorizing record last. The order is the whole
+    # design of this route: the meta record is what _owner_only reads, so
+    # erasing it before the comments meant a partial comment failure answered
+    # 502 "retry the purge" and the retry 404ed -- leaving comment files in
+    # Storage that nothing could ever reach or erase again. Every step below
+    # is idempotent, so a retry resumes rather than restarts: deleting
+    # already-deleted comments reports zero, and store.delete keeps the index
+    # whenever a file survives.
+    #
+    # Not a full tombstone: nothing here fences a concurrent write against an
+    # artifact being purged. That needs shared, revisioned state (see the
+    # v0.7.5 review) rather than ordering, so the race remains open.
+    threads, failed_threads = request.app.state.comments.delete_all_for(artifact_id)
+    if failed_threads:
+        # Some comment files are still in Storage, so the erasure the owner
+        # asked for did not fully happen. Reporting success would tell them a
+        # discussion is gone while it is still readable by anything that can
+        # reach those files. The artifact is deliberately left intact so the
+        # retry this asks for can authenticate and finish.
+        logger.error(
+            "Partial purge of artifact %s: %d comment thread(s) still have "
+            "Storage files; artifact kept so the purge can be retried",
+            artifact_id,
+            failed_threads,
+        )
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "comment threads not fully deleted",
+                "detail": (
+                    f"{failed_threads} of the artifact's comment threads "
+                    "could not be erased: some stored comment files remain. "
+                    "The artifact itself was left in place so this call can "
+                    "be retried; retry the purge to finish erasing it."
+                ),
+                "id": artifact_id,
+                "comment_threads_deleted": threads,
+                "comment_threads_failed": failed_threads,
+            },
+        )
+
     if not store.delete(artifact_id):
         # store.delete only reports success when *every* authoritative file is
         # confirmed gone; on a partial failure it keeps the index so the
@@ -5434,34 +5481,7 @@ def purge_artifact(
                     "still readable. Retry the delete."
                 ),
                 "id": artifact_id,
-            },
-        )
-    # Comment threads live in their own files; without this they would outlive
-    # the artifact as orphaned Storage files nothing can ever reach again.
-    threads, failed_threads = request.app.state.comments.delete_all_for(artifact_id)
-    if failed_threads:
-        # Same honesty rule as the artifact files above: some comment files are
-        # still in Storage, so the erasure the owner asked for did not fully
-        # happen. Reporting success would tell them a discussion is gone while
-        # it is still readable by anything that can reach those files.
-        logger.error(
-            "Partial purge of artifact %s: %d comment thread(s) still have "
-            "Storage files",
-            artifact_id,
-            failed_threads,
-        )
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error": "comment threads not fully deleted",
-                "detail": (
-                    f"The artifact was erased, but {failed_threads} of its "
-                    "comment threads could not be: some stored comment files "
-                    "remain. Retry the purge to finish erasing them."
-                ),
-                "id": artifact_id,
                 "comment_threads_deleted": threads,
-                "comment_threads_failed": failed_threads,
             },
         )
     # Same reasoning for the state sidecar: view rows and rate-limit counters

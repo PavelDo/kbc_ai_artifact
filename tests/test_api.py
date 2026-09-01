@@ -2326,6 +2326,66 @@ def _break_comment_deletes(api: Api, monkeypatch, tmp_path) -> None:
     )
 
 
+def test_a_partially_failed_purge_can_be_retried_to_completion(
+    api: Api, monkeypatch, tmp_path
+) -> None:
+    """The 502 says "retry the purge", so a retry has to be possible.
+
+    Erasing the artifact's own metadata first destroys what _owner_only
+    needs, so the advertised retry answered 404 and the comment files it was
+    supposed to finish erasing stayed in Storage for good. Children go first
+    now, and the record that authorizes the operation survives until the
+    whole thing is done.
+    """
+    artifact_id = _publish_markdown(api, "# One")
+    assert _comment(api, artifact_id, exact="One").status_code == 201
+    working_comments = main.app.state.comments
+
+    _break_comment_deletes(api, monkeypatch, tmp_path)
+    first = api.client.delete(
+        f"/api/artifacts/{artifact_id}/purge", headers=AUTH_HEADERS
+    )
+    assert first.status_code == 502, first.text
+
+    # The artifact must still be there to authorize the retry the 502 asked
+    # for -- a purge that erased it first could never be resumed.
+    assert main.app.state.store.get_meta(artifact_id) is not None
+
+    # Storage recovers; the retry finishes the job instead of 404ing.
+    monkeypatch.setattr(main.app.state, "comments", working_comments)
+    second = api.client.delete(
+        f"/api/artifacts/{artifact_id}/purge", headers=AUTH_HEADERS
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["purged"] is True
+
+    assert main.app.state.store.get_meta(artifact_id) is None
+    assert main.app.state.comments.list_for(artifact_id) == []
+    assert api.client.get(f"/a/{artifact_id}").status_code == 404
+
+
+def test_a_retry_after_a_partial_purge_still_refuses_a_foreign_owner(
+    api: Api, monkeypatch, tmp_path
+) -> None:
+    """Keeping the meta record for the retry must not widen who may retry."""
+    artifact_id = _publish_markdown(api, "# One")
+    assert _comment(api, artifact_id, exact="One").status_code == 201
+    _break_comment_deletes(api, monkeypatch, tmp_path)
+
+    assert (
+        api.client.delete(
+            f"/api/artifacts/{artifact_id}/purge", headers=AUTH_HEADERS
+        ).status_code
+        == 502
+    )
+    assert (
+        api.client.delete(
+            f"/api/artifacts/{artifact_id}/purge", headers=OTHER_AUTH_HEADERS
+        ).status_code
+        == 403
+    )
+
+
 def test_purge_is_502_when_comment_threads_cannot_be_erased(
     api: Api, monkeypatch, tmp_path
 ) -> None:

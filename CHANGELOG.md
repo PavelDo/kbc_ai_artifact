@@ -37,6 +37,12 @@ have.
   pending notifications without limit; past a configurable ceiling
   (`HUB_WEBHOOK_QUEUE_MAX`) the newest is dropped, and publishing is never held
   up waiting for one.
+- Permanently erasing a document can now actually be retried when it fails
+  partway. It previously removed the document before its comments, so a
+  failure left comments behind that nothing could reach or erase, and the
+  retry the error asked for reported the document as already gone. Comments
+  go first now, and the document stays until everything else is confirmed
+  erased.
 
 ## 0.8.0 — Documents that update themselves (2026-09-01)
 

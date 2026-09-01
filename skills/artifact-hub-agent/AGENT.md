@@ -813,6 +813,13 @@ When you generate the content to publish yourself:
   erases everything for good. Default to trashing when the user says
   "delete this" — only purge when they specifically say permanent, forever,
   or confirm it after you explain there is no undo.
+- **A purge that answers 502 should be retried, not re-confirmed.** The call
+  erases comment threads before the artifact itself and erases the record
+  that authorizes it last, so every step is safe to repeat: retrying with the
+  same credentials resumes where it stopped. `comment_threads_failed` in the
+  502 body says how many threads still have files in Storage. Do not treat a
+  502 as "already gone" -- the artifact is deliberately still there so the
+  retry can authenticate.
 - **Always warn before `rotate-link`.** State plainly, before calling it,
   that the *current* link will stop working for absolutely everyone the
   instant the call succeeds, with no grace period and no way back — including
