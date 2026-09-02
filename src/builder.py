@@ -10,8 +10,10 @@ Three entry points mirror the three publish input shapes:
   byte for byte, and only the title is derived.
 * :func:`build_from_markdown` — markdown-it-py rendering wrapped in
   :data:`PAGE_TEMPLATE` (tables, task lists, anchors, mermaid, highlight.js).
-* :func:`build_from_git` — shallow clone, entry-file selection, the same
-  Markdown rendering, plus inlining of relative images as ``data:`` URIs.
+* :func:`build_from_git` — shallow clone and entry-file selection, then
+  whatever the chosen entry's shape already gets on its own: the same Markdown
+  rendering for a Markdown entry, the same rebuild-then-pass-through for an
+  HTML one, plus inlining of relative images as ``data:`` URIs.
 
 Every failure that is the caller's fault raises :class:`BuildError`; its message
 is user-facing and is mapped to HTTP 422 by the API layer.
@@ -618,6 +620,31 @@ def _unwrap_frame_runtime(html: str) -> tuple[str, bool]:
     )
 
 
+def _standalone_html(html: str, title: str | None) -> tuple[str, str]:
+    """Rebuild a saved Claude artifact and resolve its title. ``(html, title)``.
+
+    Everything an HTML publish does to its input, kept in one place because
+    there are two ways in: a raw ``html`` body (:func:`build_from_html`) and an
+    HTML entry file in a cloned repository (:func:`build_from_git`). The same
+    bytes have to yield the same document and the same title whichever door
+    they come through — a wrapper stripped on one path only is a wrapper the
+    other path still publishes.
+    """
+    document, rebuilt = _unwrap_frame_runtime(html)
+    if rebuilt:
+        logger.info(
+            "Rebuilt a saved Claude artifact as a standalone document "
+            "(%d -> %d characters)",
+            len(html),
+            len(document),
+        )
+    # Deliberately after the rebuild, never before it: in a wrapped page the
+    # authored <title> sits in the body, behind ~13 KB of bootstrap script that
+    # any title-shaped string inside would win the search from.
+    resolved = _clean(title) or _title_from_html(document) or DEFAULT_TITLE
+    return document, resolved
+
+
 # --------------------------------------------------------------------------
 # Public builders: html / markdown
 # --------------------------------------------------------------------------
@@ -633,18 +660,7 @@ def build_from_html(html: str, title: str | None = None) -> BuiltArtifact:
     Title precedence: explicit argument, ``<title>``, first ``<h1>``, then
     :data:`DEFAULT_TITLE`.
     """
-    document, rebuilt = _unwrap_frame_runtime(html)
-    if rebuilt:
-        logger.info(
-            "Rebuilt a saved Claude artifact as a standalone document "
-            "(%d -> %d characters)",
-            len(html),
-            len(document),
-        )
-    # Deliberately after the rebuild, never before it: in a wrapped page the
-    # authored <title> sits in the body, behind ~13 KB of bootstrap script that
-    # any title-shaped string inside would win the search from.
-    resolved = _clean(title) or _title_from_html(document) or DEFAULT_TITLE
+    document, resolved = _standalone_html(html, title)
     logger.debug("Built html artifact (title=%r, %d bytes)", resolved, len(document))
     return BuiltArtifact(html=document, title=resolved, source_type="html")
 
@@ -1220,7 +1236,10 @@ def build_from_git(
     Entry selection: explicit ``path`` (file or directory), otherwise
     ``index.html`` → ``README.md`` → a single root-level ``*.html``. Markdown
     entries go through the same rendering as :func:`build_from_markdown`; HTML
-    entries are used verbatim. Relative images are inlined as ``data:`` URIs.
+    entries go through the same near pass-through as :func:`build_from_html`,
+    a page saved from Claude's artifact viewer rebuilt as a standalone document
+    included, and are otherwise used verbatim. Relative images are inlined as
+    ``data:`` URIs afterwards.
 
     ``git_token`` (with the optional ``git_username``, defaulting to
     :data:`DEFAULT_GIT_USERNAME`) makes private repositories reachable. It is
@@ -1284,10 +1303,23 @@ def build_from_git(
             page = _render_page(_render_markdown_body(source), resolved)
             source_type = "git-markdown"
         else:
-            resolved = _clean(title) or _title_from_html(source) or DEFAULT_TITLE
-            page = source
+            # Exactly what a raw `html` publish of these bytes would produce,
+            # the saved-artifact rebuild included: an entry file committed to a
+            # repository is the same document, and which door it arrived
+            # through is not a reason to store it differently.
+            page, resolved = _standalone_html(source, title)
             source_type = "git-html"
 
+        # Strictly after the entry has been turned into a document. A Markdown
+        # entry has no `src` attributes to rewrite until it is rendered, and an
+        # HTML one must be rebuilt first: a wrapper's injected head is ~13 KB of
+        # opaque bootstrap script, so an <img>-shaped string inside it is not
+        # markup to resolve against the repository, and every byte of the inline
+        # budget spent on content the rebuild then discards is a byte the
+        # author's own images no longer have. The reverse order needs no
+        # defending in turn — a data: URI is base64, which contains no `<`, so
+        # inlining can never manufacture the structural tags the rebuild looks
+        # for.
         page = _inline_images(
             page,
             base_dir=entry.parent,

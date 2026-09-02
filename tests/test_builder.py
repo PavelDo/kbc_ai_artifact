@@ -7,10 +7,19 @@ inlining (``_default_entry``, ``_resolve_entry``, ``_inline_images``) are
 tested directly against a plain directory tree / a local git fixture repo,
 since those helpers operate on any filesystem path and do not themselves
 require a network clone.
+
+Where the whole of ``build_from_git`` is what is under test — the order it
+does its work in, and whether it agrees with ``build_from_html`` — the clone
+is the only part stubbed out: ``_FakeClone`` copies a committed local fixture
+into the destination and ``_check_git_host`` is silenced, so no test resolves
+or reaches a host. Everything after the clone runs for real, the fixture's own
+``.git`` included.
 """
 
 import base64
+import dataclasses
 import os
+import shutil
 import subprocess
 import types
 from pathlib import Path
@@ -284,6 +293,189 @@ class TestBuildFromHtmlUnwrapsFrameRuntime:
     def test_an_unwrapped_document_is_published_byte_for_byte(self):
         html = "<html><head><title>Mine</title></head><body><h1>Hi</h1></body></html>"
         assert build_from_html(html).html == html
+
+
+# --------------------------------------------------------------------------
+# The same rebuild on the git path. A saved artifact committed to a repository
+# is the same saved artifact, so publishing it by git_url rather than by html
+# must not be the difference between a wrapper stripped and a wrapper served.
+# --------------------------------------------------------------------------
+
+
+_GIT_URL = "https://git.example.com/owner/repo.git"
+
+#: The wrapper carrying a repository-relative image on both sides of the line
+#: the rebuild draws: one in the injected head it discards, one in the authored
+#: body it keeps. Both name the same file, so only the *order* of the rebuild
+#: and the image inlining can tell them apart.
+_WRAPPED_WITH_IMAGES = _WRAPPED.replace(
+    "<!-- /frame-runtime -->",
+    '<!-- /frame-runtime --><img src="images/pixel.png" alt="injected">',
+).replace(
+    "<p>Body copy.</p>",
+    '<p>Body copy.</p><img src="images/pixel.png" alt="authored">',
+)
+
+
+class _FakeClone:
+    """Stand-in for ``_clone``: copies a committed fixture into ``dest``.
+
+    The clone is the one part of ``build_from_git`` that cannot run offline.
+    Everything downstream works on whatever landed on disk, so a copied fixture
+    exercises the real path — ``_head_commit`` included, since the copy brings
+    the fixture's ``.git`` with it.
+    """
+
+    def __init__(self, fixture: Path) -> None:
+        self.fixture = fixture
+
+    def __call__(self, git_url, ref, dest, timeout_s, **kwargs) -> None:
+        shutil.copytree(self.fixture, dest)
+
+
+def _make_entry_repo(tmp_path: Path, name: str, content: str) -> Path:
+    """A committed repo whose entry is ``name``, beside ``images/pixel.png``."""
+    repo = tmp_path / "entry-repo"
+    repo.mkdir()
+    (repo / "images").mkdir()
+    (repo / "images" / "pixel.png").write_bytes(_png_bytes())
+    (repo / name).write_text(content, encoding="utf-8")
+
+    _run_git(["git", "init"], repo)
+    _run_git(["git", "config", "user.email", "test@example.com"], repo)
+    _run_git(["git", "config", "user.name", "Test User"], repo)
+    _run_git(["git", "add", "-A"], repo)
+    _run_git(["git", "commit", "-m", "initial commit"], repo)
+    return repo
+
+
+def _publish_from_git(
+    tmp_path,
+    monkeypatch,
+    settings,
+    content: str,
+    *,
+    name: str = "index.html",
+    title: str | None = None,
+):
+    """Run ``build_from_git`` end to end over a one-entry local repository."""
+    monkeypatch.setattr(builder_module, "_check_git_host", lambda *a, **k: None)
+    monkeypatch.setattr(
+        builder_module, "_clone", _FakeClone(_make_entry_repo(tmp_path, name, content))
+    )
+    return build_from_git(_GIT_URL, None, None, title, settings)
+
+
+class TestBuildFromGitUnwrapsFrameRuntime:
+    def test_a_wrapped_entry_file_is_rebuilt(self, tmp_path, monkeypatch, settings):
+        result = _publish_from_git(tmp_path, monkeypatch, settings, _WRAPPED)
+        assert result.source_type == "git-html"
+        assert "__FRAME_PREAMBLE" not in result.html
+        assert "frame-runtime" not in result.html
+        assert "#faf9f5" not in result.html  # the injected reset goes too
+        assert "<main><h1>Heading</h1>" in result.html
+
+    def test_the_git_path_stores_what_the_html_path_would(
+        self, tmp_path, monkeypatch, settings
+    ):
+        """The whole point: the same bytes, the same stored document."""
+        direct = build_from_html(_WRAPPED)
+        result = _publish_from_git(tmp_path, monkeypatch, settings, _WRAPPED)
+        assert result.html == direct.html
+        assert result.title == direct.title
+
+    def test_the_authored_title_still_wins(self, tmp_path, monkeypatch, settings):
+        """Derived from the rebuilt document, not from the bootstrap script."""
+        result = _publish_from_git(tmp_path, monkeypatch, settings, _WRAPPED)
+        assert result.title == "Real Document"
+
+    def test_an_explicit_title_still_wins(self, tmp_path, monkeypatch, settings):
+        result = _publish_from_git(
+            tmp_path, monkeypatch, settings, _WRAPPED, title="Explicit Title"
+        )
+        assert result.title == "Explicit Title"
+
+    def test_the_commit_is_still_recorded(self, tmp_path, monkeypatch, settings):
+        result = _publish_from_git(tmp_path, monkeypatch, settings, _WRAPPED)
+        assert result.git_commit is not None
+        assert len(result.git_commit) >= 40
+
+    def test_ordinary_html_is_published_byte_for_byte(
+        self, tmp_path, monkeypatch, settings
+    ):
+        plain = (
+            "<!doctype html><html><head><title>Mine</title></head>"
+            "<body><h1>Hi</h1><p>Nothing to rebuild here.</p></body></html>"
+        )
+        result = _publish_from_git(tmp_path, monkeypatch, settings, plain)
+        assert result.html == plain
+        assert result.title == "Mine"
+
+    def test_a_page_that_only_writes_about_the_marker_is_left_alone(
+        self, tmp_path, monkeypatch, settings
+    ):
+        """A repository documenting the wrapper keeps the head it committed."""
+        about = (
+            "<!doctype html><html><head><title>How the wrapper works</title>"
+            '<script src="mine.js"></script></head><body><p>Claude injects '
+            f"<code>{FRAME_RUNTIME_MARKER}</code> into the head.</p></body></html>"
+        )
+        result = _publish_from_git(tmp_path, monkeypatch, settings, about)
+        assert result.html == about
+
+    def test_a_markdown_entry_is_unaffected(self, tmp_path, monkeypatch, settings):
+        """The Markdown branch renders and inlines exactly as it did before."""
+        result = _publish_from_git(
+            tmp_path,
+            monkeypatch,
+            settings,
+            "# Fixture Repo\n\n![pixel](images/pixel.png)\n",
+            name="README.md",
+        )
+        assert result.source_type == "git-markdown"
+        assert result.title == "Fixture Repo"
+        assert "data:image/png;base64," in result.html
+        assert "images/pixel.png" not in result.html
+
+
+class TestGitRebuildRunsBeforeImageInlining:
+    """Order matters, and only one order is right.
+
+    Inlining first would rewrite ``src`` attributes inside ~13 KB of bootstrap
+    script that the rebuild is about to throw away, and spend the shared inline
+    budget doing it. Rebuilding first leaves the inliner nothing but authored
+    markup to look at.
+    """
+
+    def test_only_the_authored_image_is_inlined(
+        self, tmp_path, monkeypatch, settings
+    ):
+        result = _publish_from_git(
+            tmp_path, monkeypatch, settings, _WRAPPED_WITH_IMAGES
+        )
+        assert 'alt="injected"' not in result.html
+        assert 'alt="authored"' in result.html
+        assert result.html.count("data:image/png;base64,") == 1
+        assert "images/pixel.png" not in result.html
+
+    def test_the_discarded_wrapper_cannot_spend_the_inline_budget(
+        self, tmp_path, monkeypatch, settings
+    ):
+        """A budget for exactly one image must reach the author's image.
+
+        Inlining before the rebuild would hand that one budget to the injected
+        reference — it comes first in the document — and then discard it,
+        leaving the authored image as a dead relative link to a repository the
+        hub does not serve.
+        """
+        room_for_one = dataclasses.replace(
+            settings, max_inline_total_bytes=len(_png_bytes())
+        )
+        result = _publish_from_git(
+            tmp_path, monkeypatch, room_for_one, _WRAPPED_WITH_IMAGES
+        )
+        assert result.html.count("data:image/png;base64,") == 1
+        assert "images/pixel.png" not in result.html
 
 
 # --------------------------------------------------------------------------
