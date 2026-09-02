@@ -223,6 +223,25 @@ class TestUnwrapFrameRuntime:
         assert rebuilt is False
         assert out == about
 
+    def test_a_page_with_an_implicit_head_that_mentions_the_marker_survives(self):
+        """Requiring an enclosing <head> also covers documents that have none.
+
+        Rejecting only a </head> *before* the marker left this shape exposed: a
+        page about HTML parsing, with no head tags of its own, carrying the
+        structural tags inside a script string. Rebuilding it dropped the
+        opening content and promoted an inert JS fragment to live body text.
+        """
+        about = (
+            "<!doctype html><html><body>"
+            "<h1>How saved pages are wrapped</h1>"
+            f"<p>The viewer injects <code>{FRAME_RUNTIME_MARKER}</code> first.</p>"
+            '<script>var sample = "</head><body>";</script>'
+            "<p>Keep reading.</p></body></html>"
+        )
+        out, rebuilt = _unwrap_frame_runtime(about)
+        assert rebuilt is False
+        assert out == about
+
     @pytest.mark.parametrize(
         "malformed",
         [

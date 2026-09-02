@@ -5101,16 +5101,20 @@ def read_raw(
 @app.get(
     "/a/{artifact_id}/source",
     tags=["public"],
-    summary="Original submitted source",
+    summary="Retained source",
     description=(
         "Returns the head version's retained source: the original Markdown "
         "(as text/markdown) whenever the version has one — markdown-sourced "
         "artifacts, and HTML published with 'markdown_source' — otherwise the "
-        "original HTML (as text/html) for html and git-html artifacts. "
+        "stored HTML document (as text/html) for html and git-html artifacts "
+        "— which is what the author submitted, except for a page saved from "
+        "Claude's artifact viewer, served as the standalone document it was "
+        "rebuilt into at publish time. "
         "Markdown rendered from a git repository has no retained source: that "
         "answers 404 with a JSON pointer back to the repository, ref and "
         "commit.\n\n"
-        "This route never converts: it serves what was submitted. For "
+        "This route never converts: it serves the stored HTML document, "
+        "never a render of markdown_source. For "
         "Markdown of an HTML-only artifact, use /a/{id}/export/markdown.\n\n"
         "The HTML answer is publisher-controlled markup served as a top-level "
         "document, so — exactly like /a/{id}/raw — it carries "

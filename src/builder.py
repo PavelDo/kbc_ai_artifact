@@ -173,6 +173,7 @@ _CREDENTIALS_RE = re.compile(r"//[^/@\s]*@")
 #: change a string's *length* (U+0130 lowercases to two characters), so offsets
 #: taken from a lowercased copy are not offsets into the original, and ``<body``
 #: as a substring also matches ``<bodyfoo``.
+_HEAD_OPEN_RE = re.compile(r"<head\b[^>]*>", re.IGNORECASE)
 _HEAD_CLOSE_RE = re.compile(r"</head\s*>", re.IGNORECASE)
 _BODY_OPEN_RE = re.compile(r"<body\b[^>]*>", re.IGNORECASE)
 _BODY_CLOSE_RE = re.compile(r"</body\s*>", re.IGNORECASE)
@@ -568,10 +569,17 @@ def _unwrap_frame_runtime(html: str) -> tuple[str, bool]:
     if marker == -1:
         return html, False
 
-    # The marker has to belong to the document's own <head>. A page that writes
-    # *about* the frame runtime mentions it further down, and rebuilding that
-    # would throw away a <head> its author meant to keep.
-    if _HEAD_CLOSE_RE.search(html, 0, marker) is not None:
+    # The marker has to sit inside an explicit <head> ... </head>, which is
+    # where the wrapper puts it. A page that writes *about* the frame runtime
+    # mentions it in prose instead, and rebuilding that throws away content its
+    # author meant to keep. Anchoring to the enclosing head rather than merely
+    # rejecting a </head> before the marker also covers the implicit-head
+    # shape, where markup that was inert inside a script string would otherwise
+    # be promoted to live body text.
+    head_open = _HEAD_OPEN_RE.search(html)
+    if head_open is None or head_open.end() > marker:
+        return html, False
+    if _HEAD_CLOSE_RE.search(html, head_open.end(), marker) is not None:
         return html, False
 
     # Look for the end of the injected head past the bootstrap script whenever
