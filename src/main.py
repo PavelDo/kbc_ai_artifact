@@ -3411,7 +3411,8 @@ def _build(
             # Stored under the same "markdown" key the Markdown-authored path
             # uses, so head_source, the vault and /a/{id}/source all pick it
             # up with no further change. The *rendering* is untouched: what is
-            # served stays exactly the submitted HTML.
+            # served stays the caller's own HTML document, never a render of
+            # `markdown_source`.
             if markdown_source is not None:
                 return built, {"markdown": markdown_source}
             return built, {}
